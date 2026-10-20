@@ -6,7 +6,7 @@ const { once, EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const { IPPolicy, canonicalIP, validateSettings } = require('../src/policy.cjs');
-const { SOCKSRelay, SocketReader, connectTunnel } = require('../src/relay.cjs');
+const { SOCKSRelay, NetworkRelay, SocketReader, connectTunnel } = require('../src/relay.cjs');
 const { Inspector } = require('../src/inspector.cjs');
 const { Channel } = require('../src/channel.cjs');
 const S = require('../src/sanitize.cjs');
@@ -27,6 +27,11 @@ test('settings do not accept URL credentials or invalid profiles', () => {
   assert.throws(() => validateSettings({ host: 'socks5://user:pass@host', port: 1080 }));
   assert.throws(() => validateSettings({ host: 'localhost', port: 1080, language: 'ru-RU' }));
   assert.equal(validateSettings({ host: 'localhost', port: 1080 }).timezone, 'Europe/Amsterdam');
+  assert.equal(validateSettings({ mode: 'network' }).mode, 'network');
+  assert.equal(validateSettings({ mode: 'network', password: 'unused' }).password, '');
+  assert.equal(validateSettings({ mode: 'network', host: 'socks5://user:secret@host' }).host, '127.0.0.1');
+  assert.throws(() => validateSettings({ mode: 'automatic-fallback' }));
+  assert.throws(() => validateSettings({ host: 'localhost', port: 0 }));
 });
 test('traffic masks headers, nested JSON, SSE bearer tokens and URL credentials', () => {
   assert.equal(S.headers({ Authorization: 'secret-a', Cookie: 'secret-b' }).includes('secret-'), false);
@@ -82,6 +87,19 @@ test('wrong SOCKS credentials signal a global failure, without fallback', async 
   const socks = await mockSOCKS(t), relay = new SOCKSRelay({ host: '127.0.0.1', port: socks.port, username: 'fixture', password: 'wrong' });
   const fatal = once(relay, 'fatal'); await relay.start(); relay.unlock(); t.after(() => relay.close());
   await assert.rejects(connectTunnel(relay.port, 'example.test')); assert.match((await fatal)[0], /SOCKS5/); assert.equal(socks.targets.length, 0);
+});
+test('current network/VPN works without SOCKS, gates precheck and closes live connections', async t => {
+  let accepted = 0; const clients = new Set();
+  const echo = net.createServer(socket => { accepted++; clients.add(socket); socket.on('error', () => {}); socket.once('close', () => clients.delete(socket)); socket.pipe(socket); });
+  echo.listen(0, '127.0.0.1'); await once(echo, 'listening');
+  t.after(() => { for (const socket of clients) socket.destroy(); echo.close(); });
+  const relay = new NetworkRelay(), failures = []; relay.on('fatal', x => failures.push(x)); await relay.start(); t.after(() => relay.close());
+  await assert.rejects(connectTunnel(relay.port, '127.0.0.1', echo.address().port)); assert.equal(accepted, 0);
+  relay.unlock();
+  const socket = await connectTunnel(relay.port, '127.0.0.1', echo.address().port); socket.resume(); socket.write('current-network-fixture');
+  assert.equal((await once(socket, 'data'))[0].toString(), 'current-network-fixture');
+  const ended = once(socket, 'close'), port = relay.port; relay.close(); await ended;
+  await assert.rejects(connectTunnel(port, '127.0.0.1', echo.address().port)); assert.equal(failures.length, 0);
 });
 
 class MockChannel extends EventEmitter {

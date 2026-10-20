@@ -4,7 +4,7 @@ const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const { IPPolicy, networkFingerprint, validateSettings } = require('./policy.cjs');
-const { SOCKSRelay } = require('./relay.cjs');
+const { SOCKSRelay, NetworkRelay } = require('./relay.cjs');
 const { initialIP, currentIP } = require('./ip-check.cjs');
 const { prepareRuntime, powershell } = require('./runtime.cjs');
 const { Channel } = require('./channel.cjs');
@@ -17,7 +17,7 @@ class GuardController extends EventEmitter {
     try { this.events = JSON.parse(fs.readFileSync(path.join(root, 'diagnostics.json'), 'utf8')).slice(-80); } catch {}
   }
   status(message) { this.message = message; this.emit('state', this.snapshot()); }
-  snapshot() { return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null, country: this.country || '' }; }
+  snapshot() { return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null, country: this.country || '', exitIP: this.policy.pinned || '' }; }
   log(message, kind = 'event') {
     const event = { date: new Date().toISOString(), kind, message: diagnostic(message) };
     this.events.push(event); this.events = this.events.slice(-80);
@@ -33,7 +33,7 @@ class GuardController extends EventEmitter {
     if (this.state !== 'idle') throw Error('Guard уже работает.');
     const settings = validateSettings(input); this.settings = settings;
     const epoch = ++this.epoch, active = () => this.epoch === epoch && !this.policy.blocked && this.state !== 'idle';
-    this.state = 'checking'; this.verified = null; this.status('Проверяем страну и закрепляем IP через SOCKS5…');
+    this.state = 'checking'; this.verified = null; this.status(settings.mode === 'network' ? 'Проверяем страну и закрепляем IP текущей сети / VPN…' : 'Проверяем страну и закрепляем IP через SOCKS5…');
     try {
       // Prepare before pinning so long disk copies cannot leave an old network baseline.
       this.runtime = await prepareRuntime(settings.claudePath, this.root, path.join(this.resources, 'RuntimeBootstrap.cjs'), text => this.status(text));
@@ -42,7 +42,7 @@ class GuardController extends EventEmitter {
       this.fingerprint = networkFingerprint();
       this.networkTimer = setInterval(() => { if (active() && networkFingerprint() !== this.fingerprint) this.block('Изменились локальные адреса или сетевые интерфейсы.'); }, 1000);
       this.route = await this.routeFingerprint(); if (!active()) return;
-      this.relay = new SOCKSRelay({ host: settings.host, port: settings.port, username: settings.username, password: settings.password });
+      this.relay = settings.mode === 'network' ? new NetworkRelay() : new SOCKSRelay({ host: settings.host, port: settings.port, username: settings.username, password: settings.password });
       this.relay.on('fatal', reason => { if (active()) this.block(reason); });
       const port = await this.relay.start(); if (!active()) return;
       const initial = await initialIP(port); if (!active()) return;
@@ -91,17 +91,18 @@ class GuardController extends EventEmitter {
   }
   async routeFingerprint() {
     if (process.platform !== 'win32') return '';
-    return powershell("@(Get-NetRoute -ErrorAction Stop | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0','::/0') } | Sort-Object InterfaceIndex,NextHop | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.InterfaceIndex,$_.NextHop,$_.RouteMetric,$_.DestinationPrefix }) | ConvertTo-Json -Compress", 4000);
+    return powershell("@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0','0.0.0.0/1','128.0.0.0/1','::/0','::/1','8000::/1') } | Sort-Object InterfaceIndex,DestinationPrefix,NextHop | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.InterfaceIndex,$_.NextHop,$_.RouteMetric,$_.DestinationPrefix }) | ConvertTo-Json -Compress", 4000);
   }
   async poll(epoch) {
     if (this.epoch !== epoch || this.policy.blocked || !this.relay) return;
+    const started = performance.now();
     try {
       // Start the public check immediately; route queries must not stretch the IP interval.
       const [, route] = await Promise.all([currentIP(this.relay.port).then(result => { if (this.epoch === epoch) this.policy.check(result.ip); }), this.routeFingerprint()]);
       if (this.epoch !== epoch || this.policy.blocked) return;
       if (route !== this.route) { this.block('Изменился маршрут сети.'); return; }
       this.status(this.message);
-      this.pollTimer = setTimeout(() => this.poll(epoch), this.settings.interval * 1000);
+      this.pollTimer = setTimeout(() => this.poll(epoch), Math.max(0, this.settings.interval * 1000 - (performance.now() - started)));
     } catch { if (this.epoch === epoch) this.block('IP изменился, маршрут потерян или проверка завершилась ошибкой.'); }
   }
   teardown() {

@@ -1,0 +1,14 @@
+{
+  "result": "PASS",
+  "version": "0.4.1",
+  "automaticDiscovery": true,
+  "locationKind": "WindowsApps",
+  "standardUser": true,
+  "executableReadable": true,
+  "asarReadable": true,
+  "privateCopyPrepared": true,
+  "sourceSignature": "Valid",
+  "originalPermissionsChanged": false,
+  "packagedElectron": true,
+  "packagedPreparation": true
+}

@@ -42,11 +42,15 @@ function networkFingerprint() {
 }
 
 function validateSettings(input) {
-  const host = String(input.host || '').trim();
-  const port = Number(input.port);
-  if (!host || host.length > 253 || /[\s/@?#]/.test(host) || host.includes('://')) throw Error('Укажите хост SOCKS5 отдельно от порта.');
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw Error('Неверный порт SOCKS5.');
-  const username = String(input.username || ''), password = String(input.password || '');
+  const mode = input.mode == null ? 'socks5' : String(input.mode);
+  if (!['socks5', 'network'].includes(mode)) throw Error('Выберите SOCKS5 или текущую сеть / VPN.');
+  let host = String(input.host || '').trim(), port = Number(input.port ?? 1080);
+  const validHost = host && host.length <= 253 && !/[\s/@?#]/.test(host) && !host.includes('://');
+  const validPort = Number.isInteger(port) && port >= 1 && port <= 65535;
+  if (mode === 'socks5' && !validHost) throw Error('Укажите хост SOCKS5 отдельно от порта.');
+  if (mode === 'socks5' && !validPort) throw Error('Неверный порт SOCKS5.');
+  if (mode === 'network') { if (!validHost) host = '127.0.0.1'; if (!validPort) port = 1080; }
+  const username = mode === 'socks5' ? String(input.username || '') : '', password = mode === 'socks5' ? String(input.password || '') : '';
   if (Buffer.byteLength(username) > 255 || Buffer.byteLength(password) > 255) throw Error('Логин и пароль SOCKS5: максимум 255 байт.');
   if (!username && password) throw Error('Для пароля нужен логин SOCKS5.');
   const timezone = String(input.timezone || 'Europe/Amsterdam');
@@ -55,7 +59,8 @@ function validateSettings(input) {
   if (!['en-US', 'en-GB', 'nl-NL', 'de-DE', 'fr-FR'].includes(language)) throw Error('Выберите язык из списка.');
   const interval = Number(input.interval || 5);
   if (![2, 5, 10, 30].includes(interval)) throw Error('Неверный интервал проверки IP.');
-  return { host, port, username, password, timezone, language, interval,
+  return { mode, host, port, username, password, timezone, language, interval,
+    claudeSource: input.claudeSource === 'manual' ? 'manual' : 'auto',
     captureBodies: input.captureBodies === true, claudePath: String(input.claudePath || '') };
 }
 

@@ -33,5 +33,8 @@ const publicProof = {
   publication: 'allowlist only; device metadata, user agent, full headers, paths, process/session IDs and raw traffic omitted'
 };
 if (source.webSocketCaptured != null) publicProof.webSocketCaptured = source.webSocketCaptured;
+if (['network', 'socks5'].includes(source.connectionMode)) publicProof.connectionMode = source.connectionMode;
+if (source.automaticWindowsAppsDiscovery === true) publicProof.automaticWindowsAppsDiscovery = true;
+if (source.ipChecksThroughLocalTLS === true) publicProof.ipChecksThroughLocalTLS = true;
 if (source.restart) publicProof.restart = { freshPolicy: source.restart.freshPolicy, passwordAbsent: source.restart.passwordAbsent };
 fs.writeFileSync(process.argv[3], JSON.stringify(publicProof, null, 2) + '\n');

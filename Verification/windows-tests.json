@@ -3,7 +3,7 @@
   "platform": "Windows x64",
   "node": "24.22.0",
   "electron": "44.9.2",
-  "tests": 16,
+  "tests": 21,
   "failures": 0,
   "skipped": 0,
   "checks": [
@@ -14,7 +14,11 @@
     "actual locale/profile verification and shared renderer ownership",
     "named pipe authentication and fragmented frames",
     "traffic redaction",
-    "Windows Job Object: EOF, helper crash, heartbeat timeout"
+    "Windows Job Object: EOF, helper crash, heartbeat timeout",
+    "current network/VPN without SOCKS5",
+    "current network IP change closes active tunnel and latches",
+    "MSIX manifest lookup, newest readable version and access-denied handling"
   ],
-  "helperSHA256": "6dd303c802bc50b7cc510e0bbb8075731ada0c89eab4f5462e9134398e544bcc"
+  "helperSHA256": "6dd303c802bc50b7cc510e0bbb8075731ada0c89eab4f5462e9134398e544bcc",
+  "version": "0.4.1"
 }

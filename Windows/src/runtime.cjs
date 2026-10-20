@@ -1,35 +1,14 @@
 'use strict';
-const fs = require('node:fs/promises');
+const fs = require('./raw-fs.cjs').promises;
 const path = require('node:path');
 const { promisify } = require('node:util');
 const { execFile } = require('node:child_process');
 const run = promisify(execFile);
 const { parseArchive, addBootstrap, updatePEIntegrity, windowsBootstrap, hash } = require('./asar.cjs');
-
-async function powershell(script, timeout = 30000) {
-  const encoded = Buffer.from("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);\n" + script, 'utf16le').toString('base64');
-  const exe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const result = await run(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true, timeout, maxBuffer: 1048576 });
-  return result.stdout.replace(/^\uFEFF/, '').trim();
-}
-const psQuote = value => "'" + String(value).replaceAll("'", "''") + "'";
+const { powershell, psQuote } = require('./windows.cjs');
 
 async function discoverClaude() {
-  const local = process.env.LOCALAPPDATA || '', candidates = [];
-  for (const base of [path.join(local, 'AnthropicClaude'), path.join(local, 'Claude'), path.join(local, 'Programs', 'Claude')]) {
-    candidates.push(path.join(base, 'claude.exe'));
-    for (const item of await fs.readdir(base, { withFileTypes: true }).catch(() => [])) {
-      if (item.isDirectory() && /^app-/.test(item.name)) candidates.unshift(path.join(base, item.name, 'claude.exe'));
-    }
-  }
-  if (process.platform === 'win32') {
-    try {
-      const output = await powershell("@(Get-AppxPackage -Name Claude | Sort-Object Version -Descending | ForEach-Object { Join-Path $_.InstallLocation 'app\\claude.exe'; Join-Path $_.InstallLocation 'claude.exe' }) | ConvertTo-Json -Compress");
-      const packages = output ? JSON.parse(output) : []; candidates.unshift(...(Array.isArray(packages) ? packages : [packages]));
-    } catch { /* Manual executable selection stays available. */ }
-  }
-  for (const item of candidates) if (await fs.stat(item).then(s => s.isFile()).catch(() => false)) return item;
-  return '';
+  return (await require('./discovery.cjs').discoverClaude()).path;
 }
 
 async function restrictRoot(root) {

@@ -1,0 +1,17 @@
+{
+  "version": "0.4.1",
+  "platform": "win32",
+  "result": "PASS",
+  "claudeFound": true,
+  "connectionModes": [
+    "network",
+    "socks5"
+  ],
+  "selectedMode": "network",
+  "claudeSource": "auto",
+  "runtimePrepared": true,
+  "sourceSignatureValid": true,
+  "standardUser": true,
+  "packagedElectron": true,
+  "originalPermissionsChanged": false
+}

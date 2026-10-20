@@ -1,0 +1,50 @@
+{
+  "result": "PASS",
+  "platform": "Windows x64",
+  "test": "official local Claude, isolated profile, synthetic local TLS fixture",
+  "sourceVersion": "3.1623.0",
+  "rendererProfile": {
+    "timezone": "Europe/Amsterdam",
+    "language": "en-US",
+    "locale": "en-US"
+  },
+  "capturedHTTP": {
+    "method": "POST",
+    "url": "https://claude.ai/__guard_test__/capture",
+    "status": 200,
+    "acceptLanguage": "en-US",
+    "sent": {
+      "timezone": "Europe/Amsterdam",
+      "language": "en-US",
+      "locale": "en-US"
+    },
+    "received": {
+      "marker": "guard-response-ok",
+      "received": {
+        "timezone": "Europe/Amsterdam",
+        "language": "en-US",
+        "locale": "en-US"
+      }
+    }
+  },
+  "iframeProfiles": 8,
+  "auxiliaryWindowsClosed": 2,
+  "sharedLocale": {
+    "conflict": "Another locale override is already in effect",
+    "inherited": true
+  },
+  "killSwitch": {
+    "milliseconds": 1200,
+    "processGone": true,
+    "streamClosed": true,
+    "relayRefusesNewConnections": true,
+    "blockedUntilRestart": true
+  },
+  "observedIPSource": "controlled test-only provider; no physical WAN change",
+  "network": "local fixture only; external traffic denied by the test environment",
+  "publication": "allowlist only; device metadata, user agent, full headers, paths, process/session IDs and raw traffic omitted",
+  "webSocketCaptured": true,
+  "connectionMode": "network",
+  "automaticWindowsAppsDiscovery": true,
+  "ipChecksThroughLocalTLS": true
+}

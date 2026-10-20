@@ -13,13 +13,16 @@ const { SocketReader } = require('../src/relay.cjs');
 const { prepareRuntime, powershell, psQuote } = require('../src/runtime.cjs');
 
 const argv = process.argv.slice(2), argument = name => argv[argv.indexOf(name) + 1];
-const source = argument('--claude'), work = path.resolve(argument('--work'));
+let source = argument('--claude'); const work = path.resolve(argument('--work'));
+const connectionMode = argv.includes('--network') ? 'network' : 'socks5';
 const certPath = path.resolve(argument('--cert')), keyPath = path.resolve(argument('--key'));
 const hostPath = path.resolve(argument('--host'));
 let observed = '203.0.113.7';
 const checker = require('../src/ip-check.cjs');
-checker.initialIP = async () => ({ success: true, ip: observed, country_code: 'NL' });
-checker.currentIP = async () => ({ ip: observed });
+if (connectionMode === 'socks5') {
+  checker.initialIP = async () => ({ success: true, ip: observed, country_code: 'NL' });
+  checker.currentIP = async () => ({ ip: observed });
+}
 const { GuardController } = require('../src/controller.cjs');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, label, timeout = 30000) {
@@ -46,8 +49,21 @@ const frame = '<script>parent.postMessage({guardFixture:true,timezone:Intl.DateT
 
 async function main() {
   assert.equal(process.platform, 'win32'); await fs.mkdir(work, { recursive: true });
+  if (source === 'auto') {
+    const found = await require('../src/discovery.cjs').discoverClaude();
+    assert.equal(found.status, 'found'); assert.equal(found.kind, 'msix');
+    assert.ok(found.path.toLowerCase().includes('\\windowsapps\\'));
+    source = found.path; proof.automaticWindowsAppsDiscovery = true;
+  }
+  proof.connectionMode = connectionMode;
   const cert = await fs.readFile(certPath), key = await fs.readFile(keyPath);
   const tlsServer = https.createServer({ cert, key }, (req, res) => {
+    const hostname = req.headers.host?.split(':')[0];
+    if (['ipwho.is', 'api64.ipify.org'].includes(hostname)) {
+      (observations.ipChecks ||= {})[hostname] = (observations.ipChecks?.[hostname] || 0) + 1;
+      const response = JSON.stringify(hostname === 'ipwho.is' ? { success: true, country_code: 'NL', ip: observed } : { ip: observed });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(response) }); res.end(response); return;
+    }
     if (req.url.startsWith('/__guard_test__/stream')) {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', Connection: 'keep-alive', 'Cache-Control': 'no-cache' });
       res.write('data: {"marker":"guard-sse-open"}\n\n'); observations.streamOpen = true;
@@ -74,6 +90,18 @@ async function main() {
     const data = Buffer.from('guard-ws-response'); socket.write(Buffer.concat([Buffer.from([0x81, data.length]), data]));
   });
   tlsServer.listen(0, '127.0.0.1'); await once(tlsServer, 'listening');
+  const originalConnection = net.createConnection;
+  if (connectionMode === 'network') {
+    // Test-scoped destination mapping, without changing hosts or shipping a route override.
+    net.createConnection = function (options, ...args) {
+      if (options && typeof options === 'object' && options.host && !['127.0.0.1', '::1'].includes(options.host)) {
+        if (['claude.ai', 'challenges.cloudflare.com', 'ipwho.is', 'api64.ipify.org'].includes(options.host) && options.port === 443)
+          return originalConnection.call(this, { ...options, host: '127.0.0.1', port: tlsServer.address().port }, ...args);
+        const socket = new net.Socket(); queueMicrotask(() => socket.destroy(Object.assign(Error('Fixture denies external destinations'), { code: 'ECONNREFUSED' }))); return socket;
+      }
+      return originalConnection.call(this, options, ...args);
+    };
+  }
   const socks = net.createServer(async socket => {
     track(socket); const reader = new SocketReader(socket);
     try {
@@ -134,7 +162,7 @@ command=async m=>{
     proof.internet = 'temporary Windows Firewall rules deny non-loopback egress from all private runtime executables';
     controller = new GuardController(root, resources); controller.on('log', e => console.log(e.kind + ': ' + e.message));
     const captures = new Map(); controller.on('record', r => captures.set(r.id, r));
-    const input = { host: '127.0.0.1', port: socks.address().port, timezone: 'Europe/Amsterdam', language: 'en-US', interval: 2, captureBodies: true, claudePath: source };
+    const input = { mode: connectionMode, host: '127.0.0.1', port: socks.address().port, timezone: 'Europe/Amsterdam', language: 'en-US', interval: 2, captureBodies: true, claudePath: source };
     await controller.start(input);
     await until(() => controller.state === 'running' || (controller.state === 'blocked' && Promise.reject(Error(controller.message))), 'renderer profile', 45000);
     const channel = controller.channel;
@@ -177,6 +205,10 @@ command=async m=>{
     const refusal = net.connect(port, '127.0.0.1'); const refused = await new Promise(resolve => { refusal.once('connect', () => resolve(false)); refusal.once('error', () => resolve(true)); }); refusal.destroy();
     assert.equal(refused, true); controller.stop(); await assert.rejects(controller.start(input));
     proof.killSwitch = { milliseconds: Date.now() - changedAt, processGone: true, streamClosed: true, relayRefusesNewConnections: refused, blockedUntilRestart: true };
+    if (connectionMode === 'network') {
+      assert.ok(observations.ipChecks?.['ipwho.is'] >= 1); assert.ok(observations.ipChecks?.['api64.ipify.org'] >= 2);
+      proof.ipChecksThroughLocalTLS = true;
+    }
     proof.result = 'PASS'; await fs.writeFile(path.join(work, 'proof.json'), JSON.stringify(proof, null, 2));
     console.log('PASS: installed Windows Claude, locale, interception, iframe lifecycle and IP kill');
   } catch (error) {
@@ -187,6 +219,7 @@ command=async m=>{
     throw error;
   } finally {
     controller?.stop();
+    net.createConnection = originalConnection;
     await powershell(`Get-NetFirewallRule -Group ${psQuote(ruleGroup)} -ErrorAction SilentlyContinue | Remove-NetFirewallRule`, 30000);
     for (const socket of sockets) socket.destroy(); tlsServer.close(); socks.close();
   }

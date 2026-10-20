@@ -79,8 +79,26 @@ function authority(text) {
   return { host, port };
 }
 
+async function connectCurrentNetwork(host, port, onSocket = () => {}) {
+  const socket = net.createConnection({ host, port }); onSocket(socket);
+  socket.setTimeout(8000, () => socket.destroy(Error('Тайм-аут подключения через текущую сеть.')));
+  try {
+    await new Promise((resolve, reject) => {
+      const connected = () => { cleanup(); resolve(); }, failed = error => { cleanup(); reject(error); };
+      const closed = () => failed(Error('Соединение закрыто при подключении.'));
+      const cleanup = () => socket.off('connect', connected).off('error', failed).off('close', closed);
+      socket.once('connect', connected).once('error', failed).once('close', closed);
+    });
+    socket.setTimeout(0); socket.pause(); return socket;
+  } catch (error) { socket.destroy(); error.targetRefused = true; throw error; }
+}
+
 class SOCKSRelay extends EventEmitter {
-  constructor(proxy) { super(); this.proxy = proxy; this.sockets = new Set(); this.unlocked = false; this.closed = false; }
+  constructor(proxy, mode = 'socks5') {
+    super();
+    if (!['socks5', 'network'].includes(mode) || (mode === 'socks5' && !proxy?.host)) throw Error('Не задан режим подключения.');
+    this.mode = mode; this.proxy = proxy; this.sockets = new Set(); this.unlocked = false; this.closed = false;
+  }
   async start() {
     this.server = net.createServer(socket => this.accept(socket));
     this.server.maxConnections = 128;
@@ -108,7 +126,8 @@ class SOCKSRelay extends EventEmitter {
         if (this.closed || (!this.unlocked && !(port === 443 && ['ipwho.is', 'api64.ipify.org'].includes(host)))) {
           client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return;
         }
-        try { upstream = await connectSOCKS(this.proxy, host, port, socket => this.track(socket)); }
+        try { upstream = this.mode === 'network' ? await connectCurrentNetwork(host, port, socket => this.track(socket))
+          : await connectSOCKS(this.proxy, host, port, socket => this.track(socket)); }
         catch (error) { if (!this.closed && !error.targetRefused) this.emit('fatal', error.message); throw error; }
         if (this.closed || client.destroyed) { upstream.destroy(); return; }
         client.setTimeout(0);
@@ -131,6 +150,7 @@ class SOCKSRelay extends EventEmitter {
     this.server?.close(); this.proxy = null;
   }
 }
+class NetworkRelay extends SOCKSRelay { constructor() { super(null, 'network'); } }
 
 async function connectTunnel(port, host, targetPort = 443) {
   const socket = net.createConnection({ host: '127.0.0.1', port });
@@ -156,4 +176,4 @@ async function connectTunnel(port, host, targetPort = 443) {
   socket.setTimeout(0); return socket;
 }
 
-module.exports = { SOCKSRelay, connectSOCKS, connectTunnel, SocketReader, authority };
+module.exports = { SOCKSRelay, NetworkRelay, connectSOCKS, connectCurrentNetwork, connectTunnel, SocketReader, authority };

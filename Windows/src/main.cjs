@@ -3,7 +3,8 @@ const { app, BrowserWindow, ipcMain, dialog, powerMonitor } = require('electron'
 const fs = require('node:fs');
 const path = require('node:path');
 const { GuardController } = require('./controller.cjs');
-const { discoverClaude } = require('./runtime.cjs');
+const { discoverClaude } = require('./discovery.cjs');
+const { prepareRuntime } = require('./runtime.cjs');
 const { validateSettings } = require('./policy.cjs');
 const { diagnostic } = require('./sanitize.cjs');
 
@@ -18,7 +19,7 @@ else {
   const send = (type, data) => { if (window && !window.isDestroyed()) window.webContents.send('guard:event', { type, data }); };
   const safeError = error => diagnostic(error?.message || 'Не удалось выполнить действие.');
   function settings() {
-    const defaults = { host: '127.0.0.1', port: 1080, username: '', timezone: 'Europe/Amsterdam', language: 'en-US', interval: 5, captureBodies: false, claudePath: '' };
+    const defaults = { mode: 'network', host: '127.0.0.1', port: 1080, username: '', timezone: 'Europe/Amsterdam', language: 'en-US', interval: 5, captureBodies: false, claudePath: '', claudeSource: 'auto' };
     try {
       const stored = validateSettings({ ...JSON.parse(fs.readFileSync(path.join(root, 'settings.json'), 'utf8')), password: '' });
       delete stored.password; return { ...defaults, ...stored };
@@ -39,15 +40,27 @@ else {
       send('record', value);
     });
     handle('init', async () => {
-      const value = settings(); if (!value.claudePath) value.claudePath = await discoverClaude();
+      const value = settings();
       return { version: app.getVersion(), settings: value, state: controller.snapshot(), logs: controller.events, records: [...traffic.values()] };
     });
+    let finding;
+    const findClaude = () => {
+      if (!finding) finding = discoverClaude().finally(() => { finding = null; });
+      return finding;
+    };
+    handle('find', findClaude);
     handle('choose', async () => {
       const result = await dialog.showOpenDialog(window, { title: 'Выберите установленный claude.exe', properties: ['openFile'], filters: [{ name: 'Claude Desktop', extensions: ['exe'] }] });
       return result.canceled ? '' : result.filePaths[0];
     });
     handle('start', async input => {
-      const value = validateSettings(input), saved = { ...value }; delete saved.password;
+      const value = validateSettings(input);
+      if (value.claudeSource === 'auto') {
+        const found = await findClaude();
+        if (found.status !== 'found') throw Error(found.message);
+        value.claudePath = found.path; send('discovery', found);
+      }
+      const saved = { ...value }; delete saved.password;
       fs.mkdirSync(root, { recursive: true, mode: 0o700 });
       fs.writeFileSync(path.join(root, 'settings.json'), JSON.stringify(saved, null, 2), { mode: 0o600 });
       traffic.clear(); send('clear', null); await controller.start(value); return controller.snapshot();
@@ -75,15 +88,31 @@ else {
       const proof = await window.webContents.executeJavaScript(`new Promise(resolve => {
         const started = Date.now();
         const poll = () => {
-          if (document.body.dataset.ready === 'true' || Date.now() - started > 15000)
-            resolve({title:document.title,api:typeof window.guard?.start,ready:document.body.dataset.ready,buttons:document.querySelectorAll('button').length});
+          if (document.body.dataset.ready === 'true' && document.body.dataset.discoveryDone === 'true' || Date.now() - started > 25000)
+            resolve({title:document.title,api:typeof window.guard?.start,ready:document.body.dataset.ready,discoveryDone:document.body.dataset.discoveryDone,
+              claudeFound:document.body.dataset.claudeFound==='true',connectionModes:[...document.querySelectorAll('#mode option')].map(x=>x.value),
+              selectedMode:document.getElementById('mode').value,claudeSource:document.getElementById('claudeSource').value,buttons:document.querySelectorAll('button').length});
           else setTimeout(poll, 50);
         }; poll();
       })`);
       const out = process.env.GATE_SMOKE_OUT;
+      await window.webContents.executeJavaScript('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
       if (process.env.GATE_SMOKE_PNG) fs.writeFileSync(process.env.GATE_SMOKE_PNG, (await window.webContents.capturePage()).toPNG());
-      if (out) fs.writeFileSync(out, JSON.stringify({ ...proof, platform: process.platform, version: app.getVersion(), result: proof.ready === 'true' && proof.api === 'function' ? 'PASS' : 'FAIL' }, null, 2));
-      app.exit(proof.ready === 'true' && proof.api === 'function' ? 0 : 1);
+      if (process.env.GATE_SMOKE_PREPARE === '1') {
+        proof.runtimePrepared = false;
+        try {
+          const found = await findClaude();
+          if (found.status !== 'found') throw Error(found.message);
+          const runtime = await prepareRuntime(found.path, path.join(root, 'Cache'), path.join(resources, 'RuntimeBootstrap.cjs'));
+          proof.runtimePrepared = Boolean(runtime.executable);
+          proof.sourceSignatureValid = runtime.signature === 'Valid';
+        } catch (error) { proof.prepareError = safeError(error); }
+      }
+      const ok = proof.ready === 'true' && proof.api === 'function' && proof.discoveryDone === 'true' && proof.connectionModes.includes('network') && proof.connectionModes.includes('socks5') &&
+        (process.env.GATE_EXPECT_CLAUDE !== '1' || proof.claudeFound) &&
+        (process.env.GATE_SMOKE_PREPARE !== '1' || proof.runtimePrepared && proof.sourceSignatureValid);
+      if (out) fs.writeFileSync(out, JSON.stringify({ ...proof, platform: process.platform, version: app.getVersion(), result: ok ? 'PASS' : 'FAIL' }, null, 2));
+      app.exit(ok ? 0 : 1);
     }
   }).catch(error => {
     dialog.showErrorBox('Claude Proxy Guard', safeError(error)); app.exit(1);
