@@ -1,0 +1,26 @@
+{
+  "version": "0.5.0",
+  "result": "PASS",
+  "platform": "Windows x64",
+  "test": "real WFP rules against a private Node executable and local TCP/UDP/IPv6 fixtures",
+  "coverage": "existing private runtime executable paths",
+  "allowed": "TCP to the exact owned 127.0.0.1 relay port",
+  "checks": {
+    "baselineAllFixtureEndpointsReachable": true,
+    "otherLoopbackTCPBlocked": true,
+    "LANAddressTCPBlocked": true,
+    "IPv6TCPBlocked": true,
+    "UDPBlocked": true,
+    "brokerDisconnectRetainsBlocks": true,
+    "prematureRemovalRefused": true,
+    "overlappingInstallationsSerialized": true,
+    "staleCloseDoesNotRemoveNewSessionFilters": true,
+    "normalCleanupRestoresFixtureConnectivity": true
+  },
+  "limits": [
+    "Not an inherited AppContainer/VM boundary.",
+    "New or external executable paths and service-mediated networking require separate OS isolation.",
+    "The Guard gateway DNS and route depend on the selected network/SOCKS mode.",
+    "A remote NAT public IP change is observed by polling, not instantaneously."
+  ]
+}

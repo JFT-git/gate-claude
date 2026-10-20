@@ -47,6 +47,11 @@ final class GuardModel: ObservableObject {
     private var pathMonitor: NWPathMonitor?
     private var localBaseline = Set<String>()
     private var policy = SessionPolicy()
+    private var revalidationTask: Task<Void, Never>?
+    private var launchPending = false
+    private var launchAfterValidation = false
+    private var networkRevision = 0
+    private var sleeping = false
     private var trafficWindow: NSWindow?
     private let diagnostics: GuardDiagnostics
     var onRestart: (() -> Void)?
@@ -64,6 +69,10 @@ final class GuardModel: ObservableObject {
     var e2eInspector: ClaudeInspector? { inspector }
     var e2eRelayPort: UInt16? { relayPort }
     var e2eProcessID: Int32? { process?.processIdentifier }
+    var e2eSuspended: Bool { policy.suspended }
+    func e2eVerifyNow() { verifyPinnedIP(andLaunch: false) }
+    func e2eNetworkChanged() { networkChanged("Изменение тестовой сети") }
+    func e2ePowerChanged(sleeping: Bool) { powerChanged(sleeping: sleeping) }
     #endif
 
 
@@ -85,8 +94,8 @@ final class GuardModel: ObservableObject {
         for event in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification] {
             powerObservers.append(center.addObserver(forName: event, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
-                    guard let self, self.monitoring || self.busy || self.claudeRunning else { return }
-                    self.block("Сон или пробуждение Mac. Перезапустите Guard.", latch: true)
+                    guard let self else { return }
+                    self.powerChanged(sleeping: event == NSWorkspace.willSleepNotification)
                 }
             })
         }
@@ -122,26 +131,27 @@ final class GuardModel: ObservableObject {
         Task { [self] in
             do {
                 try LaunchProfile(timezone: timezone, language: language).validate()
+                let relay: SOCKSRelay
                 if useProxy {
                     let config = try ProxySettings.validated(host: host, port: port, username: username, password: password)
-                    let relay = SOCKSRelay(settings: config)
-                    relay.onFault = { [weak self] in
-                        guard let self, self.operation == token else { return }
-                        self.block("Соединение с SOCKS5 потеряно. Перезапустите Guard.", latch: true)
-                    }
-                    relay.onTunnelEvent = { [weak self] host, port, sent, received, finished in
-                        guard let self, self.operation == token else { return }
-                        var record = TrafficRecord(id: UUID().uuidString)
-                        record.method = "CONNECT"; record.kind = "TLS-шлюз"; record.url = "\(host):\(port)"
-                        record.note = finished ? "Закрыто: ↑ \(sent) байт, ↓ \(received) байт" : "Туннель открыт"
-                        record.sent = "TLS зашифрован. Содержимое веб-запросов смотрите в записях CDP."
-                        self.addTraffic(record)
-                    }
-                    self.relay = relay
-                    let localPort = try await relay.start()
-                    guard operation == token else { relay.stop(); return }
-                    relayPort = localPort
+                    relay = SOCKSRelay(settings: config)
+                } else { relay = SOCKSRelay(currentNetwork: true) }
+                relay.onFault = { [weak self] in
+                    guard let self, self.operation == token else { return }
+                    self.networkChanged("Шлюз временно потерял соединение с прокси")
                 }
+                relay.onTunnelEvent = { [weak self] host, port, sent, received, finished in
+                    guard let self, self.operation == token else { return }
+                    var record = TrafficRecord(id: UUID().uuidString)
+                    record.method = "CONNECT"; record.kind = "TLS-шлюз"; record.url = "\(host):\(port)"
+                    record.note = finished ? "Закрыто: ↑ \(sent) байт, ↓ \(received) байт" : "Туннель открыт"
+                    record.sent = "TLS зашифрован. Содержимое веб-запросов смотрите в записях CDP."
+                    self.addTraffic(record)
+                }
+                self.relay = relay
+                let localPort = try await relay.start()
+                guard operation == token else { relay.stop(); return }
+                relayPort = localPort
                 guard operation == token else { return }
                 startNetworkGuard(token: token)
                 let result = try await initialIPCheck(relayPort)
@@ -153,38 +163,96 @@ final class GuardModel: ObservableObject {
                     guard operation == token else { return }
                     try policy.verify(actual)
                 }
-                guard NetworkSnapshot.current() == localBaseline else { throw GuardError.message("Локальные адреса изменились во время проверки.") }
-                if let relay, !relay.unlock() { throw GuardError.message("Локальный шлюз уже закрыт.") }
+                localBaseline = NetworkSnapshot.current()
+                if sleeping {
+                    monitoring = true; busy = false; launchAfterValidation = launch
+                    suspendTraffic("Mac находится в режиме сна")
+                    return
+                }
+                if !relay.unlock() { throw GuardError.message("Локальный шлюз уже закрыт.") }
                 allowed = true; monitoring = true; busy = false
                 phase = "IP закреплён за сессией"
-                detail = watchPublicIP ? "Внешний IP: каждые \(interval) с. Локальная сеть: каждую секунду. Любая смена блокирует сессию." : "Локальная сеть проверяется каждую секунду. Смена публичного IP за NAT/прокси в этом режиме не обнаруживается."
+                detail = watchPublicIP ? "Внешний IP: каждые \(interval) с. Изменение сети приостанавливает шлюз до повторной проверки IP." : "Изменение локальной сети приостанавливает шлюз для проверки IP. Периодические проверки отключены."
                 appendLog("Исходный IP закреплён: \(result.ip) · \(result.countryCode)")
                 scheduleCheck()
                 if launch { attemptLaunch() }
             } catch {
                 guard operation == token else { return }
-                block(error.localizedDescription, latch: policy.pinnedIP != nil || policy.requiresRestart)
+                if policy.pinnedIP != nil, !policy.requiresRestart {
+                    monitoring = true
+                    verifyPinnedIP(andLaunch: launch, pauseReason: error.localizedDescription)
+                } else { block(error.localizedDescription, latch: policy.requiresRestart) }
             }
         }
     }
 
-    private func verifyPinnedIP(andLaunch launch: Bool) {
-        guard !busy, !requiresRestart else { return }
+    private func verifyPinnedIP(andLaunch launch: Bool, pauseReason: String? = nil) {
+        guard !requiresRestart, policy.pinnedIP != nil else { return }
+        launchAfterValidation = launchAfterValidation || launch
+        if let pauseReason { suspendTraffic(pauseReason) }
+        guard revalidationTask == nil, !sleeping else { return }
         busy = true; let token = operation
-        Task {
-            do {
-                let actual = try await currentIPCheck(relayPort)
-                guard operation == token else { return }
-                try policy.verify(actual)
-                if let last = report { report = IPReport(ip: actual, countryCode: last.countryCode, country: last.country, date: Date()) }
-                busy = false
-                scheduleCheck()
-                if launch { attemptLaunch() }
-            } catch {
-                guard operation == token else { return }
-                block(error.localizedDescription, latch: true)
+        revalidationTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, self.operation == token, !self.sleeping {
+                let revision = self.networkRevision
+                do {
+                    let actual = try await self.currentIPCheck(self.relayPort)
+                    guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
+                    // A response started before the most recent route event cannot reopen the gate.
+                    guard revision == self.networkRevision else { continue }
+                    let wasSuspended = self.policy.suspended
+                    try self.policy.verify(actual)
+                    if wasSuspended, let relay = self.relay, !relay.unlock() {
+                        throw GuardError.message("Шлюз ожидает успешного контрольного подключения.")
+                    }
+                    self.localBaseline = NetworkSnapshot.current()
+                    if let last = self.report { self.report = IPReport(ip: actual, countryCode: last.countryCode, country: last.country, date: Date()) }
+                    self.allowed = true; self.monitoring = true; self.busy = self.launchPending
+                    self.phase = "IP закреплён за сессией"
+                    if wasSuspended {
+                        self.detail = "Прежний внешний IP подтверждён. Шлюз возобновлён."
+                        self.appendLog("Повторная проверка подтвердила прежний IP; шлюз возобновлён.")
+                    }
+                    self.revalidationTask = nil
+                    let shouldLaunch = self.launchAfterValidation; self.launchAfterValidation = false
+                    self.scheduleCheck()
+                    if shouldLaunch, !self.launchPending, !self.claudeRunning { self.attemptLaunch() }
+                    return
+                } catch {
+                    guard !Task.isCancelled, self.operation == token else { return }
+                    if self.policy.requiresRestart { self.block(error.localizedDescription, latch: true); return }
+                    self.suspendTraffic(error.localizedDescription)
+                    do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
+                }
             }
         }
+    }
+
+    private func suspendTraffic(_ reason: String) {
+        let firstPause = !policy.suspended
+        policy.suspend(); relay?.pause()
+        allowed = false; phase = "Шлюз приостановлен — проверяем IP"
+        detail = "\(reason). Новые запросы Claude закрыты до подтверждения прежнего IP."
+        timer?.invalidate(); timer = nil; nextCheck = nil
+        if firstPause { appendLog("Шлюз приостановлен для повторной проверки IP: \(reason)") }
+    }
+
+    private func networkChanged(_ reason: String) {
+        networkRevision += 1
+        relay?.pause()
+        guard policy.pinnedIP != nil, monitoring || claudeRunning else { return }
+        verifyPinnedIP(andLaunch: false, pauseReason: reason)
+    }
+
+    private func powerChanged(sleeping: Bool) {
+        self.sleeping = sleeping
+        networkRevision += 1
+        relay?.pause()
+        guard policy.pinnedIP != nil else { return }
+        suspendTraffic(sleeping ? "Mac переходит в режим сна" : "Mac вышел из режима сна")
+        revalidationTask?.cancel(); revalidationTask = nil
+        if !sleeping { verifyPinnedIP(andLaunch: false) }
     }
 
     private func scheduleCheck() {
@@ -200,10 +268,10 @@ final class GuardModel: ObservableObject {
     private func startNetworkGuard(token: UUID) {
         let currentRelay = relay
         let changed: () -> Void = { [weak self] in
-            currentRelay?.stop()
+            currentRelay?.pause()
             DispatchQueue.main.async {
                 guard let self, self.operation == token else { return }
-                self.block("Локальный адрес или маршрут изменился. Перезапустите Guard.", latch: true)
+                self.networkChanged("Локальный адрес или маршрут изменился")
             }
         }
         let watcher = LocalNetworkWatcher(); networkWatcher = watcher
@@ -225,14 +293,15 @@ final class GuardModel: ObservableObject {
         #if GUARD_E2E
         if let e2ePublicCheck { return try await e2ePublicCheck(port) }
         #endif
-        return try await IPChecker.publicIP(relayPort: port)
+        return try await IPChecker.publicIP(relayPort: port, pinnedIP: policy.pinnedIP)
     }
     private func attemptLaunch() {
         guard !busy, !requiresRestart else { return }
-        busy = true
+        busy = true; launchPending = true
         let token = operation
         runtimeStatus = "Подготавливаем отдельную локальную копию Claude…"
         Task {
+            defer { if operation == token { launchPending = false; busy = revalidationTask != nil } }
             var checkingRoute = false
             do {
                 let source = URL(fileURLWithPath: claudePath).standardizedFileURL.resolvingSymlinksInPath()
@@ -245,7 +314,10 @@ final class GuardModel: ObservableObject {
                 guard operation == token else { return }
                 checkingRoute = true
                 if watchPublicIP { try policy.verify(await currentIPCheck(relayPort)) }
-                guard NetworkSnapshot.current() == localBaseline else { throw GuardError.message("Маршрут изменился во время подготовки Claude.") }
+                if NetworkSnapshot.current() != localBaseline { networkChanged("Сеть изменилась во время подготовки Claude") }
+                while policy.suspended, operation == token {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
                 guard operation == token else { return }
                 checkingRoute = false
                 runtimeStatus = "Локальная копия Claude \(prepared.sourceVersion), отдельный профиль"
@@ -257,7 +329,10 @@ final class GuardModel: ObservableObject {
                 busy = false; scheduleCheck()
             } catch {
                 guard operation == token else { return }
-                block(error.localizedDescription, latch: checkingRoute || policy.requiresRestart)
+                if checkingRoute, !policy.requiresRestart {
+                    launchAfterValidation = true
+                    verifyPinnedIP(andLaunch: true, pauseReason: error.localizedDescription)
+                } else { block(error.localizedDescription, latch: policy.requiresRestart) }
             }
         }
     }
@@ -366,6 +441,8 @@ final class GuardModel: ObservableObject {
         if latch { policy.latch(reason) }
         requiresRestart = policy.requiresRestart
         operation = UUID()
+        revalidationTask?.cancel(); revalidationTask = nil
+        launchPending = false; launchAfterValidation = false
         relay?.stop(); relay = nil; relayPort = nil
         inspector?.stop(); inspector = nil
         timer?.invalidate(); timer = nil; nextCheck = nil
@@ -466,7 +543,7 @@ struct GuardView: View {
                         Text("Проверка IP перед запуском Claude").font(.system(size: 13)).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Text("v0.3.2").font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
+                    Text("v0.3.3").font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
                 }
                 Surface {
                     VStack(alignment: .leading, spacing: 14) {
@@ -525,7 +602,7 @@ struct GuardView: View {
                             }.labelsHidden().frame(width: 150)
                         }
                         Toggle("Проверять публичный IP через ipify", isOn: $model.watchPublicIP).font(.system(size: 12))
-                        Text("Локальные адреса и маршрут отслеживаются каждую секунду. При любой смене — блокировка до полного перезапуска Guard.")
+                        Text("Изменение сети или ошибка проверки приостанавливает шлюз. Прежний подтверждённый IP возобновляет сессию; другой IP блокирует её до перезапуска Guard.")
                             .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }.disabled(model.monitoring || model.busy || model.requiresRestart)
                 }
@@ -590,7 +667,7 @@ struct GuardView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Упрощённая защита — без системного kill switch", systemImage: "info.circle")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
-                    Text("Начальная страна: ipwho.is; повторный IP: ipify. Любая смена IP, ошибка проверки или потеря маршрута закрывает шлюз и останавливает Claude до перезапуска Guard. Публичный IP нельзя проверить локально за NAT. MCP, обновления и Cowork могут обходить эти настройки; CDP видит только доступные веб-контексты.")
+                    Text("Начальная страна: ipwho.is; повторный IP: ipify. Подтверждённый новый IP завершает сессию. Ошибка проверки, смена маршрута или сон приостанавливают трафик; прежний подтверждённый IP восстанавливает доступ без перезапуска Claude. Публичный IP нельзя проверить локально за NAT. Системной сетевой изоляции нет: native, MCP и Cowork могут обходить прокси; CDP видит только доступные веб-контексты.")
                         .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     DisclosureGroup("Журнал проверок", isExpanded: $model.showLog) {
                         VStack(alignment: .leading, spacing: 6) {

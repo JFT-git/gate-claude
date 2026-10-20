@@ -25,7 +25,9 @@ async function prepareRuntime(sourcePath, root, bootstrapPath, onStatus = () => 
   const original = await fs.readFile(archivePath), parsed = parseArchive(original);
   const metadata = JSON.parse(parsed.read('package.json').toString('utf8'));
   if (!['@ant/desktop', 'claude', 'Claude'].includes(metadata.name)) throw Error('Выбранное приложение не является поддерживаемым Claude Desktop.');
-  const base = await fs.readFile(bootstrapPath, 'utf8'), bootstrap = windowsBootstrap(base), executable = await fs.readFile(source);
+  // Our own module may be inside Guard's ASAR; vendor archives above use raw fs.
+  const networkGuard = require('node:fs').readFileSync(path.join(__dirname, 'runtime-network-guard.cjs'), 'utf8');
+  const base = await fs.readFile(bootstrapPath, 'utf8'), bootstrap = windowsBootstrap(base, networkGuard), executable = await fs.readFile(source);
   const fingerprint = hash(Buffer.concat([Buffer.from(parsed.digest), bootstrap, Buffer.from(hash(executable)), Buffer.from('gate-runtime-v4')]));
   const directory = path.join(root, 'Runtime-' + fingerprint.slice(0, 24)), destination = path.join(directory, path.basename(source));
   const profile = path.join(root, 'Profile');

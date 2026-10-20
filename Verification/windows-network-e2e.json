@@ -34,7 +34,7 @@
     "inherited": true
   },
   "killSwitch": {
-    "milliseconds": 1200,
+    "milliseconds": 845,
     "processGone": true,
     "streamClosed": true,
     "relayRefusesNewConnections": true,
@@ -46,5 +46,19 @@
   "webSocketCaptured": true,
   "connectionMode": "network",
   "automaticWindowsAppsDiscovery": true,
-  "ipChecksThroughLocalTLS": true
+  "ipChecksThroughLocalTLS": true,
+  "networkFence": {
+    "coverage": "private-runtime-executables",
+    "persistent": true,
+    "installedBeforeRuntime": true
+  },
+  "revalidation": {
+    "recheckingObserved": true,
+    "appTrafficBlockedWhilePaused": true,
+    "processSurvived": true,
+    "samePID": true,
+    "resumedHTTP": true,
+    "resumedStream": true,
+    "injectedHTTP500": 1
+  }
 }

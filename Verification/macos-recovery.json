@@ -1,0 +1,30 @@
+{
+  "version": "0.3.3",
+  "result": "PASS",
+  "platform": "macOS",
+  "offlineAssertions": 86,
+  "relayAndPolicy": 49,
+  "SOCKSFixtureChecks": 1,
+  "inspectorAssertions": 15,
+  "recoveryAssertions": 21,
+  "universalBuild": [
+    "arm64",
+    "x86_64"
+  ],
+  "codesignVerified": true,
+  "installedClaudeRun": false,
+  "realWANChanged": false,
+  "coverage": [
+    "current network and SOCKS gate",
+    "HTTP/SOCKS transient error pause",
+    "same pinned IP recovery",
+    "sleep and wake",
+    "late and stale replies cannot reopen closed gate",
+    "confirmed IP change requires restart",
+    "per-destination reset/refusal isolation"
+  ],
+  "limits": [
+    "No OS network container; direct native/Node/UDP/delegated service egress is outside the macOS proxy gate.",
+    "Intel executable was compiled but not run."
+  ]
+}

@@ -17,13 +17,14 @@ enum IPIdentity {
 struct SessionPolicy {
     private(set) var pinnedIP: String?
     private(set) var lockedReason: String?
+    private(set) var suspended = false
     var requiresRestart: Bool { lockedReason != nil }
 
     mutating func establish(_ report: IPReport) throws {
         guard !requiresRestart else { throw GuardError.message("Перезапустите Guard для новой сессии.") }
         try report.requireForeign()
         let ip = try IPIdentity.canonical(report.ip)
-        if pinnedIP != nil { try verify(ip) } else { pinnedIP = ip }
+        if pinnedIP != nil { try verify(ip) } else { pinnedIP = ip; suspended = false }
     }
 
     mutating func verify(_ ip: String) throws {
@@ -35,10 +36,12 @@ struct SessionPolicy {
             latch(reason)
             throw GuardError.message(reason)
         }
+        suspended = false
     }
 
-    mutating func latch(_ reason: String) { if lockedReason == nil { lockedReason = reason } }
-    mutating func manualStop() { if !requiresRestart { pinnedIP = nil } }
+    mutating func suspend() { if !requiresRestart, pinnedIP != nil { suspended = true } }
+    mutating func latch(_ reason: String) { if lockedReason == nil { lockedReason = reason }; suspended = true }
+    mutating func manualStop() { if !requiresRestart { pinnedIP = nil; suspended = false } }
 }
 
 struct LaunchProfile {
@@ -92,15 +95,18 @@ enum NetworkSnapshot {
 final class LocalNetworkWatcher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "local.proxyguard.addresses")
     private var timer: DispatchSourceTimer?
-    private var fired = false
+    private var previous = Set<String>()
     func start(baseline: Set<String>, onChange: @escaping () -> Void) {
         queue.sync {
+            previous = baseline
             let source = DispatchSource.makeTimerSource(queue: queue)
             timer = source
             source.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
             source.setEventHandler { [weak self] in
-                guard let self, !self.fired, NetworkSnapshot.current() != baseline else { return }
-                self.fired = true
+                guard let self else { return }
+                let current = NetworkSnapshot.current()
+                guard current != self.previous else { return }
+                self.previous = current
                 onChange()
             }
             source.resume()

@@ -115,7 +115,7 @@ function updatePEIntegrity(source, oldDigest, newDigest) {
   return bytes;
 }
 
-function windowsBootstrap(base) {
+function windowsBootstrap(base, networkGuard = '') {
   const original = "const reader = fs.createReadStream(null, { fd: 3, autoClose: false });\nconst writer = fs.createWriteStream(null, { fd: 4, autoClose: false });";
   if (base.split(original).length !== 2) throw Error('Неизвестная версия адаптера Guard.');
   const replacement = `if (!cfg.channelPipe || !/^[a-f0-9]{64}$/.test(cfg.channelToken || '')) throw Error('Guard channel required');
@@ -123,6 +123,7 @@ const bridge = require('node:net').connect(cfg.channelPipe);
 const reader = bridge, writer = bridge;
 bridge.once('connect', () => emit({method:'ProxyGuard.hello',params:{token:cfg.channelToken}}));
 if (process.platform === 'win32') app.setAppUserModelId('local.proxyguard.claude.runtime');`;
-  return Buffer.from(base.replace(original, replacement));
+  const guard = networkGuard ? `\n{const guardModule={exports:{}};(function(require,module){\n${networkGuard}\n})(require,guardModule);guardModule.exports.installNetworkGuard(cfg);}\n` : '';
+  return Buffer.from(base.replace(original, replacement + guard));
 }
 module.exports = { parseArchive, addBootstrap, updatePEIntegrity, windowsBootstrap, hash };

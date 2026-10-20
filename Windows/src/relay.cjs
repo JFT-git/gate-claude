@@ -1,6 +1,8 @@
 'use strict';
 const net = require('node:net');
 const { EventEmitter, once } = require('node:events');
+const { randomBytes, timingSafeEqual } = require('node:crypto');
+const securityError = message => Object.assign(Error(message), { guardSecurity: true });
 
 class SocketReader {
   constructor(socket) {
@@ -41,13 +43,13 @@ async function connectSOCKS(proxy, host, port, onSocket = () => {}) {
     });
     socket.write(proxy.username ? Buffer.from([5, 2, 0, 2]) : Buffer.from([5, 1, 0]));
     const greeting = await reader.read(2);
-    if (greeting[0] !== 5 || ![0, 2].includes(greeting[1])) throw Error('SOCKS5 не принял способ авторизации.');
+    if (greeting[0] !== 5 || ![0, 2].includes(greeting[1])) throw securityError('SOCKS5 не принял способ авторизации.');
     if (greeting[1] === 2) {
-      if (!proxy.username) throw Error('SOCKS5 требует логин и пароль.');
+      if (!proxy.username) throw securityError('SOCKS5 требует логин и пароль.');
       const username = Buffer.from(proxy.username), password = Buffer.from(proxy.password || '');
       socket.write(Buffer.concat([Buffer.from([1, username.length]), username, Buffer.from([password.length]), password]));
       const auth = await reader.read(2);
-      if (auth[0] !== 1 || auth[1] !== 0) throw Error('SOCKS5 отверг логин или пароль.');
+      if (auth[0] !== 1 || auth[1] !== 0) throw securityError('SOCKS5 отверг логин или пароль.');
     }
     // ATYP=domain keeps target DNS resolution on the SOCKS server.
     const domain = Buffer.from(host);
@@ -97,7 +99,8 @@ class SOCKSRelay extends EventEmitter {
   constructor(proxy, mode = 'socks5') {
     super();
     if (!['socks5', 'network'].includes(mode) || (mode === 'socks5' && !proxy?.host)) throw Error('Не задан режим подключения.');
-    this.mode = mode; this.proxy = proxy; this.sockets = new Set(); this.unlocked = false; this.closed = false;
+    this.mode = mode; this.proxy = proxy; this.sockets = new Set(); this.controlSockets = new Set();
+    this.checkToken = randomBytes(32).toString('hex'); this.unlocked = false; this.closed = false;
   }
   async start() {
     this.server = net.createServer(socket => this.accept(socket));
@@ -108,56 +111,96 @@ class SOCKSRelay extends EventEmitter {
     this.port = this.server.address().port;
     return this.port;
   }
-  track(socket) { this.sockets.add(socket); socket.once('close', () => this.sockets.delete(socket)); socket.on('error', () => {}); return socket; }
+  track(socket, control = false) {
+    this.sockets.add(socket); if (control) this.controlSockets.add(socket);
+    socket.once('close', () => { this.sockets.delete(socket); this.controlSockets.delete(socket); }); socket.on('error', () => {}); return socket;
+  }
   accept(client) {
     this.track(client); let bytes = Buffer.alloc(0), processing = false;
     client.setTimeout(10000, () => client.destroy());
     const onData = async chunk => {
       if (processing) return;
       bytes = Buffer.concat([bytes, chunk]);
-      if (bytes.length > 16384) { client.destroy(); return; }
-      const end = bytes.indexOf('\r\n\r\n'); if (end < 0) return;
-      processing = true; client.pause(); client.off('data', onData);
-      let upstream;
+      const end = bytes.indexOf('\r\n\r\n');
+      if (end < 0) { if (bytes.length > 16384) client.destroy(); return; }
+      if (end > 16384) { client.destroy(); return; }
+      processing = true; client.off('data', onData);
+      let upstream, pending, head = bytes.subarray(end + 4);
+      const cancel = () => { pending?.destroy(); client.destroy(); };
+      const collect = data => { head = Buffer.concat([head, data]); if (head.length > 65536) cancel(); };
+      // Keep reading FIN while DNS/SOCKS is pending. Pausing here hides cancellation
+      // and can otherwise create an upstream connection after the client has gone.
+      client.on('data', collect).once('end', cancel).once('close', cancel).once('error', cancel);
+      const release = () => { client.off('data', collect).off('end', cancel).off('close', cancel).off('error', cancel); };
       try {
-        const match = /^CONNECT ([^\s]+) HTTP\/1\.[01]\r\n/.exec(bytes.subarray(0, end + 4).toString('ascii'));
+        const headers = bytes.subarray(0, end + 4).toString('latin1');
+        if (/[^\x09\x0a\x0d\x20-\x7e]/.test(headers)) throw Error('Неверные заголовки CONNECT.');
+        const match = /^CONNECT ([^\s]+) HTTP\/1\.[01]\r\n/.exec(headers);
         if (!match) throw Error('Поддерживается только HTTPS CONNECT.');
         const { host, port } = authority(match[1]);
-        if (this.closed || (!this.unlocked && !(port === 443 && ['ipwho.is', 'api64.ipify.org'].includes(host)))) {
+        const credentials = [...headers.matchAll(/^Proxy-Authorization:[ \t]*Bearer ([a-f0-9]{64})[ \t]*\r?$/gmi)];
+        const control = credentials.length === 1 && timingSafeEqual(Buffer.from(credentials[0][1]), Buffer.from(this.checkToken)) &&
+          port === 443 && ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org'].includes(host);
+        if (control) this.controlSockets.add(client);
+        const allowed = () => !this.closed && !client.destroyed && (this.unlocked || control);
+        if (!allowed()) {
           client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return;
         }
-        try { upstream = this.mode === 'network' ? await connectCurrentNetwork(host, port, socket => this.track(socket))
-          : await connectSOCKS(this.proxy, host, port, socket => this.track(socket)); }
-        catch (error) { if (!this.closed && !error.targetRefused) this.emit('fatal', error.message); throw error; }
-        if (this.closed || client.destroyed) { upstream.destroy(); return; }
+        const opened = socket => { pending = this.track(socket, control); if (!allowed()) socket.destroy(); };
+        try { upstream = this.mode === 'network' ? await connectCurrentNetwork(host, port, opened) : await connectSOCKS(this.proxy, host, port, opened); }
+        catch (error) {
+          if (allowed() && !error.targetRefused) {
+            if (error.guardSecurity) this.emit('fatal', error.message);
+            else if (!control) this.emit('revalidate', 'Временный обрыв SOCKS5. Проверяем закреплённый IP.');
+          }
+          throw error;
+        }
+        if (!allowed()) { upstream.destroy(); return; }
+        client.pause(); release();
         client.setTimeout(0);
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        const head = bytes.subarray(end + 4); if (head.length) upstream.write(head);
+        if (head.length) upstream.write(head);
         // A single established TCP reset retires this tunnel, not the whole session.
         const close = () => { client.destroy(); upstream.destroy(); };
         client.once('close', close); upstream.once('close', close);
         client.on('error', close); upstream.on('error', close);
         client.pipe(upstream); upstream.pipe(client); client.resume(); upstream.resume();
         this.emit('tunnel', { host, port });
-      } catch { if (upstream) upstream.destroy(); if (!client.destroyed) client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'); }
+      } catch { pending?.destroy(); if (!client.destroyed) client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'); }
+      finally { release(); }
     };
     client.on('data', onData);
   }
   unlock() { if (this.closed) throw Error('Шлюз закрыт.'); this.unlocked = true; }
+  resume() { this.unlock(); }
+  pause() {
+    if (this.closed) return;
+    this.unlocked = false;
+    for (const socket of this.sockets) if (!this.controlSockets.has(socket)) socket.destroy();
+  }
   close() {
     this.closed = true; this.unlocked = false;
-    for (const socket of this.sockets) socket.destroy(); this.sockets.clear();
+    for (const socket of this.sockets) socket.destroy(); this.sockets.clear(); this.controlSockets.clear();
     this.server?.close(); this.proxy = null;
   }
 }
 class NetworkRelay extends SOCKSRelay { constructor() { super(null, 'network'); } }
 
-async function connectTunnel(port, host, targetPort = 443) {
+async function connectTunnel(port, host, targetPort = 443, checkToken = '', onSocket = () => {}) {
   const socket = net.createConnection({ host: '127.0.0.1', port });
   socket.setTimeout(8000, () => socket.destroy(Error('Тайм-аут локального шлюза.')));
   socket.on('error', () => {});
-  await once(socket, 'connect');
-  socket.write(`CONNECT ${host}:${targetPort} HTTP/1.1\r\nHost: ${host}:${targetPort}\r\n\r\n`);
+  onSocket(socket);
+  await new Promise((resolve, reject) => {
+    const connected = () => { cleanup(); resolve(); }, failed = error => { cleanup(); reject(error); };
+    const closed = () => failed(Error('Подключение к шлюзу отменено.'));
+    const cleanup = () => socket.off('connect', connected).off('error', failed).off('close', closed);
+    socket.once('connect', connected).once('error', failed).once('close', closed);
+    if (socket.destroyed) closed();
+  });
+  const destination = (net.isIPv6(host) ? '[' + host + ']' : host) + ':' + targetPort;
+  const authorization = /^[a-f0-9]{64}$/.test(checkToken) ? 'Proxy-Authorization: Bearer ' + checkToken + '\r\n' : '';
+  socket.write(`CONNECT ${destination} HTTP/1.1\r\nHost: ${destination}\r\n${authorization}\r\n`);
   let buffer = Buffer.alloc(0);
   await new Promise((resolve, reject) => {
     const onError = e => { cleanup(); reject(e); }, onEnd = () => onError(Error('Шлюз закрыл соединение.'));
@@ -170,8 +213,8 @@ async function connectTunnel(port, host, targetPort = 443) {
       if (buffer.length > end + 4) socket.unshift(buffer.subarray(end + 4));
       resolve();
     };
-    const cleanup = () => socket.off('data', onData).off('error', onError).off('end', onEnd);
-    socket.on('data', onData).once('error', onError).once('end', onEnd);
+    const cleanup = () => socket.off('data', onData).off('error', onError).off('end', onEnd).off('close', onEnd);
+    socket.on('data', onData).once('error', onError).once('end', onEnd).once('close', onEnd);
   }).catch(error => { socket.destroy(); throw error; });
   socket.setTimeout(0); return socket;
 }

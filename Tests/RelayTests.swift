@@ -37,6 +37,8 @@ import Network
         rejected("malformed JSON blocked") { _ = try IPReport.parse(Data("<html>error</html>".utf8)) }
         do { _ = try IPReport.parse(json("NL", "2001:db8::7")); expect(true, "IPv6 report supported") }
         catch { expect(false, "IPv6 report supported") }
+        expect(IPChecker.publicIPURL(for: "203.0.113.7").contains("api.ipify.org"), "IPv4 session uses the dedicated IPv4 probe")
+        expect(IPChecker.publicIPURL(for: "2001:db8::7").contains("api6.ipify.org"), "IPv6 session keeps its family instead of alternating dual-stack probes")
         rejected("URL as proxy host rejected") { _ = try ProxySettings.validated(host: "socks5://host", port: "1080", username: "", password: "") }
         rejected("zero proxy port rejected") { _ = try ProxySettings.validated(host: "host", port: "0", username: "", password: "") }
         rejected("oversized password rejected") { _ = try ProxySettings.validated(host: "host", port: "1080", username: "user", password: String(repeating: "x", count: 256)) }
@@ -45,6 +47,10 @@ import Network
             let report = try IPReport.parse(json("NL", "203.0.113.7"))
             var policy = SessionPolicy(); try policy.establish(report); try policy.verify("203.0.113.7")
             expect(!policy.requiresRestart, "identical pinned IP stays open")
+            policy.suspend()
+            expect(policy.suspended && !policy.requiresRestart, "temporary uncertainty pauses without permanent IP lock")
+            try policy.verify("203.0.113.7")
+            expect(!policy.suspended && !policy.requiresRestart, "same verified IP resumes a paused session")
             rejected("any new IP blocked, including another foreign IP") { try policy.verify("203.0.113.8") }
             expect(policy.requiresRestart, "IP change latches until app restart")
             policy.manualStop()
@@ -52,7 +58,7 @@ import Network
             var fresh = SessionPolicy(); try fresh.establish(report)
             expect(!fresh.requiresRestart, "new app session can establish a new baseline")
             var local = SessionPolicy(); try local.establish(report); local.latch("Local address changed")
-            rejected("local network change requires restart") { try local.verify(report.ip) }
+            rejected("explicit permanent security lock requires restart") { try local.verify(report.ip) }
             let equivalent = try IPIdentity.canonical("2001:db8:0:0::7") == IPIdentity.canonical("2001:db8::7")
             expect(equivalent, "equivalent IPv6 strings do not cause false change")
             let profile = LaunchProfile(timezone: "Europe/Amsterdam", language: "en-US")
@@ -91,12 +97,20 @@ import Network
                 queue.asyncAfter(deadline: .now() + 5) { finish(false) }
             }
             expect(connected, "long-lived tunnel established")
-            relay.stop()
+            relay.pause()
             let disconnected: Bool = await withCheckedContinuation { continuation in
                 client.receive(minimumIncompleteLength: 1, maximumLength: 1024) { _, _, done, error in continuation.resume(returning: done || error != nil) }
             }
-            expect(disconnected, "stop closes already established tunnels")
+            expect(disconnected, "pause closes already established tunnels")
             client.cancel()
+            let duringPause = await request(port, host: "blocked-during-pause.test")
+            expect(duringPause.0 != 0, "paused bridge blocks application destinations")
+            let pausedProbe = await request(port, host: "ipwho.is")
+            expect(pausedProbe.0 == 0, "paused bridge still permits IP-control probes")
+            expect(relay.unlock(), "paused bridge can resume after successful IP verification")
+            let resumed = await request(port, host: "resumed.test")
+            expect(resumed.0 == 0 && resumed.1 == "ok:resumed.test", "resumed bridge forwards fresh application requests")
+            relay.stop()
             let afterStop = await request(port, host: "destination.test")
             expect(afterStop.0 != 0, "stopped bridge refuses new connections")
             expect(!relay.unlock(), "stopped bridge cannot reopen without new check")
@@ -109,6 +123,18 @@ import Network
             try await Task.sleep(nanoseconds: 200_000_000)
             let recovery = await request(resetPort, host: "recovery.test")
             expect(recovery.0 == 0 && recovery.1 == "ok:recovery.test", "destination reset does not kill unrelated proxy connections")
+            let refused = await request(resetPort, host: "refused.test")
+            expect(refused.0 != 0, "SOCKS destination refusal closes the rejected request")
+            let afterRefusal = await request(resetPort, host: "after-refusal.test")
+            expect(afterRefusal.0 == 0, "SOCKS destination refusal leaves other destinations usable")
+            let interrupted = await request(resetPort, host: "aborted-before-reply.test")
+            expect(interrupted.0 != 0, "interrupted SOCKS setup closes its own pending request")
+            let suspended = await request(resetPort, host: "must-wait-for-probe.test")
+            expect(suspended.0 != 0, "SOCKS transport failure pauses new application requests")
+            let healthyProbe = await request(resetPort, host: "ipwho.is")
+            expect(healthyProbe.0 == 0 && resetRelay.unlock(), "successful control probe can recover the paused SOCKS transport")
+            let afterTransportRecovery = await request(resetPort, host: "after-transport-recovery.test")
+            expect(afterTransportRecovery.0 == 0, "recovered SOCKS transport accepts fresh application streams")
             resetRelay.stop()
 
             let wrong = SOCKSRelay(settings: ProxySettings(host: "127.0.0.1", port: upstreamPort, username: "user", password: "wrong"))

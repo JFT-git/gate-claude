@@ -12,3 +12,5 @@ xcrun swiftc -swift-version 5 -target "$TEST_ARCH-apple-macosx13.0" -module-cach
   Source/Core.swift Source/Policy.swift Source/Inspector.swift Source/Diagnostics.swift Tests/InspectorTests.swift -o .build/InspectorTests
 chmod +x Tests/MockClaude.py
 .build/InspectorTests "$PWD/.build/GuardHostTest" "$PWD/Tests/MockClaude.py"
+
+bash Tests/recovery_test.sh

@@ -36,5 +36,18 @@ if (source.webSocketCaptured != null) publicProof.webSocketCaptured = source.web
 if (['network', 'socks5'].includes(source.connectionMode)) publicProof.connectionMode = source.connectionMode;
 if (source.automaticWindowsAppsDiscovery === true) publicProof.automaticWindowsAppsDiscovery = true;
 if (source.ipChecksThroughLocalTLS === true) publicProof.ipChecksThroughLocalTLS = true;
+if (source.networkFence) {
+  assert.equal(source.networkFence.coverage, 'private-runtime-executables');
+  assert.equal(source.networkFence.persistent, true);
+  publicProof.networkFence = { coverage: 'private-runtime-executables', persistent: true,
+    installedBeforeRuntime: source.networkFence.installedBeforeRuntime === true };
+}
+if (source.revalidation) {
+  publicProof.revalidation = {};
+  for (const key of ['recheckingObserved','appTrafficBlockedWhilePaused','processSurvived','samePID','resumedHTTP','resumedStream']) {
+    assert.equal(source.revalidation[key], true); publicProof.revalidation[key] = true;
+  }
+  assert.equal(source.revalidation.injectedHTTP500, 1); publicProof.revalidation.injectedHTTP500 = 1;
+}
 if (source.restart) publicProof.restart = { freshPolicy: source.restart.freshPolicy, passwordAbsent: source.restart.passwordAbsent };
 fs.writeFileSync(process.argv[3], JSON.stringify(publicProof, null, 2) + '\n');

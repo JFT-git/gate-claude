@@ -19,7 +19,7 @@ else {
   const send = (type, data) => { if (window && !window.isDestroyed()) window.webContents.send('guard:event', { type, data }); };
   const safeError = error => diagnostic(error?.message || 'Не удалось выполнить действие.');
   function settings() {
-    const defaults = { mode: 'network', host: '127.0.0.1', port: 1080, username: '', timezone: 'Europe/Amsterdam', language: 'en-US', interval: 5, captureBodies: false, claudePath: '', claudeSource: 'auto' };
+    const defaults = { mode: 'network', host: '127.0.0.1', port: 1080, username: '', timezone: 'Europe/Amsterdam', language: 'en-US', interval: 2, captureBodies: false, claudePath: '', claudeSource: 'auto' };
     try {
       const stored = validateSettings({ ...JSON.parse(fs.readFileSync(path.join(root, 'settings.json'), 'utf8')), password: '' });
       delete stored.password; return { ...defaults, ...stored };
@@ -120,7 +120,7 @@ else {
   app.on('second-instance', () => { if (window) { if (window.isMinimized()) window.restore(); window.show(); window.focus(); } });
   app.on('before-quit', () => controller?.stop());
   app.on('window-all-closed', () => app.quit());
-  const powerBlock = () => { if (controller && !['idle', 'blocked'].includes(controller.state)) controller.block('Сон или пробуждение компьютера. Перезапустите Guard.'); };
+  const powerBlock = () => { if (controller && !['idle', 'blocked'].includes(controller.state)) controller.revalidate('Сон или пробуждение компьютера. Проверяем прежний IP.'); };
   app.whenReady().then(() => { powerMonitor.on('suspend', powerBlock); powerMonitor.on('resume', powerBlock); });
   process.on('uncaughtException', () => { controller?.block('Внутренняя ошибка Guard. Сессия закрыта.'); app.exit(1); });
   process.on('unhandledRejection', () => { controller?.block('Внутренняя ошибка Guard. Сессия закрыта.'); app.exit(1); });

@@ -71,7 +71,8 @@ test('CONNECT SOCKS5: precheck gate, auth, remote DNS, stream reset and kill', a
   const socks = await mockSOCKS(t), relay = new SOCKSRelay({ host: '127.0.0.1', port: socks.port, username: 'fixture', password: 'fixture-password' });
   const failures = []; relay.on('fatal', x => failures.push(x)); await relay.start(); t.after(() => relay.close());
   await assert.rejects(connectTunnel(relay.port, 'example.test')); assert.equal(socks.targets.length, 0);
-  const pre = await connectTunnel(relay.port, 'ipwho.is'); pre.destroy();
+  await assert.rejects(connectTunnel(relay.port, 'ipwho.is'));
+  const pre = await connectTunnel(relay.port, 'ipwho.is', 443, relay.checkToken); pre.destroy();
   relay.unlock();
   await assert.rejects(connectTunnel(relay.port, 'refused.test')); assert.equal(failures.length, 0);
   const socket = await connectTunnel(relay.port, 'example.test'); socket.resume(); socket.write('echo');

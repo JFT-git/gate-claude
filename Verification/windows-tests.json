@@ -3,9 +3,9 @@
   "platform": "Windows x64",
   "node": "24.22.0",
   "electron": "44.9.2",
-  "tests": 21,
+  "tests": 70,
   "failures": 0,
-  "skipped": 0,
+  "skipped": 1,
   "checks": [
     "SOCKS5 authentication and remote DNS",
     "precheck destination gate and no direct fallback",
@@ -17,8 +17,19 @@
     "Windows Job Object: EOF, helper crash, heartbeat timeout",
     "current network/VPN without SOCKS5",
     "current network IP change closes active tunnel and latches",
-    "MSIX manifest lookup, newest readable version and access-denied handling"
+    "MSIX manifest lookup, newest readable version and access-denied handling",
+    "authenticated private IP-control probes while application traffic is paused",
+    "temporary service and SOCKS failures recover the same runtime at the unchanged IP",
+    "startup cancellation cannot overlap WFP installations",
+    "persistent WFP blocks direct TCP, UDP and IPv6, survives broker loss and rejects premature removal",
+    "cross-process WFP mutex serializes installation and stale cleanup",
+    "native Node/worker/child/inspector restrictions and immutable Chromium proxy/DNS/WebRTC/QUIC"
   ],
   "helperSHA256": "6dd303c802bc50b7cc510e0bbb8075731ada0c89eab4f5462e9134398e544bcc",
-  "version": "0.4.1"
+  "version": "0.5.0",
+  "passed": 69,
+  "skippedChecks": [
+    "Windows symlink creation test; verified on macOS"
+  ],
+  "fenceSHA256": "1f3f79d81d4145d30744bb7cb3995ea4ed59f88d4ae63ae3a1999cd2bfca6c2c"
 }

@@ -30,6 +30,15 @@ async function main() {
       await fs.copyFile(path.resolve(argument('--host')), helper);
     }
     extraResource.push(helper);
+    const fence = path.join(stage, 'resources', 'NetworkFence.exe');
+    if (process.platform === 'win32') {
+      const csc = path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+      execFileSync(csc, ['/nologo', '/optimize+', '/platform:x64', '/target:exe', '/out:' + fence, path.join(root, 'native', 'NetworkFence.cs')], { stdio: 'inherit', windowsHide: true });
+    } else {
+      if (!args.includes('--fence')) throw Error('Cross-build requires --fence /absolute/path/to/NetworkFence.exe compiled from native/NetworkFence.cs.');
+      await fs.copyFile(path.resolve(argument('--fence')), fence);
+    }
+    extraResource.push(fence);
   }
   // Runtime dependencies are Node built-ins; no profiles, test hooks or Claude binaries are staged.
   const results = await packager({ dir: stage, name: 'Claude Proxy Guard', platform, arch, electronVersion,

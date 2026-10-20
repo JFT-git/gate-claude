@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 // Dependency substitution is confined to this test worker; the packaged app has no test providers.
 const runtime = require('../src/runtime.cjs'), checker = require('../src/ip-check.cjs');
+require('../src/fence.cjs').NetworkFence.prepare = async () => ({ on() {}, close: async () => {} });
 runtime.prepareRuntime = async () => ({ executable: 'fixture-not-launched', profile: 'fixture-profile', signature: 'Valid' });
 let initial, current;
 checker.initialIP = () => initial(); checker.currentIP = () => current();
@@ -49,6 +50,6 @@ test('stop during initial request cannot pin an IP or reopen resources after can
   const starting = controller.start(input);
   while (!resolve) await pause();
   controller.stop(); resolve({ success: true, country_code: 'NL', ip: '203.0.113.7' }); await starting;
-  assert.equal(controller.state, 'idle'); assert.equal(controller.policy.pinned, null); assert.equal(controller.policy.blocked, false);
+  assert.equal(controller.state, 'blocked'); assert.equal(controller.policy.pinned, null); assert.equal(controller.policy.blocked, true);
   assert.equal(controller.relay, null); assert.equal(controller.host, null);
 });

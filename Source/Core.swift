@@ -70,8 +70,15 @@ enum IPChecker {
         try IPReport.parse(await fetch(url: "https://ipwho.is/?fields=success,ip,country_code", relayPort: relayPort, timeout: 12))
     }
 
-    static func publicIP(relayPort: UInt16?) async throws -> String {
-        let data = try await fetch(url: "https://api64.ipify.org?format=json", relayPort: relayPort, timeout: 4)
+    static func publicIPURL(for pinnedIP: String?) -> String {
+        // A dual-stack probe may alternate between the same network's IPv4 and IPv6.
+        // Keep the family selected during the country check for every later probe.
+        let host = pinnedIP.map { $0.contains(":") ? "api6.ipify.org" : "api.ipify.org" } ?? "api64.ipify.org"
+        return "https://\(host)?format=json"
+    }
+
+    static func publicIP(relayPort: UInt16?, pinnedIP: String? = nil) async throws -> String {
+        let data = try await fetch(url: publicIPURL(for: pinnedIP), relayPort: relayPort, timeout: 4)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let ip = json["ip"] as? String else { throw GuardError.message("Не удалось определить внешний IP.") }
         return try IPIdentity.canonical(ip)
@@ -111,12 +118,12 @@ enum IPChecker {
     }
 }
 
-/// An HTTPS CONNECT -> SOCKS5 bridge. It never opens a direct connection to a destination.
-/// Only the SOCKS server hostname is resolved locally. Destination names travel in SOCKS5.
+/// A local CONNECT bridge. SOCKS mode never falls back to a direct destination.
+/// Current-network mode is an explicit choice and still passes through this gate.
 final class SOCKSRelay: @unchecked Sendable {
     enum Mode { case probeOnly, open, blocked }
     private let queue = DispatchQueue(label: "local.proxyguard.relay")
-    private let settings: ProxySettings
+    private let settings: ProxySettings?
     private var listener: NWListener?
     private var tunnels: [UUID: RelayTunnel] = [:]
     private var mode: Mode = .probeOnly
@@ -127,6 +134,7 @@ final class SOCKSRelay: @unchecked Sendable {
     var onTunnelEvent: ((String, UInt16, Int, Int, Bool) -> Void)?
 
     init(settings: ProxySettings) { self.settings = settings }
+    init(currentNetwork: Bool) { precondition(currentNetwork); self.settings = nil }
 
     func start() async throws -> UInt16 {
         try await withCheckedThrowingContinuation { continuation in
@@ -163,7 +171,7 @@ final class SOCKSRelay: @unchecked Sendable {
                             guard let self, self.alive else { return false }
                             switch self.mode {
                             case .open: return true
-                            case .probeOnly: return ["ipwho.is", "api64.ipify.org"].contains(host.lowercased()) && port == 443
+                            case .probeOnly: return ["ipwho.is", "api.ipify.org", "api6.ipify.org", "api64.ipify.org"].contains(host.lowercased()) && port == 443
                             case .blocked: return false
                             }
                         }
@@ -173,6 +181,7 @@ final class SOCKSRelay: @unchecked Sendable {
                             DispatchQueue.main.async { callback?(host, port, sent, received, finished) }
                         }
                         tunnel.onUpstreamFault = { [weak self] in self?.upstreamFailed() }
+                        tunnel.onProbeConnected = { [weak self] in self?.faultReported = false }
                         self.tunnels[id] = tunnel
                         tunnel.start()
                     }
@@ -192,9 +201,18 @@ final class SOCKSRelay: @unchecked Sendable {
 
     func unlock() -> Bool {
         queue.sync {
-            guard alive, mode == .probeOnly else { return false }
+            guard alive, mode == .probeOnly, !faultReported else { return false }
             mode = .open
             return true
+        }
+    }
+
+    /// Close every existing stream before allowing only fresh IP-control requests.
+    func pause() {
+        queue.sync {
+            guard alive else { return }
+            mode = .probeOnly
+            for tunnel in Array(tunnels.values) { tunnel.close() }
         }
     }
 
@@ -208,7 +226,7 @@ final class SOCKSRelay: @unchecked Sendable {
 
     private func upstreamFailed() {
         guard alive, !faultReported else { return }
-        faultReported = true; mode = .blocked
+        faultReported = true; mode = .probeOnly
         for tunnel in Array(tunnels.values) { tunnel.close() }
         let callback = onFault
         DispatchQueue.main.async { callback?() }
@@ -218,7 +236,7 @@ final class SOCKSRelay: @unchecked Sendable {
 private final class RelayTunnel {
     private let client: NWConnection
     private var upstream: NWConnection?
-    private let settings: ProxySettings
+    private let settings: ProxySettings?
     private let queue: DispatchQueue
     private var closed = false
     private var established = false
@@ -232,8 +250,9 @@ private final class RelayTunnel {
     var isAllowed: ((String, UInt16) -> Bool)?
     var onClose: (() -> Void)?
     var onUpstreamFault: (() -> Void)?
+    var onProbeConnected: (() -> Void)?
 
-    init(client: NWConnection, settings: ProxySettings, queue: DispatchQueue) {
+    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue) {
         self.client = client; self.settings = settings; self.queue = queue
     }
 
@@ -250,7 +269,7 @@ private final class RelayTunnel {
         queue.asyncAfter(deadline: .now() + 15) { [weak self] in
             guard let self, !self.closed, !self.established else { return }
             // A client that never sent a header is just discarded.
-            if self.upstream != nil { self.failUpstream() } else { self.close() }
+            if self.upstream != nil, self.settings != nil { self.failUpstream() } else { self.close() }
         }
     }
 
@@ -289,7 +308,7 @@ private final class RelayTunnel {
                     self.reject(); return
                 }
                 self.destination = host; self.port = port
-                self.connectSOCKS()
+                if self.settings == nil { self.connectCurrentNetwork() } else { self.connectSOCKS() }
             } else if done { self.close() } else { self.receiveHeader() }
         }
     }
@@ -300,6 +319,7 @@ private final class RelayTunnel {
     }
 
     private func connectSOCKS() {
+        guard let settings else { close(); return }
         let upstream = NWConnection(host: NWEndpoint.Host(settings.host),
                                     port: NWEndpoint.Port(rawValue: settings.port)!, using: .tcp)
         self.upstream = upstream
@@ -316,11 +336,28 @@ private final class RelayTunnel {
         upstream.start(queue: queue)
     }
 
+    private func connectCurrentNetwork() {
+        let connection = NWConnection(host: NWEndpoint.Host(destination), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        upstream = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self, !self.closed else { return }
+            switch state {
+            case .ready: self.connected()
+            // A single destination failing is not evidence of a changed exit IP.
+            case .failed, .waiting: self.close()
+            default: break
+            }
+        }
+        connection.start(queue: queue)
+    }
+
     private func sendUpstream(_ data: Data, next: @escaping () -> Void) {
         guard !closed else { return }
         upstream?.send(content: data, completion: .contentProcessed { [weak self] error in
             guard let self, !self.closed else { return }
-            if error != nil { self.failUpstream() } else { next() }
+            if error != nil {
+                if self.established { self.close() } else { self.failUpstream() }
+            } else { next() }
         })
     }
 
@@ -334,6 +371,7 @@ private final class RelayTunnel {
     }
 
     private func negotiate() {
+        guard let settings else { close(); return }
         let method: UInt8 = settings.username.isEmpty ? 0 : 2
         sendUpstream(Data([5, 1, method])) { [weak self] in
             self?.readExactly(2) { [weak self] data in
@@ -345,6 +383,7 @@ private final class RelayTunnel {
     }
 
     private func authenticate() {
+        guard let settings else { close(); return }
         let user = Data(settings.username.utf8), password = Data(settings.password.utf8)
         var packet = Data([1, UInt8(user.count)]); packet.append(user)
         packet.append(UInt8(password.count)); packet.append(password)
@@ -383,6 +422,7 @@ private final class RelayTunnel {
 
     private func connected() {
         guard !closed, isAllowed?(destination, port) == true else { close(); return }
+        if ["ipwho.is", "api.ipify.org", "api6.ipify.org", "api64.ipify.org"].contains(destination.lowercased()), port == 443 { onProbeConnected?() }
         established = true
         onEvent?(destination, port, 0, 0, false)
         client.send(content: Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8),

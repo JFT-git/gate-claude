@@ -35,6 +35,11 @@ def serve(conn):
         host = exact(conn, exact(conn, 1)[0]).decode()
         port = struct.unpack("!H", exact(conn, 2))[0]
         seen.append((host, port))
+        if host == "refused.test":
+            conn.sendall(b"\x05\x05\x00\x01\x7f\x00\x00\x01\x00\x50")
+            return
+        if host == "aborted-before-reply.test":
+            return
         conn.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50")
         if host == "reset.test":
             request = b""

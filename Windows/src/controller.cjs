@@ -3,13 +3,14 @@ const { EventEmitter } = require('node:events');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
-const { IPPolicy, networkFingerprint, validateSettings } = require('./policy.cjs');
+const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
 const { SOCKSRelay, NetworkRelay } = require('./relay.cjs');
 const { initialIP, currentIP } = require('./ip-check.cjs');
 const { prepareRuntime, powershell } = require('./runtime.cjs');
 const { Channel } = require('./channel.cjs');
 const { Inspector } = require('./inspector.cjs');
 const { diagnostic } = require('./sanitize.cjs');
+const { NetworkFence } = require('./fence.cjs');
 
 class GuardController extends EventEmitter {
   constructor(root, resources) {
@@ -33,24 +34,42 @@ class GuardController extends EventEmitter {
     if (this.state !== 'idle') throw Error('Guard уже работает.');
     const settings = validateSettings(input); this.settings = settings;
     const epoch = ++this.epoch, active = () => this.epoch === epoch && !this.policy.blocked && this.state !== 'idle';
-    this.state = 'checking'; this.verified = null; this.status(settings.mode === 'network' ? 'Проверяем страну и закрепляем IP текущей сети / VPN…' : 'Проверяем страну и закрепляем IP через SOCKS5…');
+    this.state = 'checking'; this.verified = null; this.revalidationRevision = 0; this.status(settings.mode === 'network' ? 'Проверяем страну и закрепляем IP текущей сети / VPN…' : 'Проверяем страну и закрепляем IP через SOCKS5…');
     try {
       // Prepare before pinning so long disk copies cannot leave an old network baseline.
       this.runtime = await prepareRuntime(settings.claudePath, this.root, path.join(this.resources, 'RuntimeBootstrap.cjs'), text => this.status(text));
       if (!active()) return;
       if (this.runtime.signature !== 'Valid') this.log('Подпись исходного Claude не подтверждена: ' + this.runtime.signature, 'warning');
       this.fingerprint = networkFingerprint();
-      this.networkTimer = setInterval(() => { if (active() && networkFingerprint() !== this.fingerprint) this.block('Изменились локальные адреса или сетевые интерфейсы.'); }, 1000);
+      this.networkTimer = setInterval(() => {
+        if (!active()) return;
+        const fingerprint = networkFingerprint();
+        if (fingerprint !== this.fingerprint) {
+          this.fingerprint = fingerprint;
+          this.revalidate('Изменились локальные адреса или сетевые интерфейсы. Проверяем закреплённый IP.');
+        }
+      }, 1000);
       this.route = await this.routeFingerprint(); if (!active()) return;
       this.relay = settings.mode === 'network' ? new NetworkRelay() : new SOCKSRelay({ host: settings.host, port: settings.port, username: settings.username, password: settings.password });
       this.relay.on('fatal', reason => { if (active()) this.block(reason); });
+      this.relay.on('revalidate', reason => { if (active()) this.revalidate(reason); });
       const port = await this.relay.start(); if (!active()) return;
-      const initial = await initialIP(port); if (!active()) return;
+      this.status('Устанавливаем сетевые ограничения Windows для копии Claude…');
+      this.fencePending = true;
+      let fence;
+      try { fence = await NetworkFence.prepare(this.runtime, port, { helperPath: path.join(this.resources, 'NetworkFence.exe') }); }
+      finally { this.fencePending = false; }
+      if (!active()) { await fence.close(); return; }
+      this.fence = fence;
+      fence.on('fatal', () => { if (active()) this.block('Сетевая защита Windows потеряна. Сессия закрыта.'); });
+      const initial = await this.requestIP(epoch, initialIP, port, this.relay.checkToken); if (!active()) return;
       const pin = this.policy.pin(initial); this.country = pin.country;
-      const current = await currentIP(port); if (!active()) return;
+      const current = await this.requestIP(epoch, currentIP, port, this.relay.checkToken); if (!active()) return;
       this.policy.check(current.ip); if (!active()) return;
       this.log('Исходный IP закреплён: [IP скрыт] · ' + pin.country);
-      this.relay.unlock();
+      // Monitor throughout runtime startup, including a slow diagnostic connection.
+      this.schedulePoll(epoch, settings.interval * 1000);
+      if (this.state !== 'rechecking') this.relay.unlock();
       this.channel = new Channel(); this.channel.on('fatal', reason => { if (active()) this.block(reason); });
       this.inspector = new Inspector(this.channel, settings, settings.captureBodies);
       this.inspector.on('fatal', reason => { if (active()) this.block(reason); });
@@ -58,11 +77,13 @@ class GuardController extends EventEmitter {
       this.inspector.on('notice', value => this.log(value));
       this.inspector.on('verified', profile => {
         if (!active()) return;
-        this.verified = profile; this.state = 'running'; this.emit('verified', profile);
-        this.status('Проверено в Claude: ' + profile.timezone + ' · ' + profile.language);
+        this.verified = profile; this.emit('verified', profile);
+        if (this.state !== 'rechecking') {
+          this.state = 'running'; this.status('Проверено в Claude: ' + profile.timezone + ' · ' + profile.language);
+        }
       });
       await this.channel.listen(); if (!active()) return;
-      this.state = 'starting'; this.status('Запускаем Claude и проверяем профиль страницы…');
+      if (this.state !== 'rechecking') { this.state = 'starting'; this.status('Запускаем Claude и проверяем профиль страницы…'); }
       const env = { ...process.env };
       for (const key of Object.keys(env)) if (/^(?:https?|all|no)_proxy$/i.test(key) || /^ELECTRON_/i.test(key) || /^NODE_OPTIONS$/i.test(key) || /^CLAUDE_/i.test(key)) delete env[key];
       Object.assign(env, { TZ: settings.timezone, LANG: settings.language.replaceAll('-', '_') + '.UTF-8', LC_ALL: settings.language.replaceAll('-', '_') + '.UTF-8',
@@ -86,31 +107,122 @@ class GuardController extends EventEmitter {
       await this.channel.connected(); if (!active()) return;
       await this.inspector.start(); if (!active()) return;
       this.log('Локальная копия Claude запущена: ' + settings.timezone + ' · ' + settings.language);
-      this.pollTimer = setTimeout(() => this.poll(epoch), settings.interval * 1000);
     } catch (error) { if (this.epoch === epoch) this.block(error.message || 'Ошибка запуска.'); }
   }
   async routeFingerprint() {
     if (process.platform !== 'win32') return '';
     return powershell("@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0','0.0.0.0/1','128.0.0.0/1','::/0','::/1','8000::/1') } | Sort-Object InterfaceIndex,DestinationPrefix,NextHop | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.InterfaceIndex,$_.NextHop,$_.RouteMetric,$_.DestinationPrefix }) | ConvertTo-Json -Compress", 4000);
   }
-  async poll(epoch) {
+  async requestIP(epoch, check, port, token) {
+    // A cancelled request may still be settling; never overlap it with a new one.
+    while (this.ipRequest) {
+      try { await this.ipRequest; } catch {}
+      if (this.epoch !== epoch) throw Error('Проверка отменена.');
+    }
+    if (this.epoch !== epoch) throw Error('Проверка отменена.');
+    const request = Promise.resolve().then(() => check(port, token, require('node:net').isIP(this.policy.pinned || ''))); this.ipRequest = request;
+    try { return await request; }
+    finally { if (this.ipRequest === request) this.ipRequest = null; }
+  }
+  schedulePoll(epoch, delay) {
+    clearTimeout(this.pollTimer);
     if (this.epoch !== epoch || this.policy.blocked || !this.relay) return;
-    const started = performance.now();
-    try {
-      // Start the public check immediately; route queries must not stretch the IP interval.
-      const [, route] = await Promise.all([currentIP(this.relay.port).then(result => { if (this.epoch === epoch) this.policy.check(result.ip); }), this.routeFingerprint()]);
-      if (this.epoch !== epoch || this.policy.blocked) return;
-      if (route !== this.route) { this.block('Изменился маршрут сети.'); return; }
-      this.status(this.message);
-      this.pollTimer = setTimeout(() => this.poll(epoch), Math.max(0, this.settings.interval * 1000 - (performance.now() - started)));
-    } catch { if (this.epoch === epoch) this.block('IP изменился, маршрут потерян или проверка завершилась ошибкой.'); }
+    this.pollTimer = setTimeout(() => this.poll(epoch), Math.max(0, delay));
+  }
+  pauseForRevalidation(reason, invalidate = true) {
+    if (!this.relay || !this.policy.pinned || this.policy.blocked || ['idle', 'blocked'].includes(this.state)) return false;
+    if (invalidate) this.revalidationRevision = (this.revalidationRevision || 0) + 1;
+    this.relay.pause();
+    if (this.state !== 'rechecking') this.log(reason, 'warning');
+    this.state = 'rechecking';
+    this.status(reason + ' Трафик приостановлен до подтверждения прежнего IP.');
+    return true;
+  }
+  revalidate(reason = 'Повторная проверка закреплённого IP.') {
+    if (!this.pauseForRevalidation(reason)) return Promise.resolve();
+    clearTimeout(this.pollTimer);
+    return this.poll(this.epoch);
+  }
+  poll(epoch) {
+    if (this.epoch !== epoch || this.policy.blocked || !this.relay) return Promise.resolve();
+    if (this.checkTask) {
+      const task = this.checkTask;
+      return task.epoch === epoch ? task.promise : task.promise.then(() => this.poll(epoch));
+    }
+    clearTimeout(this.pollTimer);
+    const task = { epoch, revision: this.revalidationRevision || 0, started: performance.now() };
+    const active = () => this.epoch === epoch && !this.policy.blocked && this.relay;
+    const before = networkFingerprint(), relayPort = this.relay.port, checkToken = this.relay.checkToken;
+    task.promise = (async () => {
+      // Validate an IP result as soon as it arrives; a slow route query cannot delay a confirmed kill.
+      const address = this.requestIP(epoch, currentIP, relayPort, checkToken).then(result => {
+        if (!active()) return null;
+        const ip = canonicalIP(result?.ip); // A malformed provider answer is temporary, not a new IP.
+        if (require('node:net').isIP(ip) !== require('node:net').isIP(this.policy.pinned)) throw Error('Сервис вернул другое семейство IP.');
+        if (ip !== this.policy.pinned) {
+          this.block('Внешний IP изменился. Сессия закрыта до перезапуска Guard.');
+          return null;
+        }
+        this.policy.check(ip); return ip;
+      }).catch(error => {
+        if (active()) this.pauseForRevalidation('Не удалось подтвердить закреплённый IP. Повторяем проверку.', false);
+        throw error;
+      });
+      const routes = Promise.resolve().then(() => this.routeFingerprint()).then(route => {
+        if (active() && route !== this.route && this.state !== 'rechecking') {
+          this.pauseForRevalidation('Изменился маршрут сети. Проверяем закреплённый IP.');
+        }
+        return route;
+      }).catch(error => {
+        if (active()) this.pauseForRevalidation('Не удалось проверить маршрут сети. Повторяем проверку.', false);
+        throw error;
+      });
+      const [ip, route] = await Promise.allSettled([address, routes]);
+      if (!active()) return;
+      if (ip.status !== 'fulfilled' || !ip.value || route.status !== 'fulfilled') {
+        this.pauseForRevalidation('Не удалось подтвердить закреплённый IP или маршрут. Повторяем проверку.', false);
+        return;
+      }
+      const after = networkFingerprint();
+      if (before !== after) {
+        this.fingerprint = after;
+        this.pauseForRevalidation('Во время проверки изменились сетевые интерфейсы. Проверяем IP повторно.');
+        return;
+      }
+      // An event arriving during the request requires a fresh answer after that event.
+      if (task.revision !== (this.revalidationRevision || 0)) return;
+      if (route.value !== this.route && this.state !== 'rechecking') {
+        this.pauseForRevalidation('Изменился маршрут сети. Проверяем закреплённый IP.');
+        return;
+      }
+      if (this.state === 'rechecking') {
+        this.route = route.value; this.fingerprint = after;
+        this.relay.resume();
+        this.state = this.verified ? 'running' : 'starting';
+        this.log('Прежний внешний IP подтверждён. Соединение возобновлено.');
+        this.status(this.verified ? 'Проверено в Claude: ' + this.verified.timezone + ' · ' + this.verified.language : 'IP подтверждён. Запускаем Claude и проверяем профиль страницы…');
+      } else this.status(this.message);
+    })().catch(() => {
+      if (active()) this.pauseForRevalidation('Проверка сети не завершилась. Повторяем проверку.', false);
+    }).finally(() => {
+      if (this.checkTask === task) this.checkTask = null;
+      if (!active()) return;
+      const changed = task.revision !== (this.revalidationRevision || 0);
+      this.schedulePoll(epoch, changed ? 0 : Math.max(0, this.settings.interval * 1000 - (performance.now() - task.started)));
+    });
+    this.checkTask = task; return task.promise;
   }
   teardown() {
     this.epoch++; clearInterval(this.networkTimer); clearInterval(this.heartbeatTimer); clearTimeout(this.pollTimer);
     this.inspector?.stop(); this.channel?.close(); this.relay?.close();
     // EOF makes GuardHost close its job. Force-terminating the helper also closes its job handle.
-    const host = this.host; this.host = null;
-    if (host) { host.stdin.end(); const timer = setTimeout(() => host.kill(), 1000); timer.unref(); host.once('exit', () => clearTimeout(timer)); }
+    const host = this.host, fence = this.fence; this.host = null; this.fence = null;
+    const closeFence = () => { if (fence) fence.close().catch(() => this.log('Ограничения Windows сохранены: завершение защищённой копии не подтверждено.', 'warning')); };
+    if (host) {
+      host.stdin.end(); const timer = setTimeout(() => host.kill(), 1000); timer.unref();
+      if (host.exitCode != null || host.signalCode != null) { clearTimeout(timer); closeFence(); }
+      else host.once('exit', () => { clearTimeout(timer); closeFence(); });
+    } else closeFence();
     this.inspector = null; this.channel = null; this.relay = null;
     if (this.settings) this.settings.password = ''; this.settings = null; this.verified = null; this.exitCode = null;
   }
@@ -122,7 +234,7 @@ class GuardController extends EventEmitter {
   stop() {
     const blocked = this.policy.blocked;
     // Pinning a second exit in the same Guard process is forbidden even after a manual stop.
-    const hadSession = this.policy.pinned != null;
+    const hadSession = this.policy.pinned != null || this.fencePending || Boolean(this.fence);
     if (hadSession) this.policy.block(); this.teardown();
     this.state = blocked || hadSession ? 'blocked' : 'idle';
     this.status(this.state === 'blocked' ? 'Сессия закрыта. Для нового подключения перезапустите Guard.' : 'Остановлено.');

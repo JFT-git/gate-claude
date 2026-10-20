@@ -26,12 +26,12 @@ async function findClaude() {
 }
 function showState(value) {
   state = value;
-  $('state').textContent = ({ idle: 'Готов к проверке', checking: 'Проверка подключения', starting: 'Проверяем профиль Claude', running: 'Claude под защитой Guard', blocked: 'Сессия закрыта' })[value.state] || value.state;
+  $('state').textContent = ({ idle: 'Готов к проверке', checking: 'Проверка подключения', starting: 'Проверяем профиль Claude', rechecking: 'Трафик приостановлен', running: 'Claude под защитой Guard', blocked: 'Сессия закрыта' })[value.state] || value.state;
   $('message').textContent = value.message; $('lamp').className = 'lamp ' + value.state;
   $('country').textContent = value.country ? value.country + ' · ' + (value.exitIP || 'IP закреплён') : 'IP не закреплён';
   const busy = value.state !== 'idle';
   for (const id of fields) $(id).disabled = busy;
-  $('choose').disabled = busy; $('start').disabled = busy; $('stop').disabled = !['checking', 'starting', 'running'].includes(value.state);
+  $('choose').disabled = busy; $('start').disabled = busy; $('stop').disabled = !['checking', 'starting', 'running', 'rechecking'].includes(value.state);
   connectionMode();
   if (value.profile) { $('profile').textContent = value.profile.timezone + ' · ' + value.profile.language; $('locale').textContent = 'Intl locale: ' + value.profile.locale; }
   else { $('profile').textContent = value.state === 'blocked' ? 'Соединение закрыто' : 'Ожидаем запуск Claude'; $('locale').textContent = 'Проверяются Intl, navigator и Accept-Language'; }
