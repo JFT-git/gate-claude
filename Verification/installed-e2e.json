@@ -1,0 +1,148 @@
+{
+  "auxiliaryWindowsClosed": 2,
+  "capturedHTTP": {
+    "date": 814213614.409493,
+    "id": "3C9DD6B29E1E7804C6F6A52B9F5897B6:8834.2",
+    "kind": "Fetch",
+    "method": "POST",
+    "note": "application/json",
+    "received": "{\n  \"marker\" : \"guard-response-ok\",\n  \"received\" : {\n    \"language\" : \"en-US\",\n    \"locale\" : \"en-US\",\n    \"timezone\" : \"Europe/Amsterdam\"\n  }\n}",
+    "requestHeaders": "Connection: keep-alive\nContent-Length: 67\nHost: claude.ai\naccept: */*\naccept-encoding: gzip, deflate, br, zstd\naccept-language: en-US\nanthropic-client-app: com.anthropic.claudefordesktop\nanthropic-client-device-class: 16\nanthropic-client-os-platform: darwin\nanthropic-client-os-version: 27.0.0\nanthropic-client-platform: desktop_app\nanthropic-client-total-memory-gb: 16\nanthropic-client-version: 3.1623.0\nanthropic-desktop-topbar: 1\ncontent-type: application/json\norigin: https://claude.ai\nreferer: https://claude.ai/\nsec-fetch-dest: empty\nsec-fetch-mode: cors\nsec-fetch-site: same-origin\nuser-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) ClaudeProxyGuardRuntime/3.1623.0 Chrome/152.0.7977.167 Electron/44.9.0 Safari/537.36",
+    "responseHeaders": "Connection: close\nContent-Length: 117\nContent-Type: application/json\nDate: Tue, 20 Oct 2026 18:26:54 GMT\nServer: BaseHTTP/0.6 Python/3.12.14",
+    "sent": "{\n  \"language\" : \"en-US\",\n  \"locale\" : \"en-US\",\n  \"timezone\" : \"Europe/Amsterdam\"\n}",
+    "status": 200,
+    "url": "https://claude.ai/__guard_test__/capture",
+    "warnings": []
+  },
+  "completedAt": "2026-10-20T18:26:57Z",
+  "durationSeconds": 13.820783019065857,
+  "iframeLifecycle": {
+    "done": true,
+    "profiles": [
+      {
+        "guardFixture": true,
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      },
+      {
+        "guardFixture": true,
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      },
+      {
+        "guardFixture": true,
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      },
+      {
+        "guardFixture": true,
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      },
+      {
+        "guardFixture": true,
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      },
+      {
+        "guardFixture": true,
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      },
+      {
+        "guardFixture": true,
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      },
+      {
+        "guardFixture": true,
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      }
+    ]
+  },
+  "internet": "denied; loopback only",
+  "keychain": "mock cookie keychain; securityd and user Keychains denied by sandbox",
+  "killSwitch": {
+    "blockedUntilRestart": true,
+    "from": "203.0.113.7",
+    "milliseconds": 1165,
+    "processGone": true,
+    "relayRefusesNewConnections": true,
+    "to": "203.0.113.8"
+  },
+  "observedIPSource": "controlled test-only provider; no physical WAN change",
+  "rendererProfile": {
+    "profile": {
+      "language": "en-US",
+      "locale": "en-US",
+      "timezone": "Europe/Amsterdam"
+    },
+    "response": {
+      "marker": "guard-response-ok",
+      "received": {
+        "language": "en-US",
+        "locale": "en-US",
+        "timezone": "Europe/Amsterdam"
+      }
+    }
+  },
+  "restart": {
+    "freshPolicy": true,
+    "passwordAbsent": true,
+    "pid": 8849
+  },
+  "result": "PASS",
+  "sharedLocale": {
+    "conflict": "Another locale override is already in effect",
+    "firstSession": "3C9DD6B29E1E7804C6F6A52B9F5897B6",
+    "inherited": true,
+    "secondSession": "48B95E816535A8CE38EF3E343F14CFCC"
+  },
+  "source": "/Applications/Claude.app",
+  "test": "real installed runtime, isolated profile, local TLS fixture",
+  "unexpectedExitRecorded": "Claude завершился по сигналу 9. Причина сохранена в журнале.",
+  "fixture": {
+    "serverReceived": {
+      "path": "/__guard_test__/capture",
+      "headers": {
+        "Host": "claude.ai",
+        "Connection": "keep-alive",
+        "Content-Length": "67",
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "accept-language": "en-US",
+        "anthropic-client-app": "com.anthropic.claudefordesktop",
+        "anthropic-client-device-class": "16",
+        "anthropic-client-os-platform": "darwin",
+        "anthropic-client-os-version": "27.0.0",
+        "anthropic-client-platform": "desktop_app",
+        "anthropic-client-total-memory-gb": "16",
+        "anthropic-client-version": "3.1623.0",
+        "anthropic-desktop-topbar": "1",
+        "content-type": "application/json",
+        "origin": "https://claude.ai",
+        "referer": "https://claude.ai/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) ClaudeProxyGuardRuntime/3.1623.0 Chrome/152.0.7977.167 Electron/44.9.0 Safari/537.36"
+      },
+      "body": {
+        "timezone": "Europe/Amsterdam",
+        "language": "en-US",
+        "locale": "en-US"
+      }
+    },
+    "activeTLSStreamClosed": true,
+    "socksForwardedOnly": "claude.ai / challenges.cloudflare.com -> loopback TLS fixture; no real Anthropic or Cloudflare server contacted"
+  }
+}

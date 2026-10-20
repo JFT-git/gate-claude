@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>ClaudeProxyGuard</string>
+<key>CFBundleIdentifier</key><string>local.proxyguard.claude</string>
+<key>CFBundleName</key><string>Claude Proxy Guard</string>
+<key>CFBundleDisplayName</key><string>Claude Proxy Guard</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.3.2</string>
+<key>CFBundleVersion</key><string>5</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>CFBundleIconFile</key><string>AppIcon</string>
+<key>NSHumanReadableCopyright</key><string>Independent companion app. Not affiliated with Anthropic.</string>
+</dict></plist>

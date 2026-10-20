@@ -1,0 +1,31 @@
+# Build outputs and vendor runtimes
+.build/
+*.app/
+node_modules/
+dist/
+build/
+*.zip
+*.exe
+*.msi
+*.msix
+*.appx
+*.asar
+*.asar.unpacked/
+
+# Private profiles, connection settings, credentials, local test artifacts
+work/
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.log
+events.jsonl
+settings.json
+Profile/
+Runtime-*/
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
