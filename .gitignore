@@ -4,6 +4,9 @@
 node_modules/
 dist/
 build/
+.stage/
+resources/GuardHost.exe
+resources/RuntimeBootstrap.cjs
 *.zip
 *.exe
 *.msi

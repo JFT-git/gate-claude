@@ -1,0 +1,20 @@
+{
+  "result": "PASS",
+  "platform": "Windows x64",
+  "node": "24.22.0",
+  "electron": "44.9.2",
+  "tests": 16,
+  "failures": 0,
+  "skipped": 0,
+  "checks": [
+    "SOCKS5 authentication and remote DNS",
+    "precheck destination gate and no direct fallback",
+    "per-destination refusal and TCP reset isolation",
+    "IP pin, invalid IP, RU/unknown country, service failure and cancellation",
+    "actual locale/profile verification and shared renderer ownership",
+    "named pipe authentication and fragmented frames",
+    "traffic redaction",
+    "Windows Job Object: EOF, helper crash, heartbeat timeout"
+  ],
+  "helperSHA256": "6dd303c802bc50b7cc510e0bbb8075731ada0c89eab4f5462e9134398e544bcc"
+}

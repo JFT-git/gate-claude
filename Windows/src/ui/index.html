@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Claude Proxy Guard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header><div class="brand"><span class="shield">G</span><div><h1>Claude Proxy Guard</h1><span class="muted">Контроль подключения · Windows <span id="version"></span></span></div></div><button id="restart" class="secondary">Перезапустить Guard</button></header>
+<main>
+  <section class="status" aria-live="polite"><span id="lamp" class="lamp"></span><div><strong id="state">Готов к проверке</strong><p id="message">Укажите SOCKS5 и установленный Claude Desktop.</p></div><span id="country" class="pill">IP не закреплён</span></section>
+  <div class="columns">
+    <section class="panel connection"><h2>Подключение</h2>
+      <form id="settings">
+        <label>Claude Desktop <span class="muted">claude.exe</span><div class="inline"><input id="claudePath" placeholder="Выберите установленный claude.exe" required><button type="button" id="choose" class="secondary">Выбрать</button></div></label>
+        <div class="row"><label class="grow">Хост SOCKS5<input id="host" placeholder="127.0.0.1" required autocomplete="off"></label><label class="port">Порт<input id="port" type="number" min="1" max="65535" required></label></div>
+        <div class="row"><label>Логин<input id="username" autocomplete="off"></label><label>Пароль<input id="password" type="password" autocomplete="off" placeholder="Только в памяти"></label></div>
+        <div class="row"><label>Часовой пояс<select id="timezone"><option>Europe/Amsterdam</option><option>Europe/London</option><option>Europe/Berlin</option><option>America/New_York</option><option>Etc/UTC</option></select></label><label>Язык<select id="language"><option>en-US</option><option>en-GB</option><option>nl-NL</option><option>de-DE</option><option>fr-FR</option></select></label></div>
+        <div class="row"><label>Проверка IP<select id="interval"><option value="2">Каждые 2 секунды</option><option value="5">Каждые 5 секунд</option><option value="10">Каждые 10 секунд</option><option value="30">Каждые 30 секунд</option></select></label></div>
+        <label class="check"><input type="checkbox" id="captureBodies"> Показывать тела запросов и ответов</label>
+        <p class="hint">Первый запуск проверяет страну и IP. Любая смена IP, ошибка проверки, смена сети или сон закрывают сессию до перезапуска Guard.</p>
+        <div class="actions"><button id="start" type="submit">Проверить и запустить</button><button id="stop" type="button" class="secondary" disabled>Остановить</button></div>
+      </form>
+      <div class="verified"><span class="eyebrow">Фактический профиль страницы</span><strong id="profile">Ожидаем запуск Claude</strong><span class="muted" id="locale">Проверяются Intl, navigator и Accept-Language</span></div>
+    </section>
+    <section class="panel monitor"><div class="tabs"><button id="trafficTab" class="tab active">Трафик <span id="count">0</span></button><button id="logsTab" class="tab">Журнал проверок</button><button id="export" class="secondary small">Экспорт JSON</button></div>
+      <div id="traffic"><div id="requests" class="requests"><p class="empty">Здесь появятся доступные веб-запросы Claude.</p></div><div id="detail" class="detail"><p class="empty">Выберите запрос для просмотра.</p></div></div>
+      <div id="logs" class="logs" hidden></div>
+    </section>
+  </div>
+  <footer><strong>Собственная копия и отдельный профиль.</strong> Оригинальный Claude и системные язык, таймзона, прокси не меняются. При закрытии Guard завершается его копия Claude.</footer>
+  <details class="limits"><summary>Что контролирует Guard</summary><p>Guard направляет Chromium через свой шлюз SOCKS5 и перехватывает доступный HTTP, SSE и WebSocket. Он закрывает шлюз и дерево процессов через Windows Job Object. Это не системный firewall или VPN: независимые native-запросы, внешние браузеры, MCP и Cowork могут иметь другие маршруты. Отдельно запущенный оригинальный Claude не контролируется.</p><p>Проверки ipwho.is и ipify получают только выходной IP. Публичный IP за прокси нельзя определить локально. При интервале 5 секунд обнаружение смены IP может занять примерно 9 секунд. Содержимое трафика хранится в памяти; известные токены скрываются, но произвольные поля могут содержать секреты. Перед экспортом проверьте содержимое.</p><p>Для локальной копии обновляется целостность ASAR, исходная цифровая подпись к ней не применяется. Файлы Claude не включены в эту сборку. Приложение независимо от Anthropic.</p></details>
+</main><script src="renderer.js"></script>
+</body></html>

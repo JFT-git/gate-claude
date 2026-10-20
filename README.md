@@ -1,6 +1,18 @@
 # gate-claude
 
-Claude Proxy Guard 0.3.2.
+Независимый Claude Proxy Guard: **macOS 0.3.2** и **Windows x64 0.4.0**.
+
+Готовые сборки: [GitHub Releases](https://github.com/JFT-git/gate-claude/releases). Исходники распространяются по MIT; Claude в комплект не входит.
+
+## Windows
+
+Распакуйте ZIP целиком и запустите `Claude Proxy Guard.exe`. Выберите установленный `claude.exe`, укажите свой SOCKS5, затем нажмите **Проверить и запустить**. Нужны Windows 10/11 x64 и отдельно установленный Claude. Пароль прокси хранится только в памяти.
+
+Windows-версия включает перехват HTTP/SSE/WebSocket, фактическую проверку `Europe/Amsterdam` / `en-US`, закрепление IP, кнопку перезапуска и завершение дерева Claude через Windows Job Object. EOF, авария helper и отсутствие heartbeat дольше 5 секунд закрывают дерево. Системные настройки Windows не меняются. Это не системный firewall или VPN.
+
+Инструкция, ограничения и воспроизводимая сборка: [Windows/README.md](Windows/README.md). Код macOS находится в `Source`, код Windows — в `Windows/src`, общий bootstrap — в `Resources`.
+
+## macOS
 
 Независимое приложение для macOS 13+, Apple Silicon и Intel. Подключает установленный Claude Desktop к SOCKS5, проверяет внешний IP, задаёт `Europe/Amsterdam` и `en-US`, показывает доступные веб-запросы и ответы. Системные язык, часовой пояс и прокси macOS не меняются.
 

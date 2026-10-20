@@ -1,0 +1,21 @@
+{
+  "name": "gate-claude",
+  "productName": "Claude Proxy Guard",
+  "version": "0.4.0",
+  "description": "Independent SOCKS5 companion for an installed Claude Desktop",
+  "author": "gate-claude contributors",
+  "license": "MIT",
+  "private": true,
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "build": "node scripts/package.cjs",
+    "smoke": "electron . --smoke-test"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "44.9.2"
+  },
+  "engines": { "node": ">=22.12.0" }
+}
