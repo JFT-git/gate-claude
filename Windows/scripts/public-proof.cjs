@@ -49,5 +49,18 @@ if (source.revalidation) {
   }
   assert.equal(source.revalidation.injectedHTTP500, 1); publicProof.revalidation.injectedHTTP500 = 1;
 }
+if (source.profilePersistence) {
+  publicProof.profilePersistence = {};
+  for (const key of ['samePrivateProfile', 'freshGuardPolicy', 'previousFenceRemovedBeforeRestart',
+    'localStorage', 'indexedDB', 'persistentHttpOnlyCookie', 'httpOnlyInvisibleToJavaScript',
+    'secondFenceInstalled', 'secondGuardCleanlyStopped']) {
+    assert.equal(source.profilePersistence[key], true); publicProof.profilePersistence[key] = true;
+  }
+}
+if (source.executionContext) {
+  for (const key of ['elevated', 'interactive', 'standardUserRuntimeCovered']) assert.equal(typeof source.executionContext[key], 'boolean');
+  publicProof.executionContext = { elevated: source.executionContext.elevated, interactive: source.executionContext.interactive,
+    standardUserRuntimeCovered: source.executionContext.standardUserRuntimeCovered };
+}
 if (source.restart) publicProof.restart = { freshPolicy: source.restart.freshPolicy, passwordAbsent: source.restart.passwordAbsent };
 fs.writeFileSync(process.argv[3], JSON.stringify(publicProof, null, 2) + '\n');

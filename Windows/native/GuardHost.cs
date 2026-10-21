@@ -1,6 +1,9 @@
 using System;
 using System.ComponentModel;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
@@ -10,6 +13,80 @@ using System.Threading;
 // JOB_LIST assigns the child atomically inside CreateProcess. Suspension alone
 // would leave an unowned child if this helper died before a later assignment.
 internal static class GuardHost {
+    // Windows SDK netioapi.h/ws2ipdef.h: SOCKADDR_INET is a 28-byte union.
+    // These integer fields keep the structure blittable without overlapping
+    // managed arrays. Address octets are copied in their native memory order.
+    [StructLayout(LayoutKind.Sequential)] internal struct SOCKADDR_INET {
+        public ushort family,port; public uint data0,data1,data2,data3,data4,scope;
+    }
+    [StructLayout(LayoutKind.Sequential)] internal struct IP_ADDRESS_PREFIX {
+        public SOCKADDR_INET prefix; public byte length;
+    }
+    [StructLayout(LayoutKind.Sequential)] internal struct MIB_IPFORWARD_ROW2 {
+        public ulong luid; public uint index; public IP_ADDRESS_PREFIX destination;
+        public SOCKADDR_INET nextHop; public byte sitePrefixLength;
+        public uint validLifetime,preferredLifetime,metric,protocol;
+        public byte loopback,autoconfigure,publish,immortal; public uint age,origin;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct MIB_IPFORWARD_TABLE2 {
+        public uint count; public MIB_IPFORWARD_ROW2 first;
+    }
+    [DllImport("iphlpapi.dll")] static extern uint GetIpForwardTable2(ushort family,out IntPtr table);
+    [DllImport("iphlpapi.dll")] static extern void FreeMibTable(IntPtr table);
+    internal static void ValidateRouteLayout() {
+        if (Marshal.SizeOf(typeof(SOCKADDR_INET)) != 28 || Marshal.SizeOf(typeof(IP_ADDRESS_PREFIX)) != 32 ||
+            Marshal.SizeOf(typeof(MIB_IPFORWARD_ROW2)) != 104 || Marshal.OffsetOf(typeof(MIB_IPFORWARD_TABLE2),"first").ToInt32() != 8 ||
+            Marshal.OffsetOf(typeof(MIB_IPFORWARD_ROW2),"destination").ToInt32() != 12 ||
+            Marshal.OffsetOf(typeof(MIB_IPFORWARD_ROW2),"nextHop").ToInt32() != 44 ||
+            Marshal.OffsetOf(typeof(MIB_IPFORWARD_ROW2),"metric").ToInt32() != 84)
+            throw new InvalidOperationException("Unsupported route table layout.");
+    }
+    static IPAddress RouteAddress(SOCKADDR_INET value) {
+        if (value.family == 2) return new IPAddress(BitConverter.GetBytes(value.data0));
+        if (value.family != 23) throw new InvalidOperationException("Unsupported route address family.");
+        var octets = new byte[16];
+        Buffer.BlockCopy(BitConverter.GetBytes(value.data1),0,octets,0,4);
+        Buffer.BlockCopy(BitConverter.GetBytes(value.data2),0,octets,4,4);
+        Buffer.BlockCopy(BitConverter.GetBytes(value.data3),0,octets,8,4);
+        Buffer.BlockCopy(BitConverter.GetBytes(value.data4),0,octets,12,4);
+        // InterfaceIndex already identifies the IPv6 next-hop's zone, matching
+        // Get-NetRoute's unscoped NextHop representation.
+        return new IPAddress(octets);
+    }
+    internal static string RouteIdentity(MIB_IPFORWARD_ROW2 row) {
+        if ((row.destination.prefix.family != 2 && row.destination.prefix.family != 23) ||
+            row.nextHop.family != row.destination.prefix.family ||
+            row.destination.length > (row.destination.prefix.family == 2 ? 32 : 128))
+            throw new InvalidOperationException("Invalid route entry.");
+        if (row.destination.length > 1) return null;
+        string prefix = RouteAddress(row.destination.prefix).ToString() + "/" + row.destination.length.ToString(CultureInfo.InvariantCulture);
+        if (prefix != "0.0.0.0/0" && prefix != "0.0.0.0/1" && prefix != "128.0.0.0/1" &&
+            prefix != "::/0" && prefix != "::/1" && prefix != "8000::/1") return null;
+        return row.index.ToString(CultureInfo.InvariantCulture) + "|" + RouteAddress(row.nextHop).ToString() + "|" +
+            row.metric.ToString(CultureInfo.InvariantCulture) + "|" + prefix;
+    }
+    internal static string EncodeRouteSnapshot(List<string> routes) {
+        routes.Sort(StringComparer.Ordinal);
+        // Each identity consists only of numeric addresses and decimal fields;
+        // none of its generated characters require JSON string escaping.
+        return routes.Count == 0 ? "[]" : "[\"" + string.Join("\",\"",routes.ToArray()) + "\"]";
+    }
+    static string RouteFingerprint() {
+        ValidateRouteLayout(); IntPtr table = IntPtr.Zero;
+        try {
+            uint status = GetIpForwardTable2(0,out table); // AF_UNSPEC includes IPv4 and IPv6.
+            if (status != 0) throw new Win32Exception(unchecked((int)status));
+            if (table == IntPtr.Zero) throw new InvalidOperationException("Missing route table.");
+            uint count = unchecked((uint)Marshal.ReadInt32(table));
+            if (count > 65536) throw new InvalidOperationException("Unexpected route table size.");
+            var routes = new List<string>();
+            for (uint index = 0; index < count; index++) {
+                var row = (MIB_IPFORWARD_ROW2)Marshal.PtrToStructure(IntPtr.Add(table,checked(8 + (int)index * 104)),typeof(MIB_IPFORWARD_ROW2));
+                string identity = RouteIdentity(row); if (identity != null) routes.Add(identity);
+            }
+            return EncodeRouteSnapshot(routes);
+        } finally { if (table != IntPtr.Zero) FreeMibTable(table); }
+    }
     [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct STARTUPINFO {
         public int cb; public string reserved, desktop, title;
         public int x,y,xSize,ySize,xCount,yCount,fill,flags; public short show,reserved2;
@@ -51,6 +128,11 @@ internal static class GuardHost {
     }
     static void Check(bool value) { if (!value) throw new Win32Exception(Marshal.GetLastWin32Error()); }
     public static int Main(string[] args) {
+        if (args.Length > 0 && args[0] == "--route-fingerprint") {
+            if (args.Length != 1) return 64;
+            try { Console.OutputEncoding = new UTF8Encoding(false); Console.WriteLine(RouteFingerprint()); return 0; }
+            catch (Exception error) { Console.Error.WriteLine("GuardHost routes: " + error.GetType().Name); return 1; }
+        }
         if (args.Length < 1 || !System.IO.Path.IsPathRooted(args[0])) return 64;
         IntPtr job = IntPtr.Zero, attributes = IntPtr.Zero, jobList = IntPtr.Zero;
         PROCESS_INFORMATION child = new PROCESS_INFORMATION();
