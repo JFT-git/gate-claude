@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, powerMonitor, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { GuardController } = require('./controller.cjs');
@@ -7,13 +7,14 @@ const { discoverClaude } = require('./discovery.cjs');
 const { prepareRuntime } = require('./runtime.cjs');
 const { validateSettings } = require('./policy.cjs');
 const { diagnostic } = require('./sanitize.cjs');
-const { takeDeepLinkFromArgv, registerGuardProtocol, LINK_REFUSED } = require('./deep-link.cjs');
+const { takeDeepLinkFromArgv, LINK_REFUSED } = require('./deep-link.cjs');
+const { ensureGuardProtocolRegistration, SETTINGS_URL } = require('./protocol-registration.cjs');
 
 app.setName('Claude Proxy Guard');
 app.setAppUserModelId?.('local.proxyguard.gate-claude');
 if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
-  let window, controller, earlyLinkRefused = false;
+  let window, controller, protocolState, earlyLinkRefused = false;
   const receiveDeepLink = argv => {
     const link = takeDeepLinkFromArgv(argv);
     if (!link.hadLink) return;
@@ -41,8 +42,14 @@ else {
   }
   app.whenReady().then(async () => {
     controller = new GuardController(root, resources);
-    const protocol = registerGuardProtocol(app, { smokeTest: process.argv.includes('--smoke-test') });
-    if (!protocol.skipped && !protocol.registered) controller.log('Не удалось назначить Guard обработчиком ссылок входа Claude.', 'warning');
+    const checkProtocol = async () => {
+      protocolState = await ensureGuardProtocolRegistration(app, { smokeTest: process.argv.includes('--smoke-test') });
+      send('protocol', protocolState); return protocolState;
+    };
+    await checkProtocol();
+    if (protocolState.selectionRequired) controller.log(protocolState.registered
+      ? 'Для входа по ссылке выберите Claude Proxy Guard для протокола claude в приложениях Windows по умолчанию.'
+      : 'Не удалось зарегистрировать обработчик входа Guard. Повторите проверку выбора приложения.', 'warning');
     if (earlyLinkRefused) { earlyLinkRefused = false; controller.log(LINK_REFUSED, 'warning'); }
     controller.on('state', value => send('state', value));
     controller.on('log', value => send('log', value));
@@ -52,7 +59,7 @@ else {
     });
     handle('init', async () => {
       const value = settings();
-      return { version: app.getVersion(), settings: value, state: controller.snapshot(), logs: controller.events, records: [...traffic.values()] };
+      return { version: app.getVersion(), settings: value, protocol: protocolState, state: controller.snapshot(), logs: controller.events, records: [...traffic.values()] };
     });
     let finding;
     const findClaude = () => {
@@ -60,6 +67,11 @@ else {
       return finding;
     };
     handle('find', findClaude);
+    handle('protocolCheck', checkProtocol);
+    handle('protocolSettings', async () => {
+      // This action accepts no URL or path from the renderer.
+      await shell.openExternal(SETTINGS_URL); return { opened: true };
+    });
     handle('choose', async () => {
       const result = await dialog.showOpenDialog(window, { title: 'Выберите установленный claude.exe', properties: ['openFile'], filters: [{ name: 'Claude Desktop', extensions: ['exe'] }] });
       return result.canceled ? '' : result.filePaths[0];

@@ -3,3 +3,4 @@
 [hidden]{display:none!important}.pill{max-width:32%;white-space:normal;overflow-wrap:anywhere}.inline input{flex:1}.inline button{flex:none}#claudeStatus{display:block;margin:6px 0 0;line-height:1.4}header{padding:18px 24px}main{padding:18px 24px}.panel{padding:18px}.monitor{padding:0}label{margin-bottom:12px}.verified{margin-top:16px;padding-top:14px}.hint{margin-bottom:13px}.status{margin-bottom:18px}
 
 .lamp.rechecking{background:#e4b86a;box-shadow:0 0 16px #e4b86a55}
+.protocol-choice{margin-top:14px;padding-top:10px;border-top:1px solid #2c4035}.protocol-choice p{margin:0 0 8px}.protocol-choice .actions{flex-wrap:wrap;align-items:flex-start}.protocol-choice button{white-space:normal}

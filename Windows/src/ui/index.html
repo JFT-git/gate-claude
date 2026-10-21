@@ -27,6 +27,7 @@
         <label class="check"><input type="checkbox" id="captureBodies"> Показывать тела запросов и ответов</label>
         <p class="hint">Первый запуск проверяет страну и IP. Подтверждённая смена IP закрывает сессию. Сбой проверки, смена сети и сон приостанавливают трафик: прежний IP позволяет продолжить без перезапуска Claude.</p>
         <div class="actions"><button id="start" type="submit">Проверить и запустить</button><button id="stop" type="button" class="secondary" disabled>Остановить</button></div>
+        <div class="protocol-choice"><p id="protocolHint" class="muted">Проверяем обработчик ссылок входа…</p><div class="actions"><button id="protocolSettings" type="button" class="secondary small">Выбрать Guard для ссылок входа</button><button id="protocolCheck" type="button" class="secondary small">Проверить выбор</button></div></div>
       </form>
       <div class="verified"><span class="eyebrow">Фактический профиль страницы</span><strong id="profile">Ожидаем запуск Claude</strong><span class="muted" id="locale">Проверяются Intl, navigator и Accept-Language</span></div>
     </section>
