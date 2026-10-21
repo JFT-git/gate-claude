@@ -7,12 +7,8 @@ $group='Claude Proxy Guard: original Claude isolation'
 $owner='gate-claude.original-isolation.v1'
 $prefix='GateClaude.Original.'
 $packages=@(Get-AppxPackage -AllUsers -Name Claude | Where-Object {$_.PackageFamilyName -eq 'Claude_pzs8sxrjxfjjc'})
-if($Mode -eq 'Remove') {
-  Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue | Where-Object {$_.Name.StartsWith($prefix) -and $_.Description -eq $owner} | Remove-NetFirewallRule
-  return
-}
 if(!$packages.Count){throw 'Official Claude WindowsApps package not found.'}
-if(@(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object {!$_.Enabled}).Count){throw 'Windows Firewall must be enabled on every profile.'}
+if($Mode -ne 'Remove' -and @(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object {!$_.Enabled}).Count){throw 'Windows Firewall must be enabled on every profile.'}
 $specs=@()
 foreach($p in $packages) {
   if(!$p.InstallLocation.StartsWith(($env:ProgramFiles+'\WindowsApps\'),[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected package path.'}
@@ -23,6 +19,17 @@ foreach($p in $packages) {
   }
 }
 $specs=@($specs|Sort-Object { $_.Kind+':'+$_.Value } -Unique)
+$nativeSource=Join-Path $PSScriptRoot 'OriginalClaudeFence.cs'
+if(!(Test-Path -LiteralPath $nativeSource)){$nativeSource=Join-Path (Split-Path $PSScriptRoot -Parent) 'native\OriginalClaudeFence.cs'}
+if(!(Test-Path -LiteralPath $nativeSource)){throw 'OriginalClaudeFence.cs must accompany this script.'}
+Add-Type -Path $nativeSource
+[string[]]$programs=@($specs|Where-Object {$_.Kind -eq 'Program'}|ForEach-Object {$_.Value})
+$nativeFilters=[OriginalClaudeFence]::Apply($programs,$Mode)
+if($Mode -eq 'Remove') {
+  Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue | Where-Object {$_.Name.StartsWith($prefix) -and $_.Description -eq $owner} | Remove-NetFirewallRule
+  return
+}
+
 foreach($s in $specs) {
   $sha=[Security.Cryptography.SHA256]::Create()
   try {$hash=([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($s.Kind+':'+$s.Value).ToLowerInvariant())))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
@@ -45,4 +52,4 @@ foreach($s in $specs) {
     if($s.Kind -eq 'Family' -and $active.PackageFamilyName -ne $s.Value){throw 'Package family filter mismatch.'}
   }
 }
-[ordered]@{result='PASS';mode=$Mode;packageFamilies=@($packages.PackageFamilyName|Sort-Object -Unique).Count;programs=@($specs|Where-Object {$_.Kind -eq 'Program'}).Count;effectiveRules=$specs.Count*2;persistent=$true;allProfiles=$true;guardRuntimeExcluded=$true}|ConvertTo-Json -Compress
+[ordered]@{result='PASS';mode=$Mode;packageFamilies=@($packages.PackageFamilyName|Sort-Object -Unique).Count;programs=@($specs|Where-Object {$_.Kind -eq 'Program'}).Count;effectiveRules=$specs.Count*2;persistent=$true;nativeDenyFilters=$nativeFilters;loopbackException=$false;allProfiles=$true;guardRuntimeExcluded=$true}|ConvertTo-Json -Compress
