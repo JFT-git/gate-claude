@@ -91,7 +91,7 @@ class GuardController extends EventEmitter {
         LANGUAGE: settings.language, LC_MESSAGES: settings.language.replaceAll('-', '_') + '.UTF-8',
         PROXY_GUARD_CONFIG: JSON.stringify({ userData: this.runtime.profile, timezone: settings.timezone, language: settings.language,
           proxyURL: 'http://127.0.0.1:' + port, channelPipe: this.channel.path, channelToken: this.channel.token }) });
-      this.host = spawn(path.join(this.resources, 'GuardHost.exe'), [this.runtime.executable, '--lang=' + settings.language], { env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+      this.host = spawn(path.join(this.resources, 'GuardHost.exe'), [this.runtime.executable, '--user-data-dir=' + this.runtime.profile, '--lang=' + settings.language], { env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
       let output = '';
       this.host.stdout.on('data', chunk => {
         output = (output + chunk).slice(-8192); let end;

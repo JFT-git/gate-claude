@@ -31,6 +31,29 @@ async function until(check, label, timeout = 30000) {
   while (Date.now() - started < timeout) { const result = await check(); if (result) return result; await sleep(80); }
   throw Error('Timeout: ' + label);
 }
+async function fixtureCookieDisk(profile) {
+  const { DatabaseSync } = require('node:sqlite'), files = [], rows = [];
+  async function walk(directory) {
+    for (const item of await fs.readdir(directory, { withFileTypes: true })) {
+      const file = path.join(directory, item.name);
+      if (item.isDirectory()) await walk(file); else if (item.isFile() && item.name === 'Cookies') files.push(file);
+    }
+  }
+  await walk(profile);
+  for (const file of files) {
+    // Chromium holds an exclusive SQLite lock. Inspect only a temporary byte
+    // snapshot of this test's own DB; never write to the live browser store.
+    const snapshot=path.join(work,'CookieInspection-'+crypto.randomUUID());await fs.mkdir(snapshot);
+    try {
+      const copy=path.join(snapshot,'Cookies');await fs.copyFile(file,copy);
+      for(const suffix of ['-wal','-journal'])try{await fs.copyFile(file+suffix,copy+suffix)}catch(error){if(error.code!=='ENOENT')throw error}
+      const db = new DatabaseSync(copy);
+      try { rows.push(...db.prepare('SELECT host_key AS host,name,is_secure AS secure,is_httponly AS httpOnly,is_persistent AS persistent,CAST(expires_utc AS TEXT) AS expiry,length(encrypted_value) AS encryptedLength,substr(hex(encrypted_value),1,6) AS scheme,length(value) AS plaintextLength FROM cookies WHERE name=?').all(persistenceCookie)); }
+      finally { db.close(); }
+    } finally { await fs.rm(snapshot,{recursive:true,force:true}); }
+  }
+  return { databaseCount: files.length, rows };
+}
 const sockets = new Set(), observations = {}, proof = { platform: process.platform, test: 'official Windows Claude, separate profile, local TLS fixture', observedIPSource: 'controlled test-only provider; no physical WAN change' };
 const track = socket => { sockets.add(socket); socket.on('error', () => {}); socket.once('close', () => sockets.delete(socket)); return socket; };
 const html = `<!doctype html><html><body><h1>Guard Windows fixture</h1><script>
@@ -171,7 +194,11 @@ command=async m=>{
   const target=sessions.get(m.params.targetSession);if(!target||target.child)throw Error('root target required');
   const storage=target.wc.session;await storage.cookies.flushStore();storage.flushStorageData();
   const cookies=await storage.cookies.get({url:'https://claude.ai',name:${JSON.stringify(persistenceCookie)}});
-  const cookie=cookies[0];emit({id:m.id,result:{flushed:true,cookiePersistent:cookies.length===1&&cookie.httpOnly&&cookie.secure&&!cookie.session&&cookie.expirationDate>Date.now()/1000+300}});return;
+  const cookie=cookies[0],own=path.resolve(cfg.userData).toLowerCase();
+  const same=p=>typeof p==='string'&&path.resolve(p).toLowerCase()===own;
+  const storagePath=storage.getStoragePath();const storageOwn=typeof storagePath==='string'&&(same(storagePath)||path.resolve(storagePath).toLowerCase().startsWith(own+path.sep));
+  emit({id:m.id,result:{electronVersion:process.versions.electron,flushed:true,cookieCount:cookies.length,cookiePersistent:cookies.length===1&&cookie.httpOnly&&cookie.secure&&!cookie.session&&cookie.expirationDate>Date.now()/1000+300,
+   cookieValueMatches:cookie?.value===m.params.expectedValue,userDataOwn:same(app.getPath('userData')),sessionDataOwn:same(app.getPath('sessionData')),sessionStorageOwn:storageOwn}});return;
  }
  if(m.method==='ProxyGuard.testSharedLocale'){
   const target=sessions.get(m.params.targetSession);if(!target||target.child)throw Error('root target required');const dbg=target.wc.debugger;
@@ -262,7 +289,10 @@ command=async m=>{
     proof.revalidation = { injectedHTTP500: observations.http500, recheckingObserved: states.slice(statesBefore).includes('rechecking'),
       appTrafficBlockedWhilePaused: true, processSurvived: true, samePID: true, resumedHTTP: true, resumedStream: true };
     assert.equal(proof.revalidation.recheckingObserved, true);
-    const firstProfile = controller.runtime.profile, firstFence = controller.fence;
+    const firstProfile = controller.runtime.profile, firstExecutable = controller.runtime.executable, firstFence = controller.fence;
+    const profileKeyHash=async()=>{try{const state=JSON.parse(await fs.readFile(path.join(firstProfile,'Local State'),'utf8')),value=state.os_crypt?.encrypted_key;return typeof value==='string'?crypto.createHash('sha256').update(value).digest('hex'):null}catch{return null}};
+    observations.profilePathsBeforeWrite=await channel.command('ProxyGuard.testFlushProfile',{targetSession:sid});
+    for(const field of ['userDataOwn','sessionDataOwn','sessionStorageOwn'])assert.equal(observations.profilePathsBeforeWrite[field],true,field+' must use only the fixture profile');
     const writePersistence = (await channel.command('Runtime.evaluate', {
       expression: `(async()=>{
         const key='guard-fixture-persistence-v1',value=${JSON.stringify(persistenceMarker)};
@@ -278,13 +308,20 @@ command=async m=>{
       })()`, awaitPromise: true, returnByValue: true
     }, sid)).result?.value;
     assert.deepEqual(writePersistence, { localStorageWritten: true, indexedDBCommitted: true, httpOnlyInvisible: true });
-    const flush = await channel.command('ProxyGuard.testFlushProfile', { targetSession: sid });
-    assert.equal(flush.flushed, true); assert.equal(flush.cookiePersistent, true);
+    const flush = await channel.command('ProxyGuard.testFlushProfile', { targetSession: sid, expectedValue: persistenceMarker });
+    observations.persistenceBeforeKill=flush;
+    assert.equal(flush.flushed, true); assert.equal(flush.cookiePersistent, true);assert.equal(flush.cookieValueMatches,true);
+    const baselineCookie=(await channel.command('Runtime.evaluate',{expression:`fetch('/__guard_test__/persist',{cache:'no-store'}).then(r=>r.json()).then(v=>v.cookiePresent)`,awaitPromise:true,returnByValue:true},sid)).result?.value;
+    observations.cookieSentBeforeKill=baselineCookie===true;assert.equal(baselineCookie,true);
+    const profileKeyPresence=async()=>{try{const value=JSON.parse(await fs.readFile(path.join(firstProfile,'Local State'),'utf8')).os_crypt||{};return {legacyKey:typeof value.encrypted_key==='string',appBoundKey:typeof value.app_bound_encrypted_key==='string'}}catch{return {legacyKey:false,appBoundKey:false}}};
+    const firstKeyHash=await profileKeyHash();observations.ownEncryptionKeyPresentBefore=firstKeyHash!==null;
+    observations.ownKeyPresenceBefore=await profileKeyPresence();observations.fixtureCookieDiskBefore=await fixtureCookieDisk(firstProfile).catch(error=>{if(error.code==='EBUSY')return {locked:true};throw error});
     // Round trips follow Chromium's explicit storage flush and committed IndexedDB
     // transaction. Persistence must then survive the same abrupt Job kill as the
     // real IP-switch path, rather than an artificial graceful app shutdown.
     assert.equal(await evaluate(`localStorage.getItem('guard-fixture-persistence-v1')===${JSON.stringify(persistenceMarker)}`), true);
-    await sleep(350);
+    await sleep(argv.includes('--settle-key')?15000:350);
+    observations.ownKeyPresenceAfterSettling=await profileKeyPresence();observations.ownEncryptionKeyPresentAfterSettling=(await profileKeyHash())!==null;
     const port = controller.relay.port, changedAt = Date.now();
     observed = '203.0.113.8';
     await until(() => controller.state === 'blocked', 'IP kill', 10000);
@@ -296,6 +333,7 @@ command=async m=>{
     // Teardown is asynchronous: do not race a new broker against the old global
     // WFP mutex or accept abandoned persistent filters as successful cleanup.
     await until(() => firstFence.closed && firstFence.installed === false, 'old WFP broker acknowledged filter removal', 20000);
+    observations.fixtureCookieDiskStopped=await fixtureCookieDisk(firstProfile);
     observed = '203.0.113.7';
     controller = new GuardController(root, resources);
     controller.on('log', event => console.log('restart ' + event.kind + ': ' + event.message));
@@ -303,6 +341,7 @@ command=async m=>{
     await controller.start(input);
     await until(() => controller.state === 'running' || (controller.state === 'blocked' && Promise.reject(Error(controller.message))), 'restarted renderer profile', 45000);
     assert.equal(controller.runtime.profile, firstProfile);
+    observations.sameRuntimeExecutable=controller.runtime.executable===firstExecutable;assert.equal(observations.sameRuntimeExecutable,true);
     assert.equal(controller.fence?.installed, true); assert.equal(controller.fence.proof?.persistent, true);
     let restartedSession;
     await until(async () => {
@@ -316,6 +355,9 @@ command=async m=>{
       }
       return false;
     }, 'restarted fixture origin');
+    observations.persistenceAfterRestart=await controller.channel.command('ProxyGuard.testFlushProfile',{targetSession:restartedSession,expectedValue:persistenceMarker});
+    const secondKeyHash=await profileKeyHash();observations.ownEncryptionKeyPresentAfter=secondKeyHash!==null;observations.ownEncryptionKeyUnchanged=firstKeyHash!==null&&secondKeyHash===firstKeyHash;
+    observations.ownKeyPresenceAfter=await profileKeyPresence();observations.fixtureCookieDiskAfter=await fixtureCookieDisk(firstProfile).catch(error=>{if(error.code==='EBUSY')return {locked:true};throw error});
     const persisted = (await controller.channel.command('Runtime.evaluate', {
       expression: `(async()=>{
         const value=${JSON.stringify(persistenceMarker)};
@@ -342,6 +384,10 @@ command=async m=>{
     assert.ok(observations.ipChecks?.['ipwho.is'] >= 1);
     assert.ok(ipHosts.filter(host => host !== 'ipwho.is').reduce((total, host) => total + (observations.ipChecks?.[host] || 0), 0) >= 4);
     proof.ipChecksThroughLocalTLS = true;
+    proof.profileDiagnostics={electronVersion:flush.electronVersion,sameRuntimeExecutable:observations.sameRuntimeExecutable,
+      keysBefore:observations.ownKeyPresenceBefore,keysAfterSettling:observations.ownKeyPresenceAfterSettling,keysAfterRestart:observations.ownKeyPresenceAfter,
+      beforeKillDBLocked:observations.fixtureCookieDiskBefore.locked===true,persistedFixtureRowsBeforeReload:observations.fixtureCookieDiskStopped.rows.length,
+      encryptedFixtureScheme:observations.fixtureCookieDiskStopped.rows[0]?.scheme,diagnosticSettleBeforeIPChange:argv.includes('--settle-key')};
     proof.result = 'PASS'; await fs.writeFile(path.join(work, 'proof.json'), JSON.stringify(proof, null, 2));
     console.log('PASS: installed Windows Claude, production WFP, locale, interception, same-PID revalidation, IP kill and persistent private profile');
   } catch (error) {

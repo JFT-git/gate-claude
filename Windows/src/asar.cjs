@@ -118,12 +118,50 @@ function updatePEIntegrity(source, oldDigest, newDigest) {
 function windowsBootstrap(base, networkGuard = '') {
   const original = "const reader = fs.createReadStream(null, { fd: 3, autoClose: false });\nconst writer = fs.createWriteStream(null, { fd: 4, autoClose: false });";
   if (base.split(original).length !== 2) throw Error('Неизвестная версия адаптера Guard.');
-  const replacement = `if (!cfg.channelPipe || !/^[a-f0-9]{64}$/.test(cfg.channelToken || '')) throw Error('Guard channel required');
+  const profileAnchor = '  ready.catch(targetFailure);';
+  const navigationAnchor = 'wc[name] = (...args) => ready.then';
+  if (base.split(profileAnchor).length !== 2 || base.split(navigationAnchor).length !== 2) throw Error('Неизвестная версия защиты профиля Guard.');
+  const replacement = `app.setPath('sessionData', cfg.userData);
+// Cookie SQLite flushes separately from Chromium's delayed Local State writes.
+// Never admit a login page until its Windows DPAPI-wrapped key is on disk.
+const guardProfileReady = app.whenReady().then(async () => {
+  if (bridge.connecting) await new Promise(resolve => bridge.once('connect', resolve));
+  if (!electron.safeStorage.isEncryptionAvailable()) throw Error('Шифрование профиля Windows недоступно.');
+  const keyFile = path.join(cfg.userData, 'Local State');
+  const deadline = performance.now() + 20000;
+  let waitingNotice = false;
+  while (performance.now() < deadline) {
+    try {
+      const stat = await fs.promises.lstat(keyFile);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 4194304) throw Error('Небезопасное хранилище ключа профиля.');
+      const saved = JSON.parse(await fs.promises.readFile(keyFile, 'utf8'));
+      const opaqueKey = saved?.os_crypt?.encrypted_key;
+      if (typeof opaqueKey === 'string' && opaqueKey.length <= 16384 &&
+          Buffer.from(opaqueKey, 'base64').length >= 64 &&
+          Buffer.from(opaqueKey, 'base64').subarray(0, 5).toString('ascii') === 'DPAPI') {
+        if (waitingNotice) emit({method:'ProxyGuard.notice',params:{message:'Зашифрованный профиль сохранён и готов к работе.'}});
+        return;
+      }
+    } catch (error) {
+      if (!(error instanceof SyntaxError) && !['ENOENT','EBUSY','EACCES'].includes(error.code)) throw error;
+    }
+    if (!waitingNotice) {
+      waitingNotice = true;
+      emit({method:'ProxyGuard.notice',params:{message:'Подготавливаем зашифрованный профиль Windows. Первый запуск может занять несколько секунд.'}});
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw Error('Windows не сохранила ключ зашифрованного профиля. Запуск остановлен без удаления данных.');
+});
+guardProfileReady.catch(fatal);
+if (!cfg.channelPipe || !/^[a-f0-9]{64}$/.test(cfg.channelToken || '')) throw Error('Guard channel required');
 const bridge = require('node:net').connect(cfg.channelPipe);
 const reader = bridge, writer = bridge;
 bridge.once('connect', () => emit({method:'ProxyGuard.hello',params:{token:cfg.channelToken}}));
 if (process.platform === 'win32') app.setAppUserModelId('local.proxyguard.claude.runtime');`;
   const guard = networkGuard ? `\n{const guardModule={exports:{}};(function(require,module){\n${networkGuard}\n})(require,guardModule);guardModule.exports.installNetworkGuard(cfg);}\n` : '';
-  return Buffer.from(base.replace(original, replacement + guard));
+  return Buffer.from(base.replace(original, replacement + guard)
+    .replace(profileAnchor, '  const durableReady = ready.then(() => guardProfileReady);\n  durableReady.catch(targetFailure);')
+    .replace(navigationAnchor, 'wc[name] = (...args) => durableReady.then'));
 }
 module.exports = { parseArchive, addBootstrap, updatePEIntegrity, windowsBootstrap, hash };

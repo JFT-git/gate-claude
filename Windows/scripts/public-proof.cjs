@@ -57,6 +57,15 @@ if (source.profilePersistence) {
     assert.equal(source.profilePersistence[key], true); publicProof.profilePersistence[key] = true;
   }
 }
+if (source.profileDiagnostics && source.profilePersistence) {
+  const detail = source.profileDiagnostics;
+  assert.equal(detail.diagnosticSettleBeforeIPChange, false);
+  assert.equal(detail.keysBefore?.legacyKey, true);
+  assert.equal(detail.keysAfterRestart?.legacyKey, true);
+  assert.equal(detail.persistedFixtureRowsBeforeReload, 1);
+  assert.equal(detail.encryptedFixtureScheme, '763130');
+  publicProof.profileEncryption = { keyPersistedBeforeKill: true, encryptedCookieOnDisk: 'v10', diagnosticDelayBeforeIPChange: false };
+}
 if (source.executionContext) {
   for (const key of ['elevated', 'interactive', 'standardUserRuntimeCovered']) assert.equal(typeof source.executionContext[key], 'boolean');
   publicProof.executionContext = { elevated: source.executionContext.elevated, interactive: source.executionContext.interactive,
