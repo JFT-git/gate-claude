@@ -66,6 +66,22 @@ if (source.profileDiagnostics && source.profilePersistence) {
   assert.equal(detail.encryptedFixtureScheme, '763130');
   publicProof.profileEncryption = { keyPersistedBeforeKill: true, encryptedCookieOnDisk: 'v10', diagnosticDelayBeforeIPChange: false };
 }
+if (source.contentLocaleAllowed) {
+  publicProof.contentLocaleAllowed = {};
+  for (const key of ['russianAccountLanguage', 'russianContentLocale', 'quotedTimezone', 'contentReachedFixtureUnchanged', 'actualRendererStillVerified']) {
+    assert.equal(source.contentLocaleAllowed[key], true); publicProof.contentLocaleAllowed[key] = true;
+  }
+  assert.equal(source.contentLocaleAllowed.actualAcceptLanguage, 'en-US');
+  publicProof.contentLocaleAllowed.actualAcceptLanguage = 'en-US';
+}
+if (source.magicLinkDelivery) {
+  publicProof.magicLinkDelivery = {};
+  for (const key of ['syntheticCallbackDelivered', 'vendorListenerPresent', 'sameRuntimePID', 'privateProfileArgument', 'workingDirectoryCorrect', 'vendorNavigatedFixture']) {
+    assert.equal(source.magicLinkDelivery[key], true); publicProof.magicLinkDelivery[key] = true;
+  }
+  assert.equal(source.magicLinkDelivery.observerCount, 1); publicProof.magicLinkDelivery.observerCount = 1;
+  publicProof.magicLinkDelivery.realAccountLoginTested = false;
+}
 if (source.executionContext) {
   for (const key of ['elevated', 'interactive', 'standardUserRuntimeCovered']) assert.equal(typeof source.executionContext[key], 'boolean');
   publicProof.executionContext = { elevated: source.executionContext.elevated, interactive: source.executionContext.interactive,

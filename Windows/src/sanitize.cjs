@@ -27,20 +27,25 @@ function body(value) {
       .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+/gi, '$1[скрыто]'));
   }
 }
-function audit(header = {}, text = '') {
-  const flags = new Set();
-  function inspect(key, value) {
-    if (typeof value !== 'string') return;
-    if (/timezone|time_zone|^tz$/i.test(key) && /europe\/moscow|europe\/moskow/i.test(value)) flags.add('В метаданных Europe/Moscow');
-    if (/language|locale/i.test(key) && /^ru(?:[-_,;]|$)/i.test(value)) flags.add('В метаданных русский язык');
-  }
-  const walk = object => {
-    if (Array.isArray(object)) object.forEach(walk);
-    else if (object && typeof object === 'object') for (const [key, value] of Object.entries(object)) {
-      inspect(key, value); if (value && typeof value === 'object') walk(value);
+// Only CDP's actual request headers are transport metadata. JSON bodies,
+// account preferences, quoted text and application-specific headers are content;
+// their locale-like field names do not describe the browser's system profile.
+function auditRequestHeaders(header = {}, language = 'en-US') {
+  const flags = new Set(), expected = String(language).toLowerCase();
+  const primary = expected.split('-')[0];
+  for (const [key, value] of Object.entries(header)) {
+    if (key.toLowerCase() !== 'accept-language') continue;
+    if (typeof value !== 'string' || !value || /[\r\n]/.test(value)) {
+      flags.add('transport.Accept-Language.invalid'); continue;
     }
-  };
-  walk(header); try { walk(JSON.parse(text)); } catch {}
+    for (const part of value.split(',')) {
+      // Chromium may add the selected language's primary fallback. Any other
+      // language, including a q=0 entry, still discloses a different preference.
+      const match = /^[ \t]*([a-z]{1,8}(?:-[a-z0-9]{1,8})*)[ \t]*(?:;[ \t]*q=(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?))?[ \t]*$/i.exec(part);
+      if (!match) flags.add('transport.Accept-Language.invalid');
+      else if (![expected, primary].includes(match[1].toLowerCase())) flags.add('transport.Accept-Language.mismatch');
+    }
+  }
   return [...flags];
 }
 function diagnostic(value) {
@@ -49,4 +54,4 @@ function diagnostic(value) {
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[IP скрыт]')
     .replace(/\b[0-9a-f]{0,4}:[0-9a-f:]{2,}(?:%\w+)?/gi, '[IP скрыт]')).slice(0, 1500);
 }
-module.exports = { LIMIT, bounded, secretKey, safeURL, headers, body, audit, diagnostic };
+module.exports = { LIMIT, bounded, secretKey, safeURL, headers, body, auditRequestHeaders, diagnostic };

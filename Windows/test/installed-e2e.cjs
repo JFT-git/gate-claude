@@ -22,6 +22,7 @@ const fencePath = argument('--fence') ? path.resolve(argument('--fence')) : null
 const ipHosts = ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org'];
 const persistenceMarker = crypto.randomBytes(24).toString('hex');
 const persistenceCookie = '__Host-guard_fixture_persist';
+const fixtureDeepLink = 'claude://claude.ai/magic-link#guard-fixture-id:synthetic-token';
 let observed = '203.0.113.7', failNextCurrentIP = false, holdCurrentIP = false;
 const heldIPResponses = [], activeStreams = new Set();
 const { GuardController } = require('../src/controller.cjs');
@@ -61,7 +62,7 @@ const profile=()=>({timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,la
 window.__guardFixture={profiles:[]};
 window.addEventListener('message',event=>{if(event.origin==='https://challenges.cloudflare.com'&&event.data.guardFixture)window.__guardFixture.profiles.push(event.data)});
 (async()=>{
-const current=profile();const response=await fetch('/__guard_test__/capture',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer fixture-secret-do-not-export'},body:JSON.stringify(current)}).then(r=>r.json());
+const current=profile();const response=await fetch('/__guard_test__/capture',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer fixture-secret-do-not-export'},body:JSON.stringify({...current,account:{language:'ru-RU'},content:{locale:'ru',quotedTimezone:'Europe/Moscow',message:'Пример русского текста'}})}).then(r=>r.json());
 window.__guardFixture.result={profile:current,response};
 for(let i=0;i<8;i++){const f=document.createElement('iframe');f.src='https://challenges.cloudflare.com/frame?i='+i;document.body.append(f);const deadline=Date.now()+5000;while(window.__guardFixture.profiles.length<=i&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,30));f.remove()}
 window.__guardFixture.iframeDone=true;
@@ -128,6 +129,7 @@ async function main() {
         const result = JSON.stringify({ marker: 'guard-response-ok', received: JSON.parse(body) });
         res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(result) }); res.end(result); return;
       }
+      if (req.url === '/magic-link') observations.magicFixtureRequests = (observations.magicFixtureRequests || 0) + 1;
       const frameRequest = req.headers.host?.split(':')[0] === 'challenges.cloudflare.com';
       if (frameRequest) (observations.frameRequests ||= []).push(req.url);
       const result = frameRequest ? frame : html;
@@ -183,8 +185,20 @@ function pinFixture(s){s.setCertificateVerifyProc((r,cb)=>{if(!['claude.ai','cha
 app.on('session-created',pinFixture);app.whenReady().then(()=>pinFixture(electron.session.defaultSession));
 electron.shell.openExternal=async()=>{};
 app.setAsDefaultProtocolClient=()=>false;
+const fixtureDeepLink=${JSON.stringify(fixtureDeepLink)};
+const testDeepLink={count:0,privateProfileArgument:false,workingDirectoryCorrect:false};
+const observeDeepLink=(_event,args,cwd)=>{
+ if(!Array.isArray(args)||!args.includes(fixtureDeepLink))return;
+ testDeepLink.count++;
+ testDeepLink.privateProfileArgument=args.length===3&&args[0]===process.execPath&&args[1]==='--user-data-dir='+cfg.userData&&args[2]===fixtureDeepLink;
+ testDeepLink.workingDirectoryCorrect=typeof cwd==='string'&&path.resolve(cwd).toLowerCase()===path.dirname(process.execPath).toLowerCase();
+};
+app.on('second-instance',observeDeepLink);
 let testWindowsDone=0;const productionCommand=command;
 command=async m=>{
+ if(m.method==='ProxyGuard.testDeepLinkStatus'){
+  emit({id:m.id,result:{...testDeepLink,vendorListenerPresent:app.listeners('second-instance').some(handler=>handler!==observeDeepLink)}});return;
+ }
  if(m.method==='ProxyGuard.testWindowLifecycle'){
   for(const delay of [1,75]){const w=new electron.BrowserWindow({show:false});w.loadURL('https://claude.ai/__guard_test__/aux').catch(()=>{});setTimeout(()=>{if(!w.isDestroyed())w.destroy();testWindowsDone++},delay)}
   emit({id:m.id,result:{}});return;
@@ -260,8 +274,38 @@ command=async m=>{
     proof.webSocketCaptured = true;
     await until(() => observations.streamOpen, 'live SSE stream');
     assert.equal(observations.received.language, 'en-US'); proof.serverReceived = observations.received;
+    assert.equal(observations.received.body.account.language, 'ru-RU');
+    assert.equal(observations.received.body.content.locale, 'ru');
+    assert.equal(observations.received.body.content.quotedTimezone, 'Europe/Moscow');
+    assert.equal(controller.state, 'running');
+    assert.equal(result.profile.language, 'en-US');
+    proof.contentLocaleAllowed = { russianAccountLanguage: true, russianContentLocale: true, quotedTimezone: true,
+      contentReachedFixtureUnchanged: true, actualAcceptLanguage: 'en-US', actualRendererStillVerified: true };
+    const beforeMagicPID = controller.runtimePID;
+    const delivered = await controller.deliverDeepLink(fixtureDeepLink);
+    assert.deepEqual(delivered, { accepted: true, delivered: true });
+    const deepLink = await until(async () => {
+      const status = await channel.command('ProxyGuard.testDeepLinkStatus'); return status.count === 1 && status;
+    }, 'synthetic callback delivered through production adapter');
+    for (const field of ['vendorListenerPresent', 'privateProfileArgument', 'workingDirectoryCorrect']) assert.equal(deepLink[field], true, field);
+    await until(() => observations.magicFixtureRequests >= 1, 'vendor magic-link handler navigated controlled fixture');
+    await until(async () => {
+      if (controller.state === 'blocked') throw Error(controller.message);
+      for (const [candidate, item] of controller.inspector.sessions) {
+        if (!item.verified || !candidate.startsWith('guard-')) continue;
+        try {
+          const value = (await channel.command('Runtime.evaluate', { expression: 'location.pathname==="/magic-link"&&Boolean(window.__guardFixture?.result)', returnByValue: true }, candidate)).result?.value;
+          if (value) { sid = candidate; return true; }
+        } catch (error) { if (!/context|target closed|session/i.test(error.message)) throw error; }
+      }
+      return false;
+    }, 'magic-link fixture renderer verified');
+    await until(async () => await evaluate('window.__guardFixture?.iframeDone'), 'magic-link iframe churn', 60000);
+    await until(() => activeStreams.size > 0, 'magic-link fixture live SSE');
     const pid = controller.runtimePID;
-    assert.ok(pid > 0);
+    assert.ok(pid > 0); assert.equal(pid, beforeMagicPID); assert.equal(controller.state, 'running');
+    proof.magicLinkDelivery = { syntheticCallbackDelivered: true, vendorListenerPresent: true, observerCount: deepLink.count,
+      sameRuntimePID: true, privateProfileArgument: true, workingDirectoryCorrect: true, vendorNavigatedFixture: true };
     const statesBefore = states.length;
     failNextCurrentIP = true;
     await until(() => observations.http500 === 1 && controller.state === 'rechecking', 'HTTP 500 pauses application traffic', 10000);

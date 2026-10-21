@@ -12,10 +12,18 @@ const { Channel } = require('./channel.cjs');
 const { Inspector } = require('./inspector.cjs');
 const { diagnostic } = require('./sanitize.cjs');
 const { NetworkFence } = require('./fence.cjs');
+const { DeepLinkInbox, messages: linkMessages } = require('./deep-link.cjs');
 
 class GuardController extends EventEmitter {
   constructor(root, resources) {
-    super(); this.root = root; this.resources = resources; this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
+    super();
+    this.deepLinks = new DeepLinkInbox({
+      active: () => !this.policy?.blocked && !!this.policy?.pinned && ['starting', 'running', 'rechecking'].includes(this.state) && !!this.host && this.host.exitCode == null && !this.host.killed && !!this.channel && !this.channel.closed,
+      ready: () => this.deepLinkReady === true && this.state !== 'rechecking' && !!this.channel?.socket,
+      deliver: url => this.channel.command('ProxyGuard.openDeepLink', { url }),
+      notice: kind => this.log(linkMessages[kind], ['refused', 'failed', 'expired'].includes(kind) ? 'warning' : 'event')
+    });
+    this.root = root; this.resources = resources; this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
     try { this.events = JSON.parse(fs.readFileSync(path.join(root, 'diagnostics.json'), 'utf8')).slice(-80); } catch {}
   }
   status(message) { this.message = message; this.emit('state', this.snapshot()); }
@@ -30,10 +38,12 @@ class GuardController extends EventEmitter {
     } catch { /* A full/unavailable disk must not keep the runtime alive after a block. */ }
     this.emit('log', event);
   }
+  deliverDeepLink(url) { return this.deepLinks.accept(url); }
   async start(input) {
     this.policy.assertAvailable();
     if (this.state !== 'idle') throw Error('Guard уже работает.');
     const settings = validateSettings(input); this.settings = settings;
+    this.deepLinks.clear(); this.deepLinkReady = false;
     const epoch = ++this.epoch, active = () => this.epoch === epoch && !this.policy.blocked && this.state !== 'idle';
     this.state = 'checking'; this.verified = null; this.revalidationRevision = 0; this.status(settings.mode === 'network' ? 'Проверяем страну и закрепляем IP текущей сети / VPN…' : 'Проверяем страну и закрепляем IP через SOCKS5…');
     try {
@@ -81,6 +91,7 @@ class GuardController extends EventEmitter {
         this.verified = profile; this.emit('verified', profile);
         if (this.state !== 'rechecking') {
           this.state = 'running'; this.status('Проверено в Claude: ' + profile.timezone + ' · ' + profile.language);
+          void this.deepLinks.flush();
         }
       });
       await this.channel.listen(); if (!active()) return;
@@ -107,6 +118,7 @@ class GuardController extends EventEmitter {
       heartbeat(); this.heartbeatTimer = setInterval(heartbeat, 1000);
       await this.channel.connected(); if (!active()) return;
       await this.inspector.start(); if (!active()) return;
+      this.deepLinkReady = true; await this.deepLinks.flush(); if (!active()) return;
       this.log('Локальная копия Claude запущена: ' + settings.timezone + ' · ' + settings.language);
     } catch (error) { if (this.epoch === epoch) this.block(error.message || 'Ошибка запуска.'); }
   }
@@ -208,6 +220,7 @@ class GuardController extends EventEmitter {
         this.route = route.value; this.fingerprint = after;
         this.relay.resume();
         this.state = this.verified ? 'running' : 'starting';
+        void this.deepLinks.flush();
         this.log('Прежний внешний IP подтверждён. Соединение возобновлено.');
         this.status(this.verified ? 'Проверено в Claude: ' + this.verified.timezone + ' · ' + this.verified.language : 'IP подтверждён. Запускаем Claude и проверяем профиль страницы…');
       } else this.status(this.message);
@@ -222,6 +235,7 @@ class GuardController extends EventEmitter {
     this.checkTask = task; return task.promise;
   }
   teardown() {
+    this.deepLinkReady = false; this.deepLinks.clear();
     this.epoch++; clearInterval(this.networkTimer); clearInterval(this.heartbeatTimer); clearTimeout(this.pollTimer);
     this.inspector?.stop(); this.channel?.close(); this.relay?.close();
     // EOF makes GuardHost close its job. Force-terminating the helper also closes its job handle.
