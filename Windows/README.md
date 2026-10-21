@@ -81,3 +81,10 @@ node scripts/package.cjs --platform win32 --arch x64 --host /absolute/path/to/Gu
 ```
 
 Официальные описания: [Electron debugger](https://www.electronjs.org/docs/latest/api/debugger), [ASAR integrity для Windows](https://www.electronjs.org/docs/latest/tutorial/asar-integrity), [Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects), [Node named pipes](https://nodejs.org/api/net.html#ipc-support).
+
+
+### Block the installed Claude outside Guard
+
+On Windows, run `scripts/Block-OriginalClaude.ps1 -Mode Install` from an administrator PowerShell. This adds persistent inbound/outbound Block rules for the official `Claude_pzs8sxrjxfjjc` package family and every EXE in its currently installed WindowsApps package. All firewall profiles must remain enabled. The package-family rule is independent of the versioned install path; run Install again after updates to refresh the additional EXE rules. The private Guard runtime and Guard relay are excluded from these program paths.
+
+Use `-Mode Verify` to check effective rules, or `-Mode Remove` to remove only this script’s named and ownership-marked rules. The original Claude remains blocked when Guard is closed: launch protected sessions from Guard. This does not convert an independently launched original Claude into a proxied session or restrict arbitrary copies installed elsewhere. Windows administrators can change these rules.
