@@ -8,7 +8,9 @@ const FAILURE = 'Guard could not launch the protected Claude Code process.';
 const WORKSPACE_FAILURE = 'Откройте проект в постоянной рабочей папке Guard.';
 const PROXY_NAME = /^(?:https?|all|no)_proxy$/i;
 const TOOL_ENV = new Set(['PATH','GIT_EXEC_PATH','GIT_TEMPLATE_DIR','GIT_CONFIG_NOSYSTEM','CLAUDE_CODE_USE_POWERSHELL_TOOL','PSMODULEPATH','POWERSHELL_TELEMETRY_OPTOUT','POWERSHELL_UPDATECHECK']);
-const PRIVATE_ENV = /^(?:PROXY_GUARD_|GATE_|ELECTRON_|CLAUDE_CDP_AUTH$|NODE_OPTIONS$|SSLKEYLOGFILE$|SHELL$|CLAUDE_CODE_GIT_BASH_PATH$)/i;
+// Desktop's Sentry propagator adds this optional SDK carrier. Its hyphenated
+// name is outside the native broker's environment contract.
+const PRIVATE_ENV = /^(?:PROXY_GUARD_|GATE_|ELECTRON_|CLAUDE_CDP_AUTH$|NODE_OPTIONS$|SSLKEYLOGFILE$|SHELL$|CLAUDE_CODE_GIT_BASH_PATH$|SENTRY-TRACE$)/i;
 let installed;
 function denied() { const error = Error(FAILURE); error.code = 'ERR_GUARD_CODE_DENIED'; return error; }
 function ownObject(value) { return value && typeof value === 'object' && !Array.isArray(value) && [null, Object.prototype].includes(Object.getPrototypeOf(value)); }

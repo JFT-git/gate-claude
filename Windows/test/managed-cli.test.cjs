@@ -70,6 +70,22 @@ test('managed policy merges proxy values ephemerally and preserves all unrelated
   assert.equal(merged.env.NO_PROXY, ''); assert.equal(merged.env.no_proxy, ''); assert.equal(h.api.mergeManagedSettings(undefined).env.HTTPS_PROXY, config().relayURL);
   merged.permissions.deny.push('changed'); assert.equal(original.permissions.deny.length, 1);
 });
+test('Desktop SDK telemetry carrier does not invalidate native launch or remove OAuth credentials', () => {
+  for (const key of ['SENTRY-TRACE', 'sentry-trace', 'SeNtRy-TrAcE']) {
+    const h = harness(), env = { [key]: 'fixture-trace', ANTHROPIC_AUTH_TOKEN: 'fixture-auth', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-oauth', 'ProgramFiles(x86)': 'C:\\Program Files (x86)', TRACEPARENT: 'fixture-parent' };
+    const original = JSON.stringify(env);
+    h.api.spawnManaged(request({ env }));
+    const output = packet(h.child).data.env;
+    assert.equal(output[key], undefined);
+    assert.equal(output.ANTHROPIC_AUTH_TOKEN, 'fixture-auth'); assert.equal(output.CLAUDE_CODE_OAUTH_TOKEN, 'fixture-oauth');
+    assert.equal(output['ProgramFiles(x86)'], env['ProgramFiles(x86)']); assert.equal(output.TRACEPARENT, 'fixture-parent');
+    assert.ok(Object.keys(output).every(name => /^[A-Za-z_][A-Za-z0-9_()]{0,127}$/.test(name)));
+    const settings = h.api.mergeManagedSettings({ env });
+    assert.equal(settings.env[key], undefined); assert.equal(settings.env.CLAUDE_CODE_OAUTH_TOKEN, 'fixture-oauth');
+    assert.equal(output.HTTPS_PROXY, config().relayURL); assert.equal(settings.env.NO_PROXY, '');
+    assert.equal(JSON.stringify(env), original);
+  }
+});
 test('malformed argv/env, aborted starts, cyclic settings and oversized packets never start a broker', () => {
   const h = harness(), abort = new AbortController(); abort.abort();
   const bad = [{ args: ['\0'] }, { args: Array(257).fill('x') }, { args: ['x'.repeat(16385)] }, { cwd: '..\\outside' }, { env: { 'BAD=NAME': 'value' } }, { env: { TOKEN: 'x\0y' } }, { env: { TOKEN: 'x'.repeat(32768) } }, { signal: abort.signal }];
