@@ -1,11 +1,11 @@
-param([switch]$SkipTests)
+param([switch]$SkipTests, [string]$CodeToolsDir)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-Location $PSScriptRoot
 
 & npm.cmd ci --no-audit --no-fund
 if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
-& npm.cmd run build
+if ($CodeToolsDir) { & npm.cmd run build -- --code-tools-dir $CodeToolsDir } else { & npm.cmd run build }
 if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
 
 $product = Join-Path $PSScriptRoot 'dist\Claude Proxy Guard-win32-x64'

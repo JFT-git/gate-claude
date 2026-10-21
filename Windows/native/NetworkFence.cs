@@ -216,6 +216,7 @@ internal static class NetworkFence {
     }
     public static int Main(string[] args) {
         IntPtr engine=IntPtr.Zero,mutex=IntPtr.Zero; bool ownsMutex=false;
+        CodeFenceSession codeSession=null;
         try {
             if(IntPtr.Size!=8 || args.Length!=4 || args[0]!="--pipe" || args[2]!="--token" || !Regex.IsMatch(args[1],@"^gate-network-fence-[a-f0-9]{32}$") || !Regex.IsMatch(args[3],@"^[a-f0-9]{64}$")) return 64;
             if(!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator)) return 5;
@@ -232,7 +233,7 @@ internal static class NetworkFence {
                     try {
                         string request=ReadLine(reader); if(request==null) return 1;
                         string[] parts=request.Split('\t'); ushort port;
-                        if(parts.Length!=4 || parts[0]!="install" || !UInt16.TryParse(parts[2],out port) || port==0) throw new InvalidDataException();
+                        if((parts.Length!=4 && parts.Length!=7) || parts[0]!="install" || !UInt16.TryParse(parts[2],out port) || port==0) throw new InvalidDataException();
                         string root=Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
                         string[] supplied=Encoding.UTF8.GetString(Convert.FromBase64String(parts[3])).Split('\n');
                         List<string> files=Validate(root,supplied);
@@ -252,9 +253,18 @@ internal static class NetworkFence {
                         // all protected images before atomically replacing BLOCK.
                         Check(FwpmEngineOpen0(null,10,IntPtr.Zero,IntPtr.Zero,out engine));
                         Install(engine,files,port);
-                        writer.WriteLine("{\"type\":\"installed\",\"version\":1,\"paths\":"+files.Count+",\"filters\":"+(files.Count*6)+",\"persistent\":true,\"coverage\":\"private-runtime-executables\"}");
+                        if(parts.Length==7) {
+                            // Derive package identity and controller SID natively.
+                            var strictUtf8=new UTF8Encoding(false,true);
+                            string containerName=strictUtf8.GetString(Convert.FromBase64String(parts[4]));
+                            string codeJobName=strictUtf8.GetString(Convert.FromBase64String(parts[5]));
+                            string relayImage=strictUtf8.GetString(Convert.FromBase64String(parts[6]));
+                            codeSession=CodeFenceSession.Open(pipe,containerName,codeJobName,relayImage,port);
+                        }
+                        writer.WriteLine("{\"type\":\"installed\",\"version\":1,\"paths\":"+files.Count+",\"filters\":"+(files.Count*6)+",\"persistent\":true,\"coverage\":\"private-runtime-executables\""+(codeSession==null?"":",\"code\":"+codeSession.ProofJson())+"}");
                         string command=ReadLine(reader);
                         if(command!="remove-after-job-exit") return 0; // EOF/crash => retain filters.
+                        if(codeSession!=null)codeSession.CloseAndRetire();
                         bool removed=Remove(engine,files);
                         writer.WriteLine("{\"type\":\"removed\",\"removed\":"+(removed ? "true" : "false")+"}");
                         return removed ? 0 : 2;
@@ -268,6 +278,7 @@ internal static class NetworkFence {
             }
         } catch { return 1; }
         finally {
+            if(codeSession!=null)codeSession.Dispose();
             if(engine!=IntPtr.Zero) FwpmEngineClose0(engine);
             if(ownsMutex) ReleaseMutex(mutex);
             if(mutex!=IntPtr.Zero) CloseHandle(mutex);

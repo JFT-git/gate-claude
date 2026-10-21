@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('guard', Object.freeze({
   init: () => ipcRenderer.invoke('guard:init'),
   choose: () => ipcRenderer.invoke('guard:choose'),
+  codeWorkspace: () => ipcRenderer.invoke('guard:codeWorkspace'),
   find: () => ipcRenderer.invoke('guard:find'),
   protocolSettings: () => ipcRenderer.invoke('guard:protocolSettings'),
   protocolCheck: () => ipcRenderer.invoke('guard:protocolCheck'),

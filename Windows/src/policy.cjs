@@ -61,7 +61,7 @@ function validateSettings(input) {
   if (![2, 5, 10, 30].includes(interval)) throw Error('Неверный интервал проверки IP.');
   return { mode, host, port, username, password, timezone, language, interval,
     claudeSource: input.claudeSource === 'manual' ? 'manual' : 'auto',
-    captureBodies: input.captureBodies === true, claudePath: String(input.claudePath || '') };
+    captureBodies: input.captureBodies === true, codeEnabled: input.codeEnabled === true, claudePath: String(input.claudePath || '') };
 }
 
 module.exports = { IPPolicy, canonicalIP, networkFingerprint, validateSettings };

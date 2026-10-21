@@ -25,7 +25,7 @@ function parseArchive(buffer) {
   return { header, raw, payloadStart, entry, read, digest: hash(raw) };
 }
 
-function addBootstrap(original, boot) {
+function addBootstrap(original, boot, extraEntries = []) {
   const archive = parseArchive(original), metadata = JSON.parse(archive.read('package.json').toString('utf8'));
   const main = metadata.main;
   if (typeof main !== 'string' || !/\.(?:c?js)$/.test(main) || metadata.type === 'module') throw Error('Неподдерживаемый входной модуль Claude.');
@@ -33,19 +33,31 @@ function addBootstrap(original, boot) {
   const marker = Buffer.from('"use strict";require("./proxy-guard-boot.cjs");\n');
   if (entry.includes(marker)) throw Error('Выберите оригинальную установку Claude.');
   const changed = Buffer.concat([marker, entry]);
+  const bootName = path.posix.join(path.posix.dirname(main), 'proxy-guard-boot.cjs');
+  if (!Buffer.isBuffer(boot) || !Array.isArray(extraEntries) || extraEntries.length > 8) throw Error('Неверные дополнительные модули Guard.');
+  const usedNames = new Set([main.toLowerCase(), bootName.toLowerCase()]);
+  for (const item of extraEntries) {
+    const name = item?.name;
+    if (typeof name !== 'string' || path.posix.isAbsolute(name) || name.includes('\\') || /[\x00-\x1f]/.test(name) ||
+        name.split('/').some(part => !part || part === '.' || part === '..') || !Buffer.isBuffer(item.source) || item.source.length > 16 * 1024 * 1024 || usedNames.has(name.toLowerCase())) throw Error('Неверный путь дополнительного модуля Guard.');
+    usedNames.add(name.toLowerCase());
+  }
   let body = original.subarray(archive.payloadStart);
   function append(filename, data) {
     const blockSize = 4194304, blocks = [];
     for (let offset = 0; offset < data.length; offset += blockSize) blocks.push(hash(data.subarray(offset, offset + blockSize)));
     const components = filename.replace(/^\.\//, '').split('/'); let parent = archive.header;
     for (const component of components.slice(0, -1)) {
-      parent = parent.files?.[component]; if (!parent?.files) throw Error('Неизвестная структура ASAR.');
+      parent = parent.files?.[component]; if (!parent?.files || parent.link || parent.unpacked) throw Error('Неизвестная структура ASAR.');
     }
-    parent.files[components.at(-1)] = { size: data.length, offset: String(body.length), integrity: { algorithm: 'SHA256', hash: hash(data), blockSize, blocks } };
+    const leaf = components.at(-1), existing = parent.files[leaf];
+    if (Object.keys(parent.files).some(name => name !== leaf && name.toLowerCase() === leaf.toLowerCase()) || existing?.files || existing?.link || existing?.unpacked) throw Error('Неоднозначный модуль ASAR.');
+    parent.files[leaf] = { size: data.length, offset: String(body.length), integrity: { algorithm: 'SHA256', hash: hash(data), blockSize, blocks } };
     body = Buffer.concat([body, data]);
   }
   append(main, changed);
-  append(path.posix.join(path.posix.dirname(main), 'proxy-guard-boot.cjs'), boot);
+  append(bootName, boot);
+  for (const item of extraEntries) append(item.name, item.source);
   const raw = Buffer.from(JSON.stringify(archive.header)), padding = (4 - raw.length % 4) % 4;
   const prefix = Buffer.alloc(16); prefix.writeUInt32LE(4, 0); prefix.writeUInt32LE(8 + raw.length + padding, 4);
   prefix.writeUInt32LE(4 + raw.length + padding, 8); prefix.writeUInt32LE(raw.length, 12);
@@ -116,7 +128,9 @@ function updatePEIntegrity(source, oldDigest, newDigest) {
   return bytes;
 }
 
-function windowsBootstrap(base, networkGuard = '') {
+function windowsBootstrap(base, networkGuard = '', options = {}) {
+  if (options.codeEnabled !== undefined && typeof options.codeEnabled !== 'boolean') throw Error('Неверный режим Claude Code.');
+  if (options.codeEnabled && !networkGuard) throw Error('Claude Code requires the native network guard.');
   const original = "const reader = fs.createReadStream(null, { fd: 3, autoClose: false });\nconst writer = fs.createWriteStream(null, { fd: 4, autoClose: false });";
   if (base.split(original).length !== 2) throw Error('Неизвестная версия адаптера Guard.');
   const profileAnchor = '  ready.catch(targetFailure);';
@@ -162,7 +176,10 @@ const bridge = require('node:net').connect(cfg.channelPipe);
 const reader = bridge, writer = bridge;
 bridge.once('connect', () => emit({method:'ProxyGuard.hello',params:{token:cfg.channelToken}}));
 if (process.platform === 'win32') app.setAppUserModelId('local.proxyguard.claude.runtime');`;
-  const guard = networkGuard ? `\n{const guardModule={exports:{}};(function(require,module){\n${networkGuard}\n})(require,guardModule);guardModule.exports.installNetworkGuard(cfg);}\n` : '';
+  const managed = options.codeEnabled
+    ? "require('./proxy-guard-managed-cli.cjs').initCodeTransport(cfg.code, installedGuard.spawnCodeBroker);"
+    : "throw Error('Guard Code runtime has not been prepared.');";
+  const guard = networkGuard ? `\n{const guardModule={exports:{}};(function(require,module){\n${networkGuard}\n})(require,guardModule);const installedGuard=guardModule.exports.installNetworkGuard(cfg);if(cfg.code){${managed}}}\n` : '';
   return Buffer.from(base.replace(original, replacement + guard)
     .replace(commandAnchor, runtimeDeepLinkSource() + commandAnchor + `
   if (!m.sessionId && m.method === 'ProxyGuard.openDeepLink') {

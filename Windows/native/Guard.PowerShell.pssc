@@ -1,0 +1,5 @@
+@{
+    SessionType = 'Default'
+    LanguageMode = 'FullLanguage'
+    ScriptsToProcess = @("$PSScriptRoot\Guard.PowerShell.ps1")
+}

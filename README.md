@@ -1,8 +1,10 @@
 # gate-claude
 
-Независимый Claude Proxy Guard: **macOS 0.3.3** и **Windows x64 0.5.2**.
+Независимый Claude Proxy Guard: **macOS 0.3.3** и **Windows x64 0.6.0**.
 
 Готовые сборки: [GitHub Releases](https://github.com/JFT-git/gate-claude/releases). Исходники распространяются по MIT; Claude в комплект не входит.
+
+Windows 0.6.0 добавляет режим Claude Code: native CLI и его дочерние процессы работают в AppContainer с сетевыми ограничениями по SID. Нативный Git HTTPS и PowerShell используют Guard; рабочая папка сохраняется в `Guard\CodeState\Workspace`. Code использует Windows-инструмент PowerShell; Git Bash и прямой Git SSH в этом режиме недоступны. Поддерживаются закреплённые Claude Desktop 3.1623.0 и Code 2.1.304. Подробности и границы защиты — в [инструкции Windows](Windows/README.md).
 
 ## Windows
 
