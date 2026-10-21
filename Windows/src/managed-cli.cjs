@@ -7,8 +7,8 @@ const MAX_PACKET_BYTES = 262144;
 const FAILURE = 'Guard could not launch the protected Claude Code process.';
 const WORKSPACE_FAILURE = 'Откройте проект в постоянной рабочей папке Guard.';
 const PROXY_NAME = /^(?:https?|all|no)_proxy$/i;
-const TOOL_ENV = new Set(['PATH','SHELL','GIT_EXEC_PATH','GIT_TEMPLATE_DIR','GIT_CONFIG_NOSYSTEM','CLAUDE_CODE_GIT_BASH_PATH','PSMODULEPATH','POWERSHELL_TELEMETRY_OPTOUT','POWERSHELL_UPDATECHECK']);
-const PRIVATE_ENV = /^(?:PROXY_GUARD_|GATE_|ELECTRON_|CLAUDE_CDP_AUTH$|NODE_OPTIONS$|SSLKEYLOGFILE$)/i;
+const TOOL_ENV = new Set(['PATH','GIT_EXEC_PATH','GIT_TEMPLATE_DIR','GIT_CONFIG_NOSYSTEM','CLAUDE_CODE_USE_POWERSHELL_TOOL','PSMODULEPATH','POWERSHELL_TELEMETRY_OPTOUT','POWERSHELL_UPDATECHECK']);
+const PRIVATE_ENV = /^(?:PROXY_GUARD_|GATE_|ELECTRON_|CLAUDE_CDP_AUTH$|NODE_OPTIONS$|SSLKEYLOGFILE$|SHELL$|CLAUDE_CODE_GIT_BASH_PATH$)/i;
 let installed;
 function denied() { const error = Error(FAILURE); error.code = 'ERR_GUARD_CODE_DENIED'; return error; }
 function ownObject(value) { return value && typeof value === 'object' && !Array.isArray(value) && [null, Object.prototype].includes(Object.getPrototypeOf(value)); }
@@ -73,7 +73,7 @@ function proxyEnv(env, lowerCase = false) {
   const result = {}, names = new Map(); let characters = 1;
   for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(env))) {
     if (!('value' in descriptor) || !text(key, 256) || !key || key.includes('=') || /[\x00-\x1f]/.test(key) || !text(descriptor.value)) throw denied();
-    if (/^CLAUDE_CODE_PROXY_RESOLVES_HOSTS$/i.test(key) || PROXY_NAME.test(key) || PRIVATE_ENV.test(key) || Object.keys(installed.code.tools.environment).some(name => name.toUpperCase() === key.toUpperCase())) continue;
+    if (/^CLAUDE_CODE_(?:PROXY_RESOLVES_HOSTS|USE_POWERSHELL_TOOL)$/i.test(key) || PROXY_NAME.test(key) || PRIVATE_ENV.test(key) || Object.keys(installed.code.tools.environment).some(name => name.toUpperCase() === key.toUpperCase())) continue;
     // Windows env names are case-insensitive. Preserve one deterministic spelling.
     const previous = names.get(key.toUpperCase()); if (previous) delete result[previous];
     names.set(key.toUpperCase(), key); Object.defineProperty(result, key, { value: descriptor.value, writable: true, enumerable: true, configurable: true });
@@ -82,6 +82,7 @@ function proxyEnv(env, lowerCase = false) {
   for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) result[key] = installed.code.relayURL;
   result.NO_PROXY = '';
   result.CLAUDE_CODE_PROXY_RESOLVES_HOSTS = '1';
+  result.CLAUDE_CODE_USE_POWERSHELL_TOOL = '1';
   if (lowerCase) for (const key of ['http_proxy', 'https_proxy', 'all_proxy']) result[key] = installed.code.relayURL;
   if (lowerCase) result.no_proxy = '';
   for (const [key, value] of Object.entries(result)) characters += key.length + value.length + 2;
@@ -105,6 +106,14 @@ function mergeManagedSettings(settings) {
     if (!installed || (settings != null && !ownObject(settings))) throw denied();
     const result = settings == null ? {} : jsonCopy(settings);
     result.env = proxyEnv(result.env == null ? {} : result.env, true);
+    // Stock MSYS Git Bash cannot initialize inside this AppContainer. Use the
+    // pinned CLI's native Windows PowerShell tool without weakening the token.
+    if (result.permissions == null) result.permissions = {};
+    if (!ownObject(result.permissions)) throw denied();
+    if (result.permissions.deny == null) result.permissions.deny = [];
+    if (!Array.isArray(result.permissions.deny) || !result.permissions.deny.every(value => text(value, 16384))) throw denied();
+    if (!result.permissions.deny.includes('Bash')) result.permissions.deny.push('Bash');
+    result.defaultShell = 'powershell';
     if (Buffer.byteLength(JSON.stringify(result)) > MAX_PACKET_BYTES / 2) throw denied();
     return result;
   } catch { throw denied(); }

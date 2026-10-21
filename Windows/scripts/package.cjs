@@ -76,6 +76,10 @@ async function main() {
   for (const result of results) {
     await fs.copyFile(path.join(root, 'README.md'), path.join(result, 'README.ru.md'));
     await fs.copyFile(path.join(project, 'LICENSE'), path.join(result, 'GUARD-LICENSE.txt'));
+    if (platform === 'win32') {
+      await fs.copyFile(path.join(root, 'scripts', 'Block-OriginalClaude.ps1'), path.join(result, 'Block-OriginalClaude.ps1'));
+      await fs.copyFile(path.join(root, 'native', 'OriginalClaudeFence.cs'), path.join(result, 'OriginalClaudeFence.cs'));
+    }
     console.log(result);
   }
 }

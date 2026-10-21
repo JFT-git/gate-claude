@@ -65,7 +65,7 @@ test('sanitizes case variants of proxy bypass and private Guard environment with
 });
 test('managed policy merges proxy values ephemerally and preserves all unrelated nested organization settings', () => {
   const h = harness(), original = { permissions: { deny: ['Bash(secret)'], defaultMode: 'plan' }, sandbox: { enabled: true }, env: { https_proxy: 'http://evil', NO_PROXY: '*', ORGANIZATION: 'fixture' } }, before = JSON.stringify(original);
-  const merged = h.api.mergeManagedSettings(original); assert.equal(JSON.stringify(original), before); assert.equal(JSON.stringify(merged.permissions), JSON.stringify(original.permissions)); assert.equal(merged.sandbox.enabled, true); assert.equal(merged.env.ORGANIZATION, 'fixture');
+  const merged = h.api.mergeManagedSettings(original); assert.equal(JSON.stringify(original), before); assert.deepEqual(merged.permissions, { deny: ['Bash(secret)', 'Bash'], defaultMode: 'plan' }); assert.equal(merged.defaultShell, 'powershell'); assert.equal(merged.sandbox.enabled, true); assert.equal(merged.env.ORGANIZATION, 'fixture');
   for (const name of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) assert.equal(merged.env[name], config().relayURL);
   assert.equal(merged.env.NO_PROXY, ''); assert.equal(merged.env.no_proxy, ''); assert.equal(h.api.mergeManagedSettings(undefined).env.HTTPS_PROXY, config().relayURL);
   merged.permissions.deny.push('changed'); assert.equal(original.permissions.deny.length, 1);
@@ -115,7 +115,7 @@ test('global managed job and workspace are immutable and all packets use the nat
 
 test('verified tool selection overrides vendor and managed settings case variants and remains immutable', () => {
   const h = load(), cfg = config(), child = childFixture();
-  cfg.tools = { environment: { PATH: 'C:\\Guard\\CodeTools\\Git\\cmd;C:\\Guard\\CodeTools\\PowerShell', CLAUDE_CODE_GIT_BASH_PATH: 'C:\\Guard\\CodeTools\\Git\\bin\\bash.exe', POWERSHELL_UPDATECHECK: 'Off' } };
+  cfg.tools = { environment: { PATH: 'C:\\Guard\\CodeTools\\Git\\cmd;C:\\Guard\\CodeTools\\PowerShell', CLAUDE_CODE_USE_POWERSHELL_TOOL: '1', POWERSHELL_UPDATECHECK: 'Off' } };
   const wanted = cfg.tools.environment.PATH;
   h.api.initCodeTransport(cfg, () => child);
   cfg.tools.environment.PATH = 'C:\\Untrusted';
@@ -178,4 +178,20 @@ test('all native and managed configuration paths force hostname resolution throu
   assert.equal(env.CLAUDE_CODE_PROXY_RESOLVES_HOSTS, '1'); assert.equal(env.claude_code_proxy_resolves_hosts, undefined);
   const settings = h.api.mergeManagedSettings({ env: { CLAUDE_CODE_PROXY_RESOLVES_HOSTS: '0' } });
   assert.equal(settings.env.CLAUDE_CODE_PROXY_RESOLVES_HOSTS, '1');
+});
+
+
+test('Windows PowerShell mode is immutable and unsupported Bash cannot be re-enabled by managed settings', () => {
+  const h = harness();
+  h.api.spawnManaged(request({env: {claude_code_use_powershell_tool: '0', SHELL: 'C:\\untrusted\\bash.exe', CLAUDE_CODE_GIT_BASH_PATH: 'C:\\untrusted\\bash.exe'}}));
+  const env = packet(h.child).data.env;
+  assert.equal(env.CLAUDE_CODE_USE_POWERSHELL_TOOL, '1');
+  assert.equal(env.claude_code_use_powershell_tool, undefined); assert.equal(env.SHELL, undefined); assert.equal(env.CLAUDE_CODE_GIT_BASH_PATH, undefined);
+  const original = {defaultShell: 'bash', permissions: {allow: ['Read'], deny: ['WebFetch']}, env: {CLAUDE_CODE_USE_POWERSHELL_TOOL: '0'}};
+  const merged = h.api.mergeManagedSettings(original);
+  assert.deepEqual(merged.permissions, {allow: ['Read'], deny: ['WebFetch', 'Bash']});
+  assert.equal(merged.defaultShell, 'powershell'); assert.equal(merged.env.CLAUDE_CODE_USE_POWERSHELL_TOOL, '1');
+  assert.deepEqual(h.api.mergeManagedSettings(merged).permissions.deny, ['WebFetch', 'Bash']);
+  assert.deepEqual(original.permissions.deny, ['WebFetch']);
+  for (const permissions of [true, [], 'Bash', {deny:'Bash'}, {deny:[{}]}]) rejects(() => h.api.mergeManagedSettings({permissions}));
 });

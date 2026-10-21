@@ -7,10 +7,11 @@ const { LIMITS, sha256, manifestSHA256, validateFiles, parsePortableZip, inflate
 // Release preparation repacks the verified, already extracted official trees.
 // Tree hashes cover canonical path/size/SHA256 records: the official Git SFX
 // after its own post-install, excluding five generated machine files, and the
-// official PowerShell ZIP with one byte-identical powershell.exe alias.
+// official PowerShell ZIP with its apphost preserved as GuardPwsh.exe and the
+// separately pinned Guard launcher, configuration and session prelude.
 const SOURCE_POLICY = Object.freeze({
   git: Object.freeze({ id: 'git', version: '2.56.0.windows.2', archiveName: 'GateCodeTools-Git-2.56.0.zip', sourceName: 'PortableGit-2.56.0.2-64-bit.7z.exe', sourceSize: 60027568, sourceSHA256: '075e158ef8e1f0ab80b347e245405d3eca735c2dc88fd8e032e137d0ca61f61b', treeSHA256: '3c7a6d240b765b765a41c34c5bb58bd0904aced00bb5e5966674a7fd1378a504', anchors: Object.freeze({ 'cmd/git.exe': '54bda91c773c6bba2b970424423cfcb80552d92dc6967d766f98931fe1251a54', 'bin/bash.exe': '6cc575e9112efe6253b6a6999c12aa0240cb3f511aeda3480ae026edc0dc5280', 'usr/bin/bash.exe': '5490d0da5e7cf9d92068cc48fcc590f2bcf8564add8ff91c3b5fe541eb2d72e3' }) }),
-  powershell: Object.freeze({ id: 'powershell', version: '7.6.7', archiveName: 'GateCodeTools-PowerShell-7.6.7.zip', sourceName: 'PowerShell-7.6.7-win-x64.zip', sourceSize: 106364316, sourceSHA256: 'd2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7', treeSHA256: '4c58e89bfb72e99280b5077193eff0c9828729aa4818ce3ecab5d8332b61b41a', anchors: Object.freeze({ 'pwsh.exe': 'fa2c8bb1e35cdd62ad15cd06a1d8f2c5961e9725a9bfa1e7cfd2c322f49e9619', 'powershell.exe': 'fa2c8bb1e35cdd62ad15cd06a1d8f2c5961e9725a9bfa1e7cfd2c322f49e9619' }) })
+  powershell: Object.freeze({ id: 'powershell', version: '7.6.7', archiveName: 'GateCodeTools-PowerShell-7.6.7.zip', sourceName: 'PowerShell-7.6.7-win-x64.zip', sourceSize: 106364316, sourceSHA256: 'd2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7', sourceTreeSHA256: '4c58e89bfb72e99280b5077193eff0c9828729aa4818ce3ecab5d8332b61b41a', bootstrapSHA256: 'bb28c9361cb153f21caa06b3c423076308d7900c4256c45c8a508d740cd3f1f4', treeSHA256: 'e89cb434541a1e322e92781a10f4373805d221f56360bff1908cddf0cb230b11', anchors: Object.freeze({ 'Guard.PowerShell.ps1': 'c74113ce8f57ddeff9934ca5b128aba18f9f8ff96b56291f0ce5a6defdf9108b', 'Guard.PowerShell.pssc': 'de9cb67beb914e77629f88d6a03fead4747a8cb305d0e19a826e526d0c4490f6', 'GuardPwsh.exe': 'fa2c8bb1e35cdd62ad15cd06a1d8f2c5961e9725a9bfa1e7cfd2c322f49e9619', 'powershell.exe': 'eba66fbca8327dfaccd43d17f570c7d604424c81a8ecd6395e6627dd2f77d9b4', 'pwsh.exe': 'eba66fbca8327dfaccd43d17f570c7d604424c81a8ecd6395e6627dd2f77d9b4' }) })
 });
 const MAX_POLICY_BYTES = 8 * 1024 * 1024;
 const fail = () => Error('Не удалось безопасно подготовить Git и PowerShell. Проверьте комплект переносимых инструментов Guard.');
@@ -136,11 +137,13 @@ async function prepareCodeTools(guardRoot, resources, archives, testdeps = {}) {
       toolRoots.push(target);
     }
     const [gitRoot, powerShellRoot] = toolRoots, pathEntries = Object.freeze([path.join(gitRoot, 'cmd'), path.join(gitRoot, 'usr', 'bin'), powerShellRoot, ...systemPaths]);
+    // MSYS Bash cannot initialize in the zero-capability AppContainer. Select
+    // the CLI's supported PowerShell tool while keeping native Git available.
     return { toolRoots: Object.freeze(toolRoots), gitRoot, powerShellRoot, policySHA256: sha256(policyBytes),
       gitExecutable: path.join(gitRoot, 'cmd', 'git.exe'), bashExecutable: path.join(gitRoot, 'bin', 'bash.exe'), powerShellExecutable: path.join(powerShellRoot, 'powershell.exe'),
       pathEntries,
-      environment: Object.freeze({ PATH: pathEntries.join(';'), SHELL: path.join(gitRoot, 'bin', 'bash.exe'), GIT_EXEC_PATH: path.join(gitRoot, 'ucrt64', 'libexec', 'git-core'), GIT_TEMPLATE_DIR: path.join(gitRoot, 'ucrt64', 'share', 'git-core', 'templates'), GIT_CONFIG_NOSYSTEM: '1',
-        CLAUDE_CODE_GIT_BASH_PATH: path.join(gitRoot, 'bin', 'bash.exe'), PSModulePath: path.join(powerShellRoot, 'Modules'), POWERSHELL_TELEMETRY_OPTOUT: '1', POWERSHELL_UPDATECHECK: 'Off' }) };
+      environment: Object.freeze({ PATH: pathEntries.join(';'), GIT_EXEC_PATH: path.join(gitRoot, 'ucrt64', 'libexec', 'git-core'), GIT_TEMPLATE_DIR: path.join(gitRoot, 'ucrt64', 'share', 'git-core', 'templates'), GIT_CONFIG_NOSYSTEM: '1',
+        CLAUDE_CODE_USE_POWERSHELL_TOOL: '1', PSModulePath: path.join(powerShellRoot, 'Modules'), POWERSHELL_TELEMETRY_OPTOUT: '1', POWERSHELL_UPDATECHECK: 'Off' }) };
   } catch {
     if (staging) { try { await safe.fs.rm(staging, { recursive: true, force: true }); } catch {} }
     throw fail();
