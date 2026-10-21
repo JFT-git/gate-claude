@@ -39,8 +39,8 @@ test('traffic masks headers, nested JSON, SSE bearer tokens and URL credentials'
   assert.equal(S.body('data: {"refresh_token":"secret-e"}\nBearer secret-f').includes('secret-'), false);
   assert.equal(S.safeURL('https://user:pass@example.test/path?token=secret#private'), 'https://example.test/path');
   assert.equal(S.body('x'.repeat(100000)).length < 33000, true);
-  assert.equal(S.audit({}, '{"timezone":"Europe/Moscow"}').length, 1);
-  assert.equal(S.audit({}, '{"message":"Moscow"}').length, 0);
+  assert.equal(S.auditRequestHeaders({ 'Accept-Language': 'ru-RU' }, 'en-US').length, 1);
+  assert.deepEqual(S.auditRequestHeaders({ 'Accept-Language': 'en-US' }, 'en-US'), []);
 });
 
 async function mockSOCKS(t, auth = true) {

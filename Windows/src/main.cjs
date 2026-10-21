@@ -7,12 +7,20 @@ const { discoverClaude } = require('./discovery.cjs');
 const { prepareRuntime } = require('./runtime.cjs');
 const { validateSettings } = require('./policy.cjs');
 const { diagnostic } = require('./sanitize.cjs');
+const { takeDeepLinkFromArgv, registerGuardProtocol, LINK_REFUSED } = require('./deep-link.cjs');
 
 app.setName('Claude Proxy Guard');
 app.setAppUserModelId?.('local.proxyguard.gate-claude');
 if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
-  let window, controller;
+  let window, controller, earlyLinkRefused = false;
+  const receiveDeepLink = argv => {
+    const link = takeDeepLinkFromArgv(argv);
+    if (!link.hadLink) return;
+    if (!controller) { earlyLinkRefused = true; return; }
+    void controller.deliverDeepLink(link.url);
+  };
+  receiveDeepLink(process.argv);
   const traffic = new Map();
   const root = path.join(app.getPath('userData'), 'Guard');
   const resources = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '..', 'resources');
@@ -33,6 +41,9 @@ else {
   }
   app.whenReady().then(async () => {
     controller = new GuardController(root, resources);
+    const protocol = registerGuardProtocol(app, { smokeTest: process.argv.includes('--smoke-test') });
+    if (!protocol.skipped && !protocol.registered) controller.log('Не удалось назначить Guard обработчиком ссылок входа Claude.', 'warning');
+    if (earlyLinkRefused) { earlyLinkRefused = false; controller.log(LINK_REFUSED, 'warning'); }
     controller.on('state', value => send('state', value));
     controller.on('log', value => send('log', value));
     controller.on('record', value => {
@@ -117,7 +128,7 @@ else {
   }).catch(error => {
     dialog.showErrorBox('Claude Proxy Guard', safeError(error)); app.exit(1);
   });
-  app.on('second-instance', () => { if (window) { if (window.isMinimized()) window.restore(); window.show(); window.focus(); } });
+  app.on('second-instance', (_event, argv) => { receiveDeepLink(argv); if (window) { if (window.isMinimized()) window.restore(); window.show(); window.focus(); } });
   app.on('before-quit', () => controller?.stop());
   app.on('window-all-closed', () => app.quit());
   const powerBlock = () => { if (controller && !['idle', 'blocked'].includes(controller.state)) controller.revalidate('Сон или пробуждение компьютера. Проверяем прежний IP.'); };

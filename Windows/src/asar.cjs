@@ -1,6 +1,7 @@
 'use strict';
 const crypto = require('node:crypto');
 const path = require('node:path');
+const { runtimeDeepLinkSource } = require('./deep-link.cjs');
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 
 function parseArchive(buffer) {
@@ -119,6 +120,8 @@ function windowsBootstrap(base, networkGuard = '') {
   const original = "const reader = fs.createReadStream(null, { fd: 3, autoClose: false });\nconst writer = fs.createWriteStream(null, { fd: 4, autoClose: false });";
   if (base.split(original).length !== 2) throw Error('Неизвестная версия адаптера Guard.');
   const profileAnchor = '  ready.catch(targetFailure);';
+  const commandAnchor = 'async function command(m) {\n  let result;';
+  if (base.split(commandAnchor).length !== 2) throw Error('Неизвестная версия канала Guard.');
   const navigationAnchor = 'wc[name] = (...args) => ready.then';
   if (base.split(profileAnchor).length !== 2 || base.split(navigationAnchor).length !== 2) throw Error('Неизвестная версия защиты профиля Guard.');
   const replacement = `app.setPath('sessionData', cfg.userData);
@@ -161,6 +164,11 @@ bridge.once('connect', () => emit({method:'ProxyGuard.hello',params:{token:cfg.c
 if (process.platform === 'win32') app.setAppUserModelId('local.proxyguard.claude.runtime');`;
   const guard = networkGuard ? `\n{const guardModule={exports:{}};(function(require,module){\n${networkGuard}\n})(require,guardModule);guardModule.exports.installNetworkGuard(cfg);}\n` : '';
   return Buffer.from(base.replace(original, replacement + guard)
+    .replace(commandAnchor, runtimeDeepLinkSource() + commandAnchor + `
+  if (!m.sessionId && m.method === 'ProxyGuard.openDeepLink') {
+    const response = await guardForwardDeepLink(m.params?.url, { app, profileReady: guardProfileReady, userData: cfg.userData, executable: process.execPath, cwd: path.dirname(process.execPath) });
+    emit({ id: m.id, result: response }); return;
+  }`)
     .replace(profileAnchor, '  const durableReady = ready.then(() => guardProfileReady);\n  durableReady.catch(targetFailure);')
     .replace(navigationAnchor, 'wc[name] = (...args) => durableReady.then'));
 }
