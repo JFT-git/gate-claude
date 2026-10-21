@@ -54,6 +54,14 @@ test('fence validates port and encodes paths without shell or protocol injection
   assert.equal(Buffer.from(fields[3], 'base64').toString(), file);
 });
 
+test('Code fence install binds its profile, shared job and relay image without changing the legacy request', () => {
+  const code = { containerName: 'gate-code-' + 'a'.repeat(24), codeJobName: 'Global\\gate-code-job-' + 'b'.repeat(32), relayExecutable: path.resolve('Guard.exe') };
+  const values = installRequest('root', ['file.exe'], 2345, code).trimEnd().split('\t');
+  assert.equal(values.length, 7);
+  assert.deepEqual(values.slice(4).map(value => Buffer.from(value, 'base64').toString()), [code.containerName, code.codeJobName, code.relayExecutable]);
+  for (const changed of [{ containerName: 'foreign' }, { codeJobName: 'Local\\foreign' }, { relayExecutable: 'relative.exe' }, { relayExecutable: code.relayExecutable + '\n' }]) assert.throws(() => installRequest('root', ['file.exe'], 2345, { ...code, ...changed }));
+});
+
 test('fence rejects executable hard-link aliases', async t => {
   const item = await fixture(t); await fs.writeFile(item.executable, Buffer.alloc(32));
   await fs.link(item.executable, path.join(item.parent, 'alias.exe'));

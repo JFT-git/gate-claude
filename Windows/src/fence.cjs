@@ -44,10 +44,15 @@ async function collectExecutables(runtime) {
   return { root, files };
 }
 
-function installRequest(root, files, relayPort) {
+function installRequest(root, files, relayPort, code) {
   if (!Number.isInteger(relayPort) || relayPort < 1 || relayPort > 65535) throw Error('Неверный порт защищённого шлюза.');
   if (!files.length || files.length > MAX_EXECUTABLES || [root, ...files].some(value => /[\0\r\n\t]/.test(value))) throw Error('Неверный список исполняемых файлов.');
-  return ['install', Buffer.from(root).toString('base64'), String(relayPort), Buffer.from(files.join('\n')).toString('base64')].join('\t') + '\n';
+  const fields = ['install', Buffer.from(root).toString('base64'), String(relayPort), Buffer.from(files.join('\n')).toString('base64')];
+  if (code) {
+    if (!/^gate-code-[a-f0-9]{24}$/.test(code.containerName || '') || !/^Global\\gate-code-job-[a-f0-9]{32}$/.test(code.codeJobName || '') || !path.isAbsolute(code.relayExecutable || '') || /[\0\r\n\t]/.test(code.relayExecutable)) throw Error('Неверная конфигурация изоляции Claude Code.');
+    fields.push(...[code.containerName, code.codeJobName, code.relayExecutable].map(value => Buffer.from(value).toString('base64')));
+  }
+  return fields.join('\t') + '\n';
 }
 
 function safeError(message) {
@@ -61,7 +66,7 @@ class NetworkFence extends EventEmitter {
   static async prepare(runtime, relayPort, options = {}) {
     if (process.platform !== 'win32') throw Error('Сетевая защита WFP доступна только в Windows.');
     const inventory = await collectExecutables(runtime);
-    const request = installRequest(inventory.root, inventory.files, relayPort);
+    const request = installRequest(inventory.root, inventory.files, relayPort, options.code);
     const helper = options.helperPath || path.join(process.resourcesPath || path.resolve(__dirname, '..'), 'NetworkFence.exe');
     await fs.access(helper);
     const instance = new NetworkFence();
@@ -94,6 +99,8 @@ class NetworkFence extends EventEmitter {
             }
             if (message.type === 'installed') {
               if (message.version !== 1 || message.coverage !== COVERAGE || message.paths !== inventory.files.length || message.filters !== inventory.files.length * 6 || message.persistent !== true) { finish(safeError()); socket.destroy(); return; }
+              if (options.code && (!message.code || message.code.sid !== options.code.containerSid || message.code.jobName !== options.code.codeJobName || message.code.filters !== 10)) { finish(safeError()); socket.destroy(); return; }
+              instance.codeProof = options.code ? Object.freeze({ ...message.code }) : null;
               instance.installed = true;
               instance.proof = { coverage: COVERAGE, paths: message.paths, filters: message.filters, persistent: true };
               finish(null, instance);

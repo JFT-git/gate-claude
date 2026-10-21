@@ -9,7 +9,9 @@ function installNetworkGuard(cfg) {
       parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
     throw Error('Guard requires one explicit loopback HTTP relay.');
   }
+  const codeFingerprint = JSON.stringify(cfg.code || null);
   if (installed) {
+    if (installed.codeFingerprint !== codeFingerprint) throw Error('Guard Code configuration is immutable.');
     if (installed.proxyURL !== cfg.proxyURL || installed.channelPipe !== (cfg.channelPipe || null)) throw Error('Guard network configuration is immutable.');
     return installed;
   }
@@ -57,8 +59,21 @@ function installNetworkGuard(cfg) {
   const dnsMethods = object => Object.getOwnPropertyNames(object || {}).filter(name => /^(?:lookup|resolve|reverse)/.test(name));
   for (const object of [dns, dns.promises, dns.Resolver?.prototype, dns.promises?.Resolver?.prototype]) block(object, dnsMethods(object), 'dns');
   block(http, ['request', 'get'], 'http'); block(https, ['request', 'get'], 'https'); block(http2, ['connect'], 'http2');
+  const nativeSpawn = child.spawn, nativePrototypeSpawn = child.ChildProcess.prototype.spawn;
+  const codeHost = cfg.code?.hostPath;
+  if (codeHost && (!/^[A-Za-z]:\\/.test(codeHost) || /[\x00-\x1f]/.test(codeHost) || require('node:path').win32.basename(codeHost) !== 'CodeHost.exe')) throw Error('Guard requires its fixed CodeHost.');
+  let codeSpawnDepth = 0;
+  hook(child.ChildProcess.prototype, 'spawn', function (options) {
+    if (!codeSpawnDepth || !codeHost || options?.file !== codeHost || !Array.isArray(options.args) || options.args.length !== 2 || options.args[0] !== codeHost || options.args[1] !== '--managed') throw denied('ChildProcess.spawn');
+    return nativePrototypeSpawn.call(this, options);
+  });
+  const spawnCodeBroker = function (executable, args, options) {
+    if (!codeHost || executable !== codeHost || !Array.isArray(args) || args.length !== 1 || args[0] !== '--managed' || !options || options.shell || options.detached || options.argv0 || options.stdio?.join(',') !== 'pipe,pipe,pipe') throw denied('CodeHost.spawn');
+    codeSpawnDepth++;
+    try { return nativeSpawn(executable, args, options); }
+    finally { codeSpawnDepth--; }
+  };
   block(child, ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork'], 'child_process');
-  block(child.ChildProcess?.prototype, ['spawn'], 'ChildProcess');
   block(workers, ['Worker'], 'worker_threads');
   for (const name of ['node:inspector', 'node:inspector/promises']) {
     try { block(require(name), ['open'], 'inspector'); }
@@ -134,7 +149,7 @@ function installNetworkGuard(cfg) {
     return binding.call(this, name);
   });
   block(process, ['dlopen'], 'process');
-  installed = Object.freeze({ installed: true, proxyURL: cfg.proxyURL, channelPipe: cfg.channelPipe || null });
+  installed = Object.freeze({ installed: true, proxyURL: cfg.proxyURL, channelPipe: cfg.channelPipe || null, codeFingerprint, spawnCodeBroker });
   return installed;
 }
 module.exports = { installNetworkGuard };

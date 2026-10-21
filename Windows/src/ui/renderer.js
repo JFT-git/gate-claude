@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const fields = ['mode', 'claudeSource', 'claudePath', 'host', 'port', 'username', 'password', 'timezone', 'language', 'interval', 'captureBodies'];
+const fields = ['mode', 'claudeSource', 'claudePath', 'host', 'port', 'username', 'password', 'timezone', 'language', 'interval', 'captureBodies', 'codeEnabled'];
 const records = new Map(); let selected = '', state, finding = false, discoveryGeneration = 0;
 const node = (tag, text, cls) => { const result = document.createElement(tag); result.textContent = text; if (cls) result.className = cls; return result; };
 function connectionMode() {
@@ -113,3 +113,5 @@ window.guard.init().then(data => {
   if ($('claudeSource').value === 'auto') findClaude();
   else { $('claudeStatus').textContent = 'Путь выбран вручную'; document.body.dataset.discoveryDone = 'true'; connectionMode(); }
 }).catch(() => { $('message').textContent = 'Не удалось открыть Guard. Перезапустите приложение.'; });
+
+$('codeWorkspace').addEventListener('click', async () => { try { error(await window.guard.codeWorkspace()); } catch { $('message').textContent = 'Не удалось открыть рабочую папку Code.'; } });

@@ -67,6 +67,17 @@ else {
       return finding;
     };
     handle('find', findClaude);
+    handle('codeWorkspace', async () => {
+      const workspace = path.join(root, 'CodeState', 'Workspace');
+      for (const directory of [root, path.join(root, 'CodeState'), workspace]) {
+        try { fs.mkdirSync(directory, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+        const info = fs.lstatSync(directory);
+        if (!info.isDirectory() || info.isSymbolicLink() || fs.realpathSync(directory).toLowerCase() !== path.resolve(directory).toLowerCase()) throw Error('Рабочая папка Code не прошла проверку пути.');
+      }
+      const message = await shell.openPath(workspace);
+      if (message) throw Error('Не удалось открыть рабочую папку Code.');
+      return { opened: true };
+    });
     handle('protocolCheck', checkProtocol);
     handle('protocolSettings', async () => {
       // This action accepts no URL or path from the renderer.

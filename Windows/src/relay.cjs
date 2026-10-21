@@ -81,6 +81,83 @@ function authority(text) {
   return { host, port };
 }
 
+// Parse one request before opening its selected upstream. Ordinary HTTP is one
+// framed request per TCP connection; pipelining and upgrades cannot become an
+// unparsed second request or carry proxy credentials through this adapter.
+function proxyRequest(headers) {
+  if (/[^\x09\x0a\x0d\x20-\x7e]/.test(headers) || !headers.endsWith('\r\n\r\n')) throw Error('Неверные заголовки прокси.');
+  const lines = headers.slice(0, -4).split('\r\n'), requestLine = lines.shift();
+  const fields = lines.map(line => {
+    const match = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([\x09\x20-\x7e]*)$/.exec(line);
+    if (!match) throw Error('Неверные заголовки прокси.');
+    return { name: match[1].toLowerCase(), value: match[2].trim() };
+  });
+  const connect = /^CONNECT ([^\s]+) HTTP\/1\.[01]$/.exec(requestLine);
+  if (connect) return { kind: 'connect', ...authority(connect[1]), fields };
+  const request = /^([A-Z]{1,32}) ([^\s]+) HTTP\/1\.([01])$/.exec(requestLine);
+  if (!request) throw Error('Неверный запрос HTTP-прокси.');
+  const [, method, target, minor] = request;
+  if (/[^\x21-\x7e]|[\\#]/.test(target) || /%(?![0-9a-f]{2})|%(?:0[0-9a-f]|1[0-9a-f]|7f)/i.test(target)) throw Error('Неверный HTTP URI.');
+  const uri = /^http:\/\/(\[[0-9a-fA-F:]+\]|[a-zA-Z0-9._-]+)(?::([1-9]\d{0,4}))?([/?][^#]*)?$/i.exec(target);
+  if (!uri) throw Error('HTTP-прокси требует абсолютный http URI без авторизации.');
+  const host = (uri[1].startsWith('[') ? uri[1].slice(1, -1) : uri[1]).toLowerCase(), port = uri[2] ? Number(uri[2]) : 80;
+  if (port > 65535 || (uri[1].startsWith('[') && !net.isIPv6(host))) throw Error('Неверное назначение HTTP.');
+  const hostHeader = (net.isIPv6(host) ? '[' + host + ']' : host) + (port === 80 ? '' : ':' + port);
+  const hostFields = fields.filter(field => field.name === 'host');
+  if (hostFields.length > 1 || (hostFields.length === 1 && hostFields[0].value.toLowerCase() !== hostHeader && hostFields[0].value.toLowerCase() !== hostHeader + (port === 80 ? ':80' : ''))) throw Error('Неоднозначный Host.');
+  const lengths = fields.filter(field => field.name === 'content-length'), encodings = fields.filter(field => field.name === 'transfer-encoding');
+  if (lengths.length > 1 || encodings.length > 1 || (lengths.length && encodings.length) || fields.some(field => field.name === 'trailer')) throw Error('Неоднозначная длина HTTP.');
+  if (lengths.length && !/^(?:0|[1-9]\d{0,18})$/.test(lengths[0].value)) throw Error('Неверная длина HTTP.');
+  if (encodings.length && (minor !== '1' || encodings[0].value.toLowerCase() !== 'chunked')) throw Error('Неподдерживаемое кодирование HTTP.');
+  const connectionNames = new Set();
+  for (const field of fields.filter(field => field.name === 'connection')) {
+    for (const value of field.value.split(',')) {
+      const token = value.trim().toLowerCase(); if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(token)) throw Error('Неверный Connection.');
+      if (['host', 'content-length', 'transfer-encoding'].includes(token)) throw Error('Неоднозначное оформление HTTP.');
+      connectionNames.add(token);
+    }
+  }
+  const stripped = new Set(['host', 'proxy-authorization', 'proxy-authenticate', 'proxy-connection', 'connection', 'keep-alive', 'te', 'trailer', 'transfer-encoding', 'upgrade', ...connectionNames]);
+  const path = uri[3] ? (uri[3].startsWith('?') ? '/' + uri[3] : uri[3]) : '/';
+  const outgoing = [method + ' ' + path + ' HTTP/1.' + minor, 'Host: ' + hostHeader];
+  for (const field of fields) if (!stripped.has(field.name)) outgoing.push(field.name + ': ' + field.value);
+  // Transfer coding is reconstructed only after a strict single-coding check.
+  if (encodings.length) outgoing.push('Transfer-Encoding: chunked');
+  outgoing.push('Connection: close', '', '');
+  return { kind: 'http', host, port, fields, header: Buffer.from(outgoing.join('\r\n'), 'latin1'), body: requestBody(encodings.length ? null : BigInt(lengths[0]?.value || '0')) };
+}
+function requestBody(length) {
+  let state = length === null ? 'size' : 'fixed', remaining = length, line = '';
+  const body = { complete: length === 0n, consume(bytes) {
+    let offset = 0;
+    while (offset < bytes.length) {
+      if (body.complete) throw Error('HTTP pipelining запрещён.');
+      if (state === 'fixed' || state === 'data') {
+        const count = remaining > BigInt(bytes.length - offset) ? bytes.length - offset : Number(remaining);
+        remaining -= BigInt(count); offset += count;
+        if (remaining === 0n) { if (state === 'fixed') body.complete = true; else { state = 'data-crlf'; line = ''; } }
+        continue;
+      }
+      line += String.fromCharCode(bytes[offset++]);
+      if (line.length > 128) throw Error('Неверная граница HTTP.');
+      if (state === 'size') {
+        if (!line.endsWith('\r\n')) { if (line.endsWith('\n') || (line.includes('\r') && !line.endsWith('\r'))) throw Error('Неверная граница HTTP.'); continue; }
+        if (!/^[0-9a-fA-F]{1,16}\r\n$/.test(line)) throw Error('Неверная граница HTTP.');
+        remaining = BigInt('0x' + line.slice(0, -2)); line = ''; state = remaining === 0n ? 'last-crlf' : 'data';
+      } else {
+        if (line.length === 1 && line !== '\r') throw Error('HTTP trailers запрещены.');
+        if (line.length === 2) {
+          if (line !== '\r\n') throw Error('Неверная граница HTTP.');
+          if (state === 'last-crlf') body.complete = true; else state = 'size';
+          line = '';
+        }
+      }
+    }
+    return body.complete;
+  } };
+  return body;
+}
+
 async function connectCurrentNetwork(host, port, onSocket = () => {}) {
   const socket = net.createConnection({ host, port }); onSocket(socket);
   socket.setTimeout(8000, () => socket.destroy(Error('Тайм-аут подключения через текущую сеть.')));
@@ -103,7 +180,7 @@ class SOCKSRelay extends EventEmitter {
     this.checkToken = randomBytes(32).toString('hex'); this.unlocked = false; this.closed = false;
   }
   async start() {
-    this.server = net.createServer(socket => this.accept(socket));
+    this.server = net.createServer({ allowHalfOpen: true }, socket => this.accept(socket));
     this.server.maxConnections = 128;
     this.server.on('error', () => { if (!this.closed) this.emit('fatal', 'Локальный шлюз остановился.'); });
     this.server.listen({ host: '127.0.0.1', port: 0 });
@@ -125,28 +202,33 @@ class SOCKSRelay extends EventEmitter {
       if (end < 0) { if (bytes.length > 16384) client.destroy(); return; }
       if (end > 16384) { client.destroy(); return; }
       processing = true; client.off('data', onData);
-      let upstream, pending, head = bytes.subarray(end + 4);
+      let upstream, pending, request, head = bytes.subarray(end + 4);
       const cancel = () => { pending?.destroy(); client.destroy(); };
-      const collect = data => { head = Buffer.concat([head, data]); if (head.length > 65536) cancel(); };
+      const collect = data => {
+        try {
+          if (request?.kind === 'http') request.body.consume(data);
+          head = Buffer.concat([head, data]); if (head.length > 65536) cancel();
+        } catch { cancel(); }
+      };
       // Keep reading FIN while DNS/SOCKS is pending. Pausing here hides cancellation
       // and can otherwise create an upstream connection after the client has gone.
       client.on('data', collect).once('end', cancel).once('close', cancel).once('error', cancel);
       const release = () => { client.off('data', collect).off('end', cancel).off('close', cancel).off('error', cancel); };
       try {
-        const headers = bytes.subarray(0, end + 4).toString('latin1');
-        if (/[^\x09\x0a\x0d\x20-\x7e]/.test(headers)) throw Error('Неверные заголовки CONNECT.');
-        const match = /^CONNECT ([^\s]+) HTTP\/1\.[01]\r\n/.exec(headers);
-        if (!match) throw Error('Поддерживается только HTTPS CONNECT.');
-        const { host, port } = authority(match[1]);
-        const credentials = [...headers.matchAll(/^Proxy-Authorization:[ \t]*Bearer ([a-f0-9]{64})[ \t]*\r?$/gmi)];
-        const control = credentials.length === 1 && timingSafeEqual(Buffer.from(credentials[0][1]), Buffer.from(this.checkToken)) &&
+        if (head.length > 65536) throw Error('Слишком большой буфер запроса.');
+        request = proxyRequest(bytes.subarray(0, end + 4).toString('latin1'));
+        const { host, port } = request;
+        if (request.kind === 'http') request.body.consume(head);
+        const credentials = request.fields.filter(field => field.name === 'proxy-authorization');
+        const token = credentials.length === 1 && /^Bearer ([a-f0-9]{64})$/i.exec(credentials[0].value);
+        const control = request.kind === 'connect' && token && timingSafeEqual(Buffer.from(token[1]), Buffer.from(this.checkToken)) &&
           port === 443 && ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org'].includes(host);
         if (control) this.controlSockets.add(client);
         const allowed = () => !this.closed && !client.destroyed && (this.unlocked || control);
         if (!allowed()) {
           client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return;
         }
-        const opened = socket => { pending = this.track(socket, control); if (!allowed()) socket.destroy(); };
+        const opened = socket => { pending = this.track(socket, Boolean(control)); if (!allowed()) socket.destroy(); };
         try { upstream = this.mode === 'network' ? await connectCurrentNetwork(host, port, opened) : await connectSOCKS(this.proxy, host, port, opened); }
         catch (error) {
           if (allowed() && !error.targetRefused) {
@@ -156,15 +238,37 @@ class SOCKSRelay extends EventEmitter {
           throw error;
         }
         if (!allowed()) { upstream.destroy(); return; }
-        client.pause(); release();
-        client.setTimeout(0);
-        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head.length) upstream.write(head);
+        client.pause(); release(); client.setTimeout(0);
         // A single established TCP reset retires this tunnel, not the whole session.
         const close = () => { client.destroy(); upstream.destroy(); };
-        client.once('close', close); upstream.once('close', close);
+        client.once('close', close);
+        upstream.once('close', () => {
+          // Keep a clean HTTP response's buffered writes alive until client.end
+          // flushes them. A reset or incomplete upstream still retires both sides.
+          if (request.kind === 'http' && upstream.readableEnded) { if (!client.writableEnded) client.end(); }
+          else close();
+        });
         client.on('error', close); upstream.on('error', close);
-        client.pipe(upstream); upstream.pipe(client); client.resume(); upstream.resume();
+        if (request.kind === 'connect') {
+          client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          if (head.length) upstream.write(head);
+          client.pipe(upstream); upstream.pipe(client); client.resume(); upstream.resume();
+        } else {
+          let blocked = !upstream.write(request.header);
+          if (head.length && !upstream.write(head)) blocked = true;
+          const forward = data => {
+            try {
+              request.body.consume(data);
+              if (!upstream.write(data)) { blocked = true; client.pause(); }
+              if (request.body.complete) upstream.end();
+            } catch { close(); }
+          };
+          client.on('data', forward).once('end', () => { if (request.body.complete) upstream.end(); else close(); });
+          upstream.on('drain', () => { blocked = false; if (allowed()) client.resume(); });
+          upstream.pipe(client); upstream.resume();
+          if (request.body.complete) upstream.end();
+          if (!blocked) client.resume();
+        }
         this.emit('tunnel', { host, port });
       } catch { pending?.destroy(); if (!client.destroyed) client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'); }
       finally { release(); }
