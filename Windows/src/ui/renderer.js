@@ -11,6 +11,15 @@ function connectionMode() {
   $('claudePath').readOnly = $('claudeSource').value !== 'manual';
   $('find').disabled = busy || finding;
 }
+function showProtocol(value) {
+  if (!value) return;
+  $('protocolHint').textContent = value.defaultConfirmed
+    ? 'Windows открывает ссылки входа Claude через Guard.'
+    : value.registered
+      ? 'В Windows выберите Claude Proxy Guard для ссылок claude. Затем нажмите «Проверить выбор».'
+      : 'Обработчик входа Guard пока не подтверждён. Нажмите «Проверить выбор».';
+  document.body.dataset.protocolConfirmed = String(value.defaultConfirmed === true);
+}
 function discovered(value) {
   if (error(value)) { $('claudeStatus').textContent = value.error; return; }
   $('claudeSource').value = 'auto'; $('claudePath').value = value.path || '';
@@ -72,6 +81,12 @@ $('choose').addEventListener('click', async () => {
   if (!error(result) && result) { discoveryGeneration++; finding = false; $('claudeSource').value = 'manual'; $('claudePath').value = result; $('claudeStatus').textContent = 'Путь выбран вручную'; connectionMode(); }
 });
 $('find').addEventListener('click', findClaude);
+$('protocolSettings').addEventListener('click', async () => error(await window.guard.protocolSettings()));
+$('protocolCheck').addEventListener('click', async () => {
+  $('protocolCheck').disabled = true;
+  try { const value = await window.guard.protocolCheck(); if (!error(value)) showProtocol(value); }
+  finally { $('protocolCheck').disabled = false; }
+});
 $('mode').addEventListener('change', () => { if ($('mode').value === 'network') $('password').value = ''; connectionMode(); });
 $('stop').addEventListener('click', () => window.guard.stop());
 $('restart').addEventListener('click', () => { $('restart').disabled = true; window.guard.restart(); });
@@ -82,6 +97,7 @@ function tab(traffic) {
 }
 $('trafficTab').addEventListener('click', () => tab(true)); $('logsTab').addEventListener('click', () => tab(false));
 window.guard.subscribe(event => {
+  if (event.type === 'protocol') showProtocol(event.data);
   if (event.type === 'state') showState(event.data);
   if (event.type === 'log') log(event.data);
   if (event.type === 'record') record(event.data);
@@ -90,7 +106,7 @@ window.guard.subscribe(event => {
 });
 window.guard.init().then(data => {
   if (error(data)) return;
-  $('version').textContent = data.version;
+  $('version').textContent = data.version; showProtocol(data.protocol);
   for (const id of fields) { if (id === 'password') continue; if ($(id).type === 'checkbox') $(id).checked = data.settings[id]; else $(id).value = data.settings[id]; }
   showState(data.state); data.logs.forEach(log); data.records.forEach(record);
   document.body.dataset.ready = 'true';
