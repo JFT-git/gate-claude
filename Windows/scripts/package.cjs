@@ -15,6 +15,17 @@ async function main() {
   await fs.rm(stage, { recursive: true, force: true }); await fs.mkdir(stage, { recursive: true });
   const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
   const electronVersion = pkg.devDependencies.electron;
+  let electronZipDir;
+  if (args.includes('--electron-zip-dir')) {
+    // This optional offline input is pinned to the official release checksum;
+    // it never turns off Electron's integrity requirement for arbitrary ZIPs.
+    if (platform !== 'win32' || arch !== 'x64' || electronVersion !== '44.9.2') throw Error('No pinned offline Electron archive for this target.');
+    electronZipDir = path.resolve(argument('--electron-zip-dir'));
+    const safe = safeFilesystem(fs);
+    await safe.inspect(electronZipDir, true);
+    const bytes = await safe.read(path.join(electronZipDir, 'electron-v44.9.2-win32-x64.zip'), LIMITS.archive);
+    if (sha256(bytes) !== '1a9ed7f4e70291c95ed9479d7fcd384a2d9cf062e5fb7ce846b119c7c63036c3') throw Error('Offline Electron checksum mismatch.');
+  }
   delete pkg.devDependencies; delete pkg.scripts; delete pkg.engines; delete pkg.private;
   await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify(pkg, null, 2));
   await fs.cp(path.join(root, 'src'), path.join(stage, 'src'), { recursive: true });
@@ -68,7 +79,7 @@ async function main() {
     }
   }
   // Runtime dependencies are Node built-ins; no profiles, test hooks or Claude binaries are staged.
-  const results = await packager({ dir: stage, name: 'Claude Proxy Guard', platform, arch, electronVersion,
+  const results = await packager({ dir: stage, name: 'Claude Proxy Guard', platform, arch, electronVersion, electronZipDir,
     out: path.join(root, 'dist'), overwrite: true, asar: true, prune: false, extraResource,
     appBundleId: 'local.proxyguard.gate-claude', appCopyright: 'Copyright 2026 gate-claude contributors',
     win32metadata: { CompanyName: 'gate-claude contributors', FileDescription: 'Claude Proxy Guard', ProductName: 'Claude Proxy Guard', OriginalFilename: 'Claude Proxy Guard.exe' },

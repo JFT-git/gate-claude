@@ -12,6 +12,8 @@
 
 Code использует штатный Windows-инструмент PowerShell: `CLAUDE_CODE_USE_POWERSHELL_TOOL=1`, `defaultShell: powershell`, `permissions.deny: ["Bash"]`. Git Bash несовместим с используемым AppContainer и не запускается как инструмент Code. Bash-скрипты и hooks автоматически не переводятся: для поддерживаемых hooks задайте `shell: "powershell"` либо прямой запуск программы. Права системного пространства объектов ради Bash не расширяются. [PowerShell в Claude Code](https://code.claude.com/docs/en/tools-reference#powershell-tool).
 
+Длинные имена файлов состояния Code не мешают повторному запуску: helper обрабатывает их через внутренние расширенные пути, сохраняя проверки ссылок и ACL. Очень длинный текущий рабочий каталог команды имеет отдельное ограничение запуска Windows/Node. Держите корень проекта в короткой подпапке `Workspace`; поддержка запуска оболочки из расширенного `\\?\` cwd не заявлена.
+
 Для сборки с инструментами передайте `--code-tools-dir` — папку с двумя ZIP и `code-tools-policy.json`, созданную `scripts/prepare-code-tools.cjs` из официальных проверенных исходных архивов. Cross-build дополнительно требует `--code-host`, собранный из `native/CodeHost.cs`; сетевой брокер компилируется из `NetworkFence.cs`, `CodeNetworkFence.cs` и `CodeFenceSession.cs`.
 
 Подготовщик инструментов принимает `--git-root`, `--powershell-root`, `--git-asset`, `--powershell-asset`, `--powershell-bootstrap` и `--output`. Bootstrap — отдельная папка с собранным `GuardPowerShell.exe` и исходными `Guard.PowerShell.pssc`/`Guard.PowerShell.ps1` из `native`. Политика фиксирует официальные архивы, полный исходный PowerShell, эти три файла и полный итоговый комплект. Неизвестная пересборка launcher требует обновления проверенных хешей в исходной политике; произвольный EXE не принимается.
@@ -82,7 +84,7 @@ Guard добавляет свой bootstrap в локальную копию ASA
 
 ## Сборка
 
-На Windows x64 нужны Node.js 22.12+ и штатный .NET Framework 4.x compiler (`csc.exe`). Для обычного запуска Node.js и SDK не нужны.
+На Windows x64 нужны Node.js 22.12+ и штатный .NET Framework compiler (`csc.exe`) и .NET Framework 4.6.2 или новее. Для обычного запуска Node.js и SDK не нужны.
 
 ```powershell
 cd Windows
@@ -97,6 +99,8 @@ cd Windows
 npm ci
 node scripts/package.cjs --platform win32 --arch x64 --host /absolute/path/to/GuardHost.exe --fence /absolute/path/to/NetworkFence.exe --code-host /absolute/path/to/CodeHost.exe --code-tools-dir /absolute/path/to/verified-sidecars
 ```
+
+Если загрузчик Node не может получить Electron, `--electron-zip-dir` принимает локальную папку с официальным `electron-v44.9.2-win32-x64.zip`. Упаковщик сверяет закреплённую SHA-256 из официального SHASUMS256 и отказывается от другого архива; проверка целостности не отключается.
 
 Официальные описания: [Electron debugger](https://www.electronjs.org/docs/latest/api/debugger), [ASAR integrity для Windows](https://www.electronjs.org/docs/latest/tutorial/asar-integrity), [Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects), [Node named pipes](https://nodejs.org/api/net.html#ipc-support).
 
