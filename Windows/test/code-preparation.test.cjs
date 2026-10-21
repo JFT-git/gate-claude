@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const { prepareCodeFiles, SOURCE_POLICY, MAX_CLI_BYTES, validatePE } = require('../src/code-preparation.cjs');
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const SID = 'S-1-15-2-1-2-3-4-5-6-7';
@@ -109,4 +110,42 @@ test('the decompressed executable must also match its independent complete relea
   const f = await fixture(t), different = pe(); different[700] = 17;
   await assert.rejects(f.prepare({ decompress: () => different }), /Не удалось безопасно/);
   assert.equal(f.calls.length, 0); assert.equal(fs.existsSync(path.join(f.guardRoot, 'CodeBin')), false);
+});
+
+test('the default asynchronous zstd decompressor produces the pinned native executable', { skip: typeof zlib.zstdCompressSync !== 'function' }, async t => {
+  const f = await fixture(t), compressed = zlib.zstdCompressSync(pe());
+  fs.writeFileSync(f.compressedPath, compressed);
+  f.policy.compressedSize = compressed.length; f.policy.compressedSHA256 = sha(compressed);
+  const code = await f.prepare({ decompress: undefined });
+  assert.equal(sha(fs.readFileSync(code.approved[0].path)), f.policy.executableSHA256);
+  assert.equal(f.counts.decompress, 0); assert.equal(f.calls.length, 1);
+  await code.cleanupProfile();
+});
+
+test('deferred decompression leaves timers and owner cancellation callbacks schedulable and still rejects an unpinned output', { timeout: 5000 }, async t => {
+  const f = await fixture(t), owner = new AbortController();
+  let entered, release, settled = false, cancelled = false;
+  const started = new Promise(resolve => { entered = resolve; });
+  owner.signal.addEventListener('abort', () => { cancelled = true; }, { once: true });
+  const preparing = f.prepare({ decompress: (bytes, options) => {
+    assert.equal(sha(bytes), f.policy.compressedSHA256); assert.equal(options.maxOutputLength, MAX_CLI_BYTES);
+    entered(); return new Promise(resolve => { release = resolve; });
+  } });
+  preparing.then(() => { settled = true; }, () => { settled = true; });
+  await started;
+  await new Promise(resolve => setTimeout(() => { owner.abort(); resolve(); }, 0));
+  assert.equal(cancelled, true); assert.equal(settled, false);
+  assert.equal(f.calls.length, 0); assert.equal(fs.existsSync(path.join(f.guardRoot, 'CodeBin')), false);
+  const different = pe(); different[700] = 17; release(different);
+  await assert.rejects(preparing, /Не удалось безопасно/);
+  assert.equal(f.calls.length, 0); assert.equal(fs.existsSync(path.join(f.guardRoot, 'CodeState')), false);
+  assert.equal(fs.existsSync(path.join(f.guardRoot, 'CodeBin')), false);
+});
+
+test('an asynchronous decompression rejection stays sanitized and creates no native profile or output', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.prepare({ decompress: async () => { throw Error('private-decompression-details'); } }),
+    error => /Не удалось безопасно/.test(error.message) && !error.message.includes('private-decompression'));
+  assert.equal(f.calls.length, 0); assert.equal(fs.existsSync(path.join(f.guardRoot, 'CodeBin')), false);
+  assert.equal(fs.existsSync(path.join(f.guardRoot, 'CodeState')), false);
 });

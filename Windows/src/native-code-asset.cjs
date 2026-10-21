@@ -7,6 +7,7 @@ const tls = require('node:tls');
 const { connectTunnel } = require('./relay.cjs');
 const { safeFilesystem } = require('./code-tools.cjs');
 const { SOURCE_POLICY } = require('./code-preparation.cjs');
+const { sha256 } = require('./async-bytes.cjs');
 
 // Source provenance is compiled into Guard. Callers cannot choose a URL, host,
 // checksum, TLS authority, or proxy bypass. No account credentials are sent.
@@ -85,7 +86,7 @@ async function ensureNativeCodeAsset(guardRoot, relayPort, controls) {
     const assets = await safe.directory(path.join(guardRoot, 'CodeAssets')), target = await safe.directory(path.join(assets, ASSET.sha256));
     const assetPath = path.join(target, ASSET.filename), names = await fs.readdir(target);
     if (names.some(name => name !== ASSET.filename)) throw failure();
-    const verify = async file => { check(); const bytes = await safe.read(file, ASSET.bytes); check(); if (bytes.length !== ASSET.bytes || crypto.createHash('sha256').update(bytes).digest('hex') !== ASSET.sha256) throw failure(); };
+    const verify = async file => { check(); const bytes = await safe.read(file, ASSET.bytes); check(); if (bytes.length !== ASSET.bytes || await sha256(bytes) !== ASSET.sha256) throw failure(); check(); };
     if (names.length === 1) { await verify(assetPath); return { path: assetPath }; }
     check();
     const candidate = path.join(assets, 'Preparing-' + crypto.randomBytes(16).toString('hex') + '.zst');

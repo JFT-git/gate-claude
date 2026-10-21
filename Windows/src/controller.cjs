@@ -1,7 +1,6 @@
 'use strict';
 const { EventEmitter } = require('node:events');
-const { spawn, execFile } = require('node:child_process');
-const runFile = require('node:util').promisify(execFile);
+const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
@@ -11,6 +10,7 @@ const { prepareRuntime } = require('./runtime.cjs');
 const { Channel } = require('./channel.cjs');
 const { Inspector } = require('./inspector.cjs');
 const { diagnostic } = require('./sanitize.cjs');
+const { readRouteFingerprint, RouteReadError } = require('./route-reader.cjs');
 const { NetworkFence } = require('./fence.cjs');
 const { prepareCodeFiles } = require('./code-preparation.cjs');
 const { prepareCodeTools, SOURCE_POLICY: CODE_TOOLS_POLICY } = require('./code-tools.cjs');
@@ -335,14 +335,18 @@ class GuardController extends EventEmitter {
   }
   async routeFingerprint() {
     if (process.platform !== 'win32') return '';
+    const epoch = this.epoch;
     try {
-      const { stdout } = await runFile(path.join(this.resources, 'GuardHost.exe'), ['--route-fingerprint'],
-        { windowsHide: true, timeout: 4000, maxBuffer: 65536, encoding: 'utf8' });
-      const routes = JSON.parse(stdout.trim());
-      if (!Array.isArray(routes) || routes.some(route => typeof route !== 'string' || route.length > 256)) throw Error('Invalid route snapshot');
-      return JSON.stringify(routes);
-    } catch {
-      throw Error('Не удалось прочитать таблицу маршрутов Windows. Трафик остаётся закрытым.');
+      const route = await readRouteFingerprint(path.join(this.resources, 'GuardHost.exe'));
+      if (this.epoch === epoch) this.routeErrorCode = null;
+      return route;
+    } catch (error) {
+      const failure = error instanceof RouteReadError ? error : new RouteReadError('EXIT_NONZERO');
+      if (this.epoch === epoch && this.routeErrorCode !== failure.code) {
+        this.routeErrorCode = failure.code;
+        this.log('Проверка маршрутов Windows: ' + failure.code + '.', 'warning');
+      }
+      throw failure;
     }
   }
   async requestIP(epoch, check, port, token) {

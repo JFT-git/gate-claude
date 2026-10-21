@@ -3,6 +3,9 @@
 // executable extractors, data descriptors, links, ZIP64 records or extra fields.
 const zlib = require('node:zlib');
 const crypto = require('node:crypto');
+const inflateRaw = require('node:util').promisify(zlib.inflateRaw);
+const { setImmediate: yieldTurn } = require('node:timers/promises');
+const asyncSHA256 = require('./async-bytes.cjs').sha256;
 const LIMITS = Object.freeze({ archive: 256 * 1024 * 1024, expanded: 512 * 1024 * 1024, file: 128 * 1024 * 1024, entries: 20000, path: 240 });
 const HASH = /^[a-f0-9]{64}$/;
 const bad = () => Error('Invalid portable tool archive');
@@ -74,6 +77,24 @@ function inflateEntry(entry) {
   if (data.length !== entry.size || crc32(data) !== entry.crc || sha256(data) !== entry.sha256) throw bad();
   return data;
 }
+async function inflateEntryAsync(entry) {
+  let data;
+  if (entry.method === 0) data = Buffer.from(entry.compressed);
+  else {
+    const result = await inflateRaw(entry.compressed, { maxOutputLength: Math.max(1, entry.size), info: true });
+    if (result.engine.bytesWritten !== entry.compressed.length) throw bad();
+    data = result.buffer;
+  }
+  if (data.length !== entry.size) throw bad();
+  let crc = 0xffffffff;
+  for (let offset = 0; offset < data.length; offset += 262144) {
+    if (data.length > 262144) await yieldTurn();
+    const end = Math.min(offset + 262144, data.length);
+    for (let index = offset; index < end; index++) crc = CRC_TABLE[(crc ^ data[index]) & 255] ^ (crc >>> 8);
+  }
+  if (((crc ^ 0xffffffff) >>> 0) !== entry.crc || await asyncSHA256(data) !== entry.sha256) throw bad();
+  return data;
+}
 // The release builder streams these pieces to a new file. No platform metadata,
 // local timestamps, permission bits or random data enter the archive bytes.
 function zipEntry(name, data, offset) {
@@ -88,4 +109,4 @@ function zipEnd(count, centralSize, centralOffset) {
   if (!Number.isSafeInteger(count) || count < 1 || count > LIMITS.entries || !Number.isSafeInteger(centralSize) || centralSize < 1 || !Number.isSafeInteger(centralOffset) || centralOffset < 1 || centralOffset + centralSize + 22 > LIMITS.archive) throw bad();
   const end = Buffer.alloc(22); end.writeUInt32LE(0x06054b50); end.writeUInt16LE(count, 8); end.writeUInt16LE(count, 10); end.writeUInt32LE(centralSize, 12); end.writeUInt32LE(centralOffset, 16); return end;
 }
-module.exports = { LIMITS, sha256, crc32, manifestSHA256, validateName, validateFiles, parsePortableZip, inflateEntry, zipEntry, zipEnd };
+module.exports = { LIMITS, sha256, crc32, manifestSHA256, validateName, validateFiles, parsePortableZip, inflateEntry, inflateEntryAsync, zipEntry, zipEnd };

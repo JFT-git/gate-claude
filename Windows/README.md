@@ -1,6 +1,8 @@
-# Claude Proxy Guard для Windows · 0.6.0
+# Claude Proxy Guard для Windows · 0.6.1
 
 Переносимая сборка x64 для Windows 10/11. Внутри — собственный Guard, Electron, helper Windows Job Object и брокер сетевых правил WFP. Копия Claude запускается обычным процессом Windows; Docker, Hyper-V и отдельная VM для этой сборки не нужны. Файлы Claude, учётные записи, пароли и тестовые сертификаты не распространяются. Проверено на Windows 11 x64 и официальном Claude Desktop 3.1623.0.
+
+В 0.6.1 распаковка Claude Code и проверка больших файлов Git/PowerShell уступают время сетевым проверкам и heartbeat. Это устраняет воспроизведённый сценарий ложной ошибки маршрута при задержке основного потока. В журнал добавлены безопасные коды причин (`TIMEOUT`, `ENOENT`, `EACCES`, `EXIT_NONZERO`, `INVALID_SNAPSHOT`); готовая Windows-сборка теперь проходит проверку native-модуля маршрутов при smoke-test. Тайм-ауты и правила остановки при смене IP сохранены.
 
 ## Claude Code
 
