@@ -1,12 +1,13 @@
 'use strict';
 const { EventEmitter } = require('node:events');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
+const runFile = require('node:util').promisify(execFile);
 const path = require('node:path');
 const fs = require('node:fs');
 const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
 const { SOCKSRelay, NetworkRelay } = require('./relay.cjs');
 const { initialIP, currentIP } = require('./ip-check.cjs');
-const { prepareRuntime, powershell } = require('./runtime.cjs');
+const { prepareRuntime } = require('./runtime.cjs');
 const { Channel } = require('./channel.cjs');
 const { Inspector } = require('./inspector.cjs');
 const { diagnostic } = require('./sanitize.cjs');
@@ -90,7 +91,7 @@ class GuardController extends EventEmitter {
         LANGUAGE: settings.language, LC_MESSAGES: settings.language.replaceAll('-', '_') + '.UTF-8',
         PROXY_GUARD_CONFIG: JSON.stringify({ userData: this.runtime.profile, timezone: settings.timezone, language: settings.language,
           proxyURL: 'http://127.0.0.1:' + port, channelPipe: this.channel.path, channelToken: this.channel.token }) });
-      this.host = spawn(path.join(this.resources, 'GuardHost.exe'), [this.runtime.executable, '--lang=' + settings.language], { env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+      this.host = spawn(path.join(this.resources, 'GuardHost.exe'), [this.runtime.executable, '--user-data-dir=' + this.runtime.profile, '--lang=' + settings.language], { env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
       let output = '';
       this.host.stdout.on('data', chunk => {
         output = (output + chunk).slice(-8192); let end;
@@ -111,7 +112,15 @@ class GuardController extends EventEmitter {
   }
   async routeFingerprint() {
     if (process.platform !== 'win32') return '';
-    return powershell("@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0','0.0.0.0/1','128.0.0.0/1','::/0','::/1','8000::/1') } | Sort-Object InterfaceIndex,DestinationPrefix,NextHop | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.InterfaceIndex,$_.NextHop,$_.RouteMetric,$_.DestinationPrefix }) | ConvertTo-Json -Compress", 4000);
+    try {
+      const { stdout } = await runFile(path.join(this.resources, 'GuardHost.exe'), ['--route-fingerprint'],
+        { windowsHide: true, timeout: 4000, maxBuffer: 65536, encoding: 'utf8' });
+      const routes = JSON.parse(stdout.trim());
+      if (!Array.isArray(routes) || routes.some(route => typeof route !== 'string' || route.length > 256)) throw Error('Invalid route snapshot');
+      return JSON.stringify(routes);
+    } catch {
+      throw Error('Не удалось прочитать таблицу маршрутов Windows. Трафик остаётся закрытым.');
+    }
   }
   async requestIP(epoch, check, port, token) {
     // A cancelled request may still be settling; never overlap it with a new one.
