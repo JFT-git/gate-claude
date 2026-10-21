@@ -60,7 +60,7 @@ test('sanitizes case variants of proxy bypass and private Guard environment with
   const env = packet(h.child).data.env;
   assert.equal(env.Path, undefined); assert.equal(env.PATH, 'last'); assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'fixture-auth');
   for (const name of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) assert.equal(env[name], config().relayURL);
-  assert.equal(env.NO_PROXY, ''); assert.equal(Object.keys(env).filter(key => /proxy/i.test(key)).length, 4);
+  assert.equal(env.NO_PROXY, ''); assert.equal(Object.keys(env).filter(key => /^(?:https?|all|no)_proxy$/i.test(key)).length, 4);
   for (const name of ['ELECTRON_RUN_AS_NODE', 'node_OPTIONS', 'PROXY_GUARD_CONFIG', 'GATE_TOKEN', 'CLAUDE_CDP_AUTH', 'SSLKEYLOGFILE']) assert.equal(env[name], undefined);
 });
 test('managed policy merges proxy values ephemerally and preserves all unrelated nested organization settings', () => {
@@ -157,4 +157,25 @@ test('projects inside the permanent workspace retain their canonical working dir
   for (const cwd of [config().stateRoot + '\\Workspace-other', config().stateRoot + '\\Workspace\\..\\Other']) {
     const outside = harness(); assert.throws(() => outside.api.spawnManaged(request({ cwd }))); assert.equal(outside.calls.length, 0);
   }
+});
+
+
+test('vendor readiness resolves only an approved immutable cache identity without reading a profile or downloading', () => {
+  const h = load(), cfg = config();
+  cfg.approved[0].requestedPath = 'C:\\Guard\\Profile\\claude-code\\2.1.304\\aed62990b91e\\claude.exe';
+  rejects(() => h.api.resolveManagedCliPath(cfg.approved[0].requestedPath));
+  h.api.initCodeTransport(cfg, () => childFixture());
+  const wanted = cfg.approved[0].path, requested = cfg.approved[0].requestedPath;
+  cfg.approved[0].path = 'C:\\Untrusted\\claude.exe';
+  assert.equal(h.api.resolveManagedCliPath(requested.toUpperCase()), wanted);
+  for (const value of [wanted, requested.replace('2.1.304', '2.1.305'), requested.replace('aed62990b91e', '000000000000'), 'C:\\Other\\claude.exe']) rejects(() => h.api.resolveManagedCliPath(value));
+});
+
+
+test('all native and managed configuration paths force hostname resolution through the proxy', () => {
+  const h = harness(); h.api.spawnManaged(request({ env: { claude_code_proxy_resolves_hosts: '0' } }));
+  const env = packet(h.child).data.env;
+  assert.equal(env.CLAUDE_CODE_PROXY_RESOLVES_HOSTS, '1'); assert.equal(env.claude_code_proxy_resolves_hosts, undefined);
+  const settings = h.api.mergeManagedSettings({ env: { CLAUDE_CODE_PROXY_RESOLVES_HOSTS: '0' } });
+  assert.equal(settings.env.CLAUDE_CODE_PROXY_RESOLVES_HOSTS, '1');
 });

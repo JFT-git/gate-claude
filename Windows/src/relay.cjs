@@ -203,11 +203,12 @@ class SOCKSRelay extends EventEmitter {
       if (end > 16384) { client.destroy(); return; }
       processing = true; client.off('data', onData);
       let upstream, pending, request, head = bytes.subarray(end + 4);
+      const pendingLimit = () => request?.kind === 'http' ? 1024 * 1024 : 65536;
       const cancel = () => { pending?.destroy(); client.destroy(); };
       const collect = data => {
         try {
           if (request?.kind === 'http') request.body.consume(data);
-          head = Buffer.concat([head, data]); if (head.length > 65536) cancel();
+          head = Buffer.concat([head, data]); if (head.length > pendingLimit()) cancel();
         } catch { cancel(); }
       };
       // Keep reading FIN while DNS/SOCKS is pending. Pausing here hides cancellation
@@ -215,8 +216,8 @@ class SOCKSRelay extends EventEmitter {
       client.on('data', collect).once('end', cancel).once('close', cancel).once('error', cancel);
       const release = () => { client.off('data', collect).off('end', cancel).off('close', cancel).off('error', cancel); };
       try {
-        if (head.length > 65536) throw Error('Слишком большой буфер запроса.');
         request = proxyRequest(bytes.subarray(0, end + 4).toString('latin1'));
+        if (head.length > pendingLimit()) throw Error('Слишком большой буфер запроса.');
         const { host, port } = request;
         if (request.kind === 'http') request.body.consume(head);
         const credentials = request.fields.filter(field => field.name === 'proxy-authorization');

@@ -13,6 +13,12 @@ const PREFIX = '"use strict";const __gateCli=require("./proxy-guard-managed-cli.
 // identity and host-auth checks. Generic Yf/Zf and child_process stay blocked.
 const PLUGIN_RUN = 'Yf(i,e,{timeout:r,env:{...t.env,...o.env,PATH:s,CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:"1"},cwd:t.cwd,stdin:t.stdin,ignoreExitCode:!0})';
 const PLUGIN_AUTH = 'let o=await dAa({tag:"plugin_cli",versionIdentity:a});';
+const HOST_PRESEED = 'async getHostPreseedInPlacePath(){if(!pi()||this.skipPreseedThisProcess)return null;let e=this.getHostTarget();return BHr(e.platform,e.binaryName)}';
+// Reuse the vendor's prepared-binary branch so a fresh Profile never has to
+// install a second CLI before the SDK can reach the protected transport. Its
+// ordinary version identity and host-only behavior remain intact. A complete
+// checksum check precedes the vendor path, whose folder uses only 12 hex chars.
+const MANAGED_PRESEED = 'async getHostPreseedInPlacePath(){let e=this.getHostTarget();if(e.platform!=="win32-x64"||this.targetVersion!=="2.1.304"||this.expectedChecksumForTarget(e)!=="aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81")throw Error("Unsupported Claude Code version; protected launch is unavailable.");return __gateCli.resolveManagedCliPath(this.getBinaryPathForTarget(e,this.targetVersion))}';
 const failure = () => Error('Unsupported Claude Code SDK; protected launch is unavailable.');
 const mainFailure = () => Error('Unsupported Claude Code main module; protected launch is unavailable.');
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -45,8 +51,8 @@ function findManagedCliSDK(archive) {
 function patchManagedCliMain(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length !== MAIN_BYTES || digest(bytes) !== MAIN_SHA256) throw mainFailure();
   const source = bytes.toString('utf8');
-  if ([PLUGIN_RUN, PLUGIN_AUTH, 'async function hAa(e,t={})'].some(anchor => source.split(anchor).length !== 2) || source.includes('__gateCli')) throw mainFailure();
-  return Buffer.from(PREFIX + source.replace(PLUGIN_RUN, PLUGIN_RUN.replace('Yf(', '__gateCli.runManagedCommand(')));
+  if ([PLUGIN_RUN, PLUGIN_AUTH, HOST_PRESEED, 'async function hAa(e,t={})'].some(anchor => source.split(anchor).length !== 2) || source.includes('__gateCli')) throw mainFailure();
+  return Buffer.from(PREFIX + source.replace(PLUGIN_RUN, PLUGIN_RUN.replace('Yf(', '__gateCli.runManagedCommand(')).replace(HOST_PRESEED, MANAGED_PRESEED));
 }
 function findManagedCliMain(archive) {
   if (!archive || typeof archive.read !== 'function' || !archive.header?.files) throw mainFailure();

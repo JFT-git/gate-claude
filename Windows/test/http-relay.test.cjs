@@ -105,3 +105,21 @@ test('a clean HTTP upstream close drains a large response under downstream backp
   socket.pause(); socket.write(`GET http://127.0.0.1:${dest.port}/large-response HTTP/1.1\r\n\r\n`); await ready; await delay(60); socket.resume();
   const actual = split(await result); assert.ok(actual.body.equals(body));
 });
+
+
+test('a complete native Code sized POST survives a pending SOCKS handshake without truncation', async t => {
+  const proxy = await socks(t, 'greeting'), { relay } = await relayFixture(t, proxy); relay.unlock();
+  const socket = await open(t, relay.port), result = response(socket), body = Buffer.alloc(89052, 97);
+  socket.write(Buffer.concat([Buffer.from(`POST http://code-api.fixture.invalid/v1/messages HTTP/1.1\r\nContent-Length: ${body.length}\r\n\r\n`), body]));
+  await until(() => proxy.greetings.length === 1, 'SOCKS greeting did not arrive'); await delay(30);
+  assert.equal(socket.destroyed, false); proxy.release();
+  const reply = await result; assert.match(reply.toString(), /^HTTP\/1\.1 200 /);
+  assert.ok(split(Buffer.concat(proxy.application)).body.equals(body));
+});
+
+test('oversized pending HTTP bodies stay bounded and never forward bytes to SOCKS', async t => {
+  const proxy = await socks(t, 'greeting'), { relay } = await relayFixture(t, proxy); relay.unlock();
+  const socket = await open(t, relay.port), closed = once(socket, 'close'), body = Buffer.alloc(1024 * 1024 + 1);
+  socket.write(Buffer.concat([Buffer.from(`POST http://too-large.fixture.invalid/ HTTP/1.1\r\nContent-Length: ${body.length}\r\n\r\n`), body]));
+  await closed; proxy.release(); await delay(15); assert.equal(proxy.application.length, 0);
+});

@@ -73,7 +73,7 @@ function proxyEnv(env, lowerCase = false) {
   const result = {}, names = new Map(); let characters = 1;
   for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(env))) {
     if (!('value' in descriptor) || !text(key, 256) || !key || key.includes('=') || /[\x00-\x1f]/.test(key) || !text(descriptor.value)) throw denied();
-    if (PROXY_NAME.test(key) || PRIVATE_ENV.test(key) || Object.keys(installed.code.tools.environment).some(name => name.toUpperCase() === key.toUpperCase())) continue;
+    if (/^CLAUDE_CODE_PROXY_RESOLVES_HOSTS$/i.test(key) || PROXY_NAME.test(key) || PRIVATE_ENV.test(key) || Object.keys(installed.code.tools.environment).some(name => name.toUpperCase() === key.toUpperCase())) continue;
     // Windows env names are case-insensitive. Preserve one deterministic spelling.
     const previous = names.get(key.toUpperCase()); if (previous) delete result[previous];
     names.set(key.toUpperCase(), key); Object.defineProperty(result, key, { value: descriptor.value, writable: true, enumerable: true, configurable: true });
@@ -81,6 +81,7 @@ function proxyEnv(env, lowerCase = false) {
   Object.assign(result, installed.code.tools.environment);
   for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) result[key] = installed.code.relayURL;
   result.NO_PROXY = '';
+  result.CLAUDE_CODE_PROXY_RESOLVES_HOSTS = '1';
   if (lowerCase) for (const key of ['http_proxy', 'https_proxy', 'all_proxy']) result[key] = installed.code.relayURL;
   if (lowerCase) result.no_proxy = '';
   for (const [key, value] of Object.entries(result)) characters += key.length + value.length + 2;
@@ -149,6 +150,15 @@ function spawnManaged(options) {
     throw denied();
   }
 }
+function resolveManagedCliPath(requestedPath) {
+  try {
+    if (!installed) throw denied();
+    const requested = absolute(requestedPath, true).toLowerCase();
+    const match = installed.code.approved.find(item => item.requestedPath?.toLowerCase() === requested);
+    if (!match) throw denied();
+    return match.path;
+  } catch { throw denied(); }
+}
 function runManagedCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     let child, completed = false, timer, killTimer, failure, bytes = 0;
@@ -185,4 +195,4 @@ function runManagedCommand(command, args, options = {}) {
     } catch (error) { try { child?.kill(); } catch {} finish(error?.code ? error : denied()); }
   });
 }
-module.exports = { initCodeTransport, spawnManaged, runManagedCommand, mergeManagedSettings, MAX_PACKET_BYTES };
+module.exports = { initCodeTransport, spawnManaged, runManagedCommand, resolveManagedCliPath, mergeManagedSettings, MAX_PACKET_BYTES };
