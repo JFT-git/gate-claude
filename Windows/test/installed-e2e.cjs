@@ -11,7 +11,7 @@ const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
 const { SocketReader } = require('../src/relay.cjs');
-const { prepareRuntime } = require('../src/runtime.cjs');
+const { prepareRuntime, powershell } = require('../src/runtime.cjs');
 
 const argv = process.argv.slice(2), argument = name => argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined;
 let source = argument('--claude'); const work = path.resolve(argument('--work'));
@@ -20,6 +20,8 @@ const certPath = path.resolve(argument('--cert')), keyPath = path.resolve(argume
 const hostPath = path.resolve(argument('--host'));
 const fencePath = argument('--fence') ? path.resolve(argument('--fence')) : null;
 const ipHosts = ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org'];
+const persistenceMarker = crypto.randomBytes(24).toString('hex');
+const persistenceCookie = '__Host-guard_fixture_persist';
 let observed = '203.0.113.7', failNextCurrentIP = false, holdCurrentIP = false;
 const heldIPResponses = [], activeStreams = new Set();
 const { GuardController } = require('../src/controller.cjs');
@@ -48,6 +50,10 @@ const frame = '<script>parent.postMessage({guardFixture:true,timezone:Intl.DateT
 
 async function main() {
   assert.equal(process.platform, 'win32'); await fs.mkdir(work, { recursive: true });
+  const execution = JSON.parse(await powershell("[pscustomobject]@{elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);interactive=((Get-Process -Id $PID).SessionId -gt 0)}|ConvertTo-Json -Compress"));
+  proof.executionContext = { elevated: execution.elevated === true, interactive: execution.interactive === true,
+    standardUserRuntimeCovered: execution.elevated !== true,
+    limitation: execution.elevated === true ? 'Interactive elevated fixture; standard-user runtime token is not covered by this run.' : 'Runtime inherits the invoking test token.' };
   if (source === 'auto') {
     const found = await require('../src/discovery.cjs').discoverClaude();
     assert.equal(found.status, 'found'); assert.equal(found.kind, 'msix');
@@ -81,6 +87,14 @@ async function main() {
     }
     let body = ''; req.on('data', data => { body += data.toString(); });
     req.on('end', () => {
+      if (req.url === '/__guard_test__/persist') {
+        const cookiePresent = String(req.headers.cookie || '').split(';').some(value => value.trim() === persistenceCookie + '=' + persistenceMarker);
+        const response = JSON.stringify({ marker: 'guard-persistence-fixture', cookiePresent });
+        const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(response), 'Cache-Control': 'no-store' };
+        // The read endpoint never recreates the marker after the runtime restart.
+        if (req.method === 'POST') headers['Set-Cookie'] = persistenceCookie + '=' + persistenceMarker + '; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=86400';
+        res.writeHead(200, headers); res.end(response); return;
+      }
       if (req.url.startsWith('/__guard_test__/revalidation')) {
         (observations.revalidationRequests ||= []).push(req.url);
         const result = JSON.stringify({ marker: 'guard-revalidation-response' });
@@ -153,6 +167,12 @@ command=async m=>{
   emit({id:m.id,result:{}});return;
  }
  if(m.method==='ProxyGuard.testWindowStatus'){emit({id:m.id,result:{completed:testWindowsDone}});return}
+ if(m.method==='ProxyGuard.testFlushProfile'){
+  const target=sessions.get(m.params.targetSession);if(!target||target.child)throw Error('root target required');
+  const storage=target.wc.session;await storage.cookies.flushStore();storage.flushStorageData();
+  const cookies=await storage.cookies.get({url:'https://claude.ai',name:${JSON.stringify(persistenceCookie)}});
+  const cookie=cookies[0];emit({id:m.id,result:{flushed:true,cookiePersistent:cookies.length===1&&cookie.httpOnly&&cookie.secure&&!cookie.session&&cookie.expirationDate>Date.now()/1000+300}});return;
+ }
  if(m.method==='ProxyGuard.testSharedLocale'){
   const target=sessions.get(m.params.targetSession);if(!target||target.child)throw Error('root target required');const dbg=target.wc.debugger;
   await dbg.sendCommand('Emulation.setLocaleOverride',{locale:''});const info=await dbg.sendCommand('Target.getTargetInfo');
@@ -242,6 +262,29 @@ command=async m=>{
     proof.revalidation = { injectedHTTP500: observations.http500, recheckingObserved: states.slice(statesBefore).includes('rechecking'),
       appTrafficBlockedWhilePaused: true, processSurvived: true, samePID: true, resumedHTTP: true, resumedStream: true };
     assert.equal(proof.revalidation.recheckingObserved, true);
+    const firstProfile = controller.runtime.profile, firstFence = controller.fence;
+    const writePersistence = (await channel.command('Runtime.evaluate', {
+      expression: `(async()=>{
+        const key='guard-fixture-persistence-v1',value=${JSON.stringify(persistenceMarker)};
+        localStorage.setItem(key,value);
+        await new Promise((resolve,reject)=>{
+          const open=indexedDB.open('guard-fixture-persistence',1);
+          open.onupgradeneeded=()=>open.result.createObjectStore('markers');open.onerror=()=>reject(open.error);
+          open.onsuccess=()=>{const db=open.result;const tx=db.transaction('markers','readwrite',{durability:'strict'});
+            tx.objectStore('markers').put(value,'marker');tx.oncomplete=()=>{db.close();resolve()};tx.onabort=()=>{db.close();reject(tx.error)}};
+        });
+        await fetch('/__guard_test__/persist',{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw Error('fixture cookie rejected')});
+        return {localStorageWritten:localStorage.getItem(key)===value,indexedDBCommitted:true,httpOnlyInvisible:!document.cookie.split(';').some(x=>x.trim().startsWith(${JSON.stringify(persistenceCookie + '=')}))};
+      })()`, awaitPromise: true, returnByValue: true
+    }, sid)).result?.value;
+    assert.deepEqual(writePersistence, { localStorageWritten: true, indexedDBCommitted: true, httpOnlyInvisible: true });
+    const flush = await channel.command('ProxyGuard.testFlushProfile', { targetSession: sid });
+    assert.equal(flush.flushed, true); assert.equal(flush.cookiePersistent, true);
+    // Round trips follow Chromium's explicit storage flush and committed IndexedDB
+    // transaction. Persistence must then survive the same abrupt Job kill as the
+    // real IP-switch path, rather than an artificial graceful app shutdown.
+    assert.equal(await evaluate(`localStorage.getItem('guard-fixture-persistence-v1')===${JSON.stringify(persistenceMarker)}`), true);
+    await sleep(350);
     const port = controller.relay.port, changedAt = Date.now();
     observed = '203.0.113.8';
     await until(() => controller.state === 'blocked', 'IP kill', 10000);
@@ -250,11 +293,57 @@ command=async m=>{
     const refusal = net.connect(port, '127.0.0.1'); const refused = await new Promise(resolve => { refusal.once('connect', () => resolve(false)); refusal.once('error', () => resolve(true)); }); refusal.destroy();
     assert.equal(refused, true); controller.stop(); await assert.rejects(controller.start(input));
     proof.killSwitch = { milliseconds: Date.now() - changedAt, processGone: true, streamClosed: true, relayRefusesNewConnections: refused, blockedUntilRestart: true };
+    // Teardown is asynchronous: do not race a new broker against the old global
+    // WFP mutex or accept abandoned persistent filters as successful cleanup.
+    await until(() => firstFence.closed && firstFence.installed === false, 'old WFP broker acknowledged filter removal', 20000);
+    observed = '203.0.113.7';
+    controller = new GuardController(root, resources);
+    controller.on('log', event => console.log('restart ' + event.kind + ': ' + event.message));
+    assert.equal(controller.policy.pinned, null); assert.equal(controller.policy.blocked, false);
+    await controller.start(input);
+    await until(() => controller.state === 'running' || (controller.state === 'blocked' && Promise.reject(Error(controller.message))), 'restarted renderer profile', 45000);
+    assert.equal(controller.runtime.profile, firstProfile);
+    assert.equal(controller.fence?.installed, true); assert.equal(controller.fence.proof?.persistent, true);
+    let restartedSession;
+    await until(async () => {
+      if (controller.state === 'blocked') throw Error(controller.message);
+      for (const [candidate, item] of controller.inspector.sessions) {
+        if (!item.verified || !candidate.startsWith('guard-')) continue;
+        try {
+          const value = (await controller.channel.command('Runtime.evaluate', { expression: 'Boolean(window.__guardFixture?.result)', returnByValue: true }, candidate)).result?.value;
+          if (value) { restartedSession = candidate; return true; }
+        } catch (error) { if (!/context|target closed|session/i.test(error.message)) throw error; }
+      }
+      return false;
+    }, 'restarted fixture origin');
+    const persisted = (await controller.channel.command('Runtime.evaluate', {
+      expression: `(async()=>{
+        const value=${JSON.stringify(persistenceMarker)};
+        const saved=await new Promise((resolve,reject)=>{
+          const open=indexedDB.open('guard-fixture-persistence',1);open.onerror=()=>reject(open.error);
+          open.onsuccess=()=>{const db=open.result;if(!db.objectStoreNames.contains('markers')){db.close();resolve(null);return}
+            const tx=db.transaction('markers','readonly');const get=tx.objectStore('markers').get('marker');
+            get.onsuccess=()=>{const result=get.result;db.close();resolve(result)};get.onerror=()=>{db.close();reject(get.error)}};
+        });
+        const cookie=await fetch('/__guard_test__/persist',{cache:'no-store'}).then(r=>r.json());
+        return {localStorage:localStorage.getItem('guard-fixture-persistence-v1')===value,indexedDB:saved===value,httpOnlyCookie:cookie.cookiePresent===true,
+          httpOnlyInvisible:!document.cookie.split(';').some(x=>x.trim().startsWith(${JSON.stringify(persistenceCookie + '=')}))};
+      })()`, awaitPromise: true, returnByValue: true
+    }, restartedSession)).result?.value;
+    assert.deepEqual(persisted, { localStorage: true, indexedDB: true, httpOnlyCookie: true, httpOnlyInvisible: true });
+    const restartedPID = controller.runtimePID, restartedFence = controller.fence;
+    assert.ok(restartedPID > 0); assert.equal(controller.state, 'running');
+    controller.stop();
+    await until(() => { try { process.kill(restartedPID, 0); return false; } catch { return true; } }, 'restarted runtime terminated');
+    await until(() => restartedFence.closed && restartedFence.installed === false, 'restarted WFP broker acknowledged filter removal', 20000);
+    proof.profilePersistence = { samePrivateProfile: true, freshGuardPolicy: true, previousFenceRemovedBeforeRestart: true,
+      localStorage: persisted.localStorage, indexedDB: persisted.indexedDB, persistentHttpOnlyCookie: persisted.httpOnlyCookie,
+      httpOnlyInvisibleToJavaScript: persisted.httpOnlyInvisible, secondFenceInstalled: true, secondGuardCleanlyStopped: true };
     assert.ok(observations.ipChecks?.['ipwho.is'] >= 1);
     assert.ok(ipHosts.filter(host => host !== 'ipwho.is').reduce((total, host) => total + (observations.ipChecks?.[host] || 0), 0) >= 4);
     proof.ipChecksThroughLocalTLS = true;
     proof.result = 'PASS'; await fs.writeFile(path.join(work, 'proof.json'), JSON.stringify(proof, null, 2));
-    console.log('PASS: installed Windows Claude, production WFP, locale, interception, iframe lifecycle, same-PID revalidation and IP kill');
+    console.log('PASS: installed Windows Claude, production WFP, locale, interception, same-PID revalidation, IP kill and persistent private profile');
   } catch (error) {
     if (controller?.inspector) {
       const records = [...controller.inspector.records.values()].map(r => ({url:r.url,status:r.status,note:r.note}));
