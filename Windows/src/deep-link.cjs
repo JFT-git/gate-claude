@@ -65,16 +65,24 @@ class DeepLinkInbox {
 async function forwardRuntimeDeepLink(raw, { app, profileReady, userData, executable, cwd }) {
   let url = validateClaudeDeepLink(raw);
   if (!url) throw Error('Недопустимая ссылка входа.');
+  const deadline = performance.now() + 3500;
+  let timer;
+  const timedOut = new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Handler deadline exceeded')), 3500); });
   try {
-    await profileReady;
-    const deadline = performance.now() + 3500;
-    while (app.listenerCount('second-instance') === 0 && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
-    if (!app.listenerCount('second-instance')) throw Error('Handler unavailable');
+    // The deadline includes the profile barrier. Once it expires this invocation
+    // is consumed; a later profile resolution must never emit the callback.
+    await Promise.race([Promise.resolve(profileReady), timedOut]);
+    while (app.listenerCount('second-instance') === 0) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw Error('Handler deadline exceeded');
+      await Promise.race([new Promise(resolve => setTimeout(resolve, Math.min(25, remaining))), timedOut]);
+    }
+    if (performance.now() >= deadline) throw Error('Handler deadline exceeded');
     const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
     if (!app.emit('second-instance', event, [executable, '--user-data-dir=' + userData, url], cwd, {})) throw Error('Handler unavailable');
     return { delivered: true };
   } catch { throw Error('Не удалось передать ссылку входа в Claude.'); }
-  finally { url = ''; }
+  finally { clearTimeout(timer); url = ''; }
 }
 function runtimeDeepLinkSource() { return 'const validateClaudeDeepLink = ' + validateClaudeDeepLink.toString() + ';\nconst guardForwardDeepLink = ' + forwardRuntimeDeepLink.toString() + ';\n'; }
 module.exports = { validateClaudeDeepLink, takeDeepLinkFromArgv, registerGuardProtocol, DeepLinkInbox, forwardRuntimeDeepLink, runtimeDeepLinkSource, LINK_REFUSED, messages };

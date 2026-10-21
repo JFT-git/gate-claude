@@ -82,15 +82,26 @@ test('runtime forwarding waits for profile readiness and emits only fixed own-pr
   assert.equal(seen[0][2], 'C:\\private\\Runtime'); assert.deepEqual(seen[0][3], {}); assert.equal(typeof seen[0][0].preventDefault, 'function');
 });
 
+test('runtime deadline includes a pending profile and never emits after late resolution', async () => {
+  const app = new EventEmitter(); let resolveProfile, emissions = 0;
+  app.on('second-instance', () => { emissions++; });
+  const profileReady = new Promise(resolve => { resolveProfile = resolve; });
+  await assert.rejects(D.forwardRuntimeDeepLink(link, { app, profileReady, userData: 'C:\\private\\Profile', executable: 'C:\\private\\claude.exe', cwd: 'C:\\private' }), error => error.message === 'Не удалось передать ссылку входа в Claude.' && !error.message.includes('fixture'));
+  assert.equal(emissions, 0);
+  resolveProfile(); await sleep(30);
+  assert.equal(emissions, 0, 'An expired callback must not resume when the profile becomes ready');
+});
+
 test('injected runtime source rejects malformed routes, missing listeners and handler exceptions without URL disclosure', async () => {
   let tick = 0;
-  const context = { URL, performance: { now: () => (tick++) * 4000 }, setTimeout, Error };
+  const context = { URL, performance: { now: () => (tick++) * 4000 }, setTimeout, clearTimeout, Error };
   const forward = vm.runInNewContext(D.runtimeDeepLinkSource() + '\nguardForwardDeepLink;', context);
   const options = { app: new EventEmitter(), profileReady: Promise.resolve(), userData: 'C:\\private\\Profile', executable: 'C:\\private\\claude.exe', cwd: 'C:\\private' };
-  await assert.rejects(forward(link, options), error => !error.message.includes('fixture'));
-  await assert.rejects(forward('claude://login?token=fixture', options), error => !error.message.includes('fixture'));
+  await assert.rejects(forward(link, options), error => error.message === 'Не удалось передать ссылку входа в Claude.');
+  await assert.rejects(forward('claude://login?token=fixture', options), error => error.message === 'Недопустимая ссылка входа.');
+  context.performance.now = () => 0;
   options.app.on('second-instance', () => { throw Error(link); });
-  await assert.rejects(forward(link, options), error => !error.message.includes('fixture'));
+  await assert.rejects(forward(link, options), error => error.message === 'Не удалось передать ссылку входа в Claude.');
 });
 
 test('Windows bootstrap embeds root-only authenticated forwarding and preserves the shared bootstrap', () => {
