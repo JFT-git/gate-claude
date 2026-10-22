@@ -2,7 +2,8 @@
 const rawFS = require('./raw-fs.cjs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { LIMITS, sha256, manifestSHA256, validateFiles, parsePortableZip, inflateEntry } = require('./portable-zip.cjs');
+const { LIMITS, manifestSHA256, validateFiles, parsePortableZip, inflateEntryAsync } = require('./portable-zip.cjs');
+const { sha256 } = require('./async-bytes.cjs');
 // This is source provenance, not permission to execute a downloaded installer.
 // Release preparation repacks the verified, already extracted official trees.
 // Tree hashes cover canonical path/size/SHA256 records: the official Git SFX
@@ -83,7 +84,7 @@ async function verifyTree(root, files, safe) {
       else {
         const expected = expectedFiles.get(entry); if (!expected) throw fail();
         const bytes = await safe.read(absolute, expected.size);
-        if (bytes.length !== expected.size || sha256(bytes) !== expected.sha256) throw fail(); seenFiles.add(entry);
+        if (bytes.length !== expected.size || await sha256(bytes) !== expected.sha256) throw fail(); seenFiles.add(entry);
       }
     }
   }
@@ -107,7 +108,7 @@ async function prepareCodeTools(guardRoot, resources, archives, testdeps = {}) {
       const tool = policy.tools[index], archivePath = archives[index === 0 ? 'gitArchive' : 'powerShellArchive'];
       if (!samePath(archivePath, path.join(resources, 'CodeTools', tool.archiveName))) throw fail();
       const archive = await safe.read(archivePath, tool.archiveSize);
-      if (archive.length !== tool.archiveSize || sha256(archive) !== tool.archiveSHA256) throw fail();
+      if (archive.length !== tool.archiveSize || await sha256(archive) !== tool.archiveSHA256) throw fail();
       parsed.push(parsePortableZip(archive, tool.files));
     }
     const toolsRoot = await safe.directory(path.join(guardRoot, 'CodeTools')), toolRoots = [];
@@ -128,7 +129,7 @@ async function prepareCodeTools(guardRoot, resources, archives, testdeps = {}) {
           // Check the complete parent chain before every file write, while
           // avoiding repeated mkdir calls for thousands of shared prefixes.
           await safe.inspect(directory, true);
-          const bytes = inflateEntry(entry); await safe.fs.writeFile(path.join(directory, leaf), bytes, { flag: 'wx', mode: 0o600 });
+          const bytes = await inflateEntryAsync(entry); await safe.fs.writeFile(path.join(directory, leaf), bytes, { flag: 'wx', mode: 0o600 });
         }
         await verifyTree(staging, tool.files, safe);
         // A concurrent installer fails closed; it cannot replace an existing tree.
@@ -139,7 +140,7 @@ async function prepareCodeTools(guardRoot, resources, archives, testdeps = {}) {
     const [gitRoot, powerShellRoot] = toolRoots, pathEntries = Object.freeze([path.join(gitRoot, 'cmd'), path.join(gitRoot, 'usr', 'bin'), powerShellRoot, ...systemPaths]);
     // MSYS Bash cannot initialize in the zero-capability AppContainer. Select
     // the CLI's supported PowerShell tool while keeping native Git available.
-    return { toolRoots: Object.freeze(toolRoots), gitRoot, powerShellRoot, policySHA256: sha256(policyBytes),
+    return { toolRoots: Object.freeze(toolRoots), gitRoot, powerShellRoot, policySHA256: await sha256(policyBytes),
       gitExecutable: path.join(gitRoot, 'cmd', 'git.exe'), bashExecutable: path.join(gitRoot, 'bin', 'bash.exe'), powerShellExecutable: path.join(powerShellRoot, 'powershell.exe'),
       pathEntries,
       environment: Object.freeze({ PATH: pathEntries.join(';'), GIT_EXEC_PATH: path.join(gitRoot, 'ucrt64', 'libexec', 'git-core'), GIT_TEMPLATE_DIR: path.join(gitRoot, 'ucrt64', 'share', 'git-core', 'templates'), GIT_CONFIG_NOSYSTEM: '1',

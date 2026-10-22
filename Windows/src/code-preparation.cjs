@@ -3,7 +3,10 @@ const rawFS = require('./raw-fs.cjs').promises;
 const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
-const runFile = require('node:util').promisify(require('node:child_process').execFile);
+const { promisify } = require('node:util');
+const runFile = promisify(require('node:child_process').execFile);
+const decompressZstd = typeof zlib.zstdDecompress === 'function' ? promisify(zlib.zstdDecompress) : undefined;
+const { sha256: hash } = require('./async-bytes.cjs');
 const { parseArchive } = require('./asar.cjs');
 const { findManagedCliSDK, SDK_SHA256 } = require('./managed-cli-patch.cjs');
 const MAX_CLI_BYTES = 512 * 1024 * 1024;
@@ -11,7 +14,6 @@ const SOURCE_POLICY = Object.freeze({ desktopVersion: '3.1623.0', codeVersion: '
   compressedSize: 104965652, compressedSHA256: 'aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81',
   executableSize: 293227168, executableSHA256: '019e5174d5d954585edb1a946fe280e44a973050b4897034adf0e16306f85fdd',
   sdkSHA256: SDK_SHA256, mainFile: '.vite/build/index.chunk-7dsQFims.js', mainSHA256: '403a7d93388a723d2c0688cea83861ecfbe7e08caa63c6701bcd49684100c348' });
-const hash = data => crypto.createHash('sha256').update(data).digest('hex');
 const fail = () => Error('Не удалось безопасно подготовить Claude Code. Исходная версия или файлы не подтверждены.');
 function validatePE(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length < 256 || bytes.length > MAX_CLI_BYTES || bytes.readUInt16LE(0) !== 0x5a4d) throw fail();
@@ -22,11 +24,11 @@ function validatePE(bytes) {
 async function inspectSource(archiveBytes, policy) {
   const archive = parseArchive(archiveBytes), metadata = JSON.parse(archive.read('package.json').toString('utf8'));
   if (!['@ant/desktop', 'claude', 'Claude'].includes(metadata.name) || metadata.version !== policy.desktopVersion ||
-      findManagedCliSDK(archive).sha256 !== policy.sdkSHA256 || hash(archive.read(policy.mainFile)) !== policy.mainSHA256) throw fail();
+      findManagedCliSDK(archive).sha256 !== policy.sdkSHA256 || await hash(archive.read(policy.mainFile)) !== policy.mainSHA256) throw fail();
 }
 function samePath(a, b) { return process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b); }
 async function prepareCodeFiles(runtime, sourcePath, guardRoot, resources, testdeps = {}, assets) {
-  const fs = testdeps.fs || rawFS, run = testdeps.runFile || runFile, decompress = testdeps.decompress || zlib.zstdDecompressSync;
+  const fs = testdeps.fs || rawFS, run = testdeps.runFile || runFile, decompress = testdeps.decompress || decompressZstd;
   // Dependency injection is for owned unit fixtures; production supplies no overrides.
   const policy = testdeps.sourcePolicy || SOURCE_POLICY, inspect = testdeps.inspectSource || inspectSource;
   const randomBytes = testdeps.randomBytes || crypto.randomBytes;
@@ -78,26 +80,26 @@ async function prepareCodeFiles(runtime, sourcePath, guardRoot, resources, testd
       }
     }
     const compressed = await read(compressedPath, policy.compressedSize);
-    if (compressed.length !== policy.compressedSize || hash(compressed) !== policy.compressedSHA256) throw fail();
-    const executableBytes = validatePE(decompress(compressed, { maxOutputLength: MAX_CLI_BYTES })), executableSHA256 = hash(executableBytes);
+    if (compressed.length !== policy.compressedSize || await hash(compressed) !== policy.compressedSHA256) throw fail();
+    const executableBytes = validatePE(await decompress(compressed, { maxOutputLength: MAX_CLI_BYTES })), executableSHA256 = await hash(executableBytes);
     if (executableBytes.length !== policy.executableSize || executableSHA256 !== policy.executableSHA256) throw fail();
     const codeBin = await directory(path.join(guardRoot, 'CodeBin')), target = path.join(codeBin, executableSHA256), executable = path.join(target, 'claude.exe');
     const manifestPayload = { version: 1, desktopVersion: policy.desktopVersion, codeVersion: policy.codeVersion, compressedSHA256: policy.compressedSHA256, sdkSHA256: policy.sdkSHA256, mainSHA256: policy.mainSHA256, executableSHA256, executableSize: executableBytes.length };
-    const manifest = { ...manifestPayload, manifestSHA256: hash(Buffer.from(JSON.stringify(manifestPayload))) }, manifestBytes = Buffer.from(JSON.stringify(manifest));
+    const manifest = { ...manifestPayload, manifestSHA256: await hash(Buffer.from(JSON.stringify(manifestPayload))) }, manifestBytes = Buffer.from(JSON.stringify(manifest));
     let exists = false;
     try { await fs.lstat(target); exists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (exists) {
       await safePath(target, true);
       const names = await fs.readdir(target); if (names.length !== 2 || !names.includes('claude.exe') || !names.includes('guard-code-manifest.json')) throw fail();
       const saved = await read(path.join(target, 'guard-code-manifest.json'), 16384), actual = validatePE(await read(executable, MAX_CLI_BYTES));
-      if (!saved.equals(manifestBytes) || actual.length !== executableBytes.length || hash(actual) !== executableSHA256) throw fail();
+      if (!saved.equals(manifestBytes) || actual.length !== executableBytes.length || await hash(actual) !== executableSHA256) throw fail();
     } else {
       staging = path.join(codeBin, 'Preparing-' + randomBytes(16).toString('hex'));
       await fs.mkdir(staging, { recursive: false, mode: 0o700 }); await safePath(staging, true);
       await fs.writeFile(path.join(staging, 'claude.exe'), executableBytes, { flag: 'wx', mode: 0o600 });
       await fs.writeFile(path.join(staging, 'guard-code-manifest.json'), manifestBytes, { flag: 'wx', mode: 0o600 });
       await fs.rename(staging, target); staging = undefined;
-      await safePath(target, true); if (hash(await read(executable, MAX_CLI_BYTES)) !== executableSHA256) throw fail();
+      await safePath(target, true); if (await hash(await read(executable, MAX_CLI_BYTES)) !== executableSHA256) throw fail();
     }
     const stateRoot = await directory(path.join(guardRoot, 'CodeState')), workspaceRoot = await directory(path.join(stateRoot, 'Workspace'));
     containerName = 'gate-code-' + randomBytes(12).toString('hex');

@@ -130,6 +130,11 @@ else {
         }; poll();
       })`);
       const out = process.env.GATE_SMOKE_OUT;
+      if (process.platform === 'win32') {
+        proof.nativeRoutesVerified = false;
+        try { await controller.routeFingerprint(); proof.nativeRoutesVerified = true; }
+        catch { proof.routeErrorCode = controller.routeErrorCode; }
+      }
       await window.webContents.executeJavaScript('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
       if (process.env.GATE_SMOKE_PNG) fs.writeFileSync(process.env.GATE_SMOKE_PNG, (await window.webContents.capturePage()).toPNG());
       if (process.env.GATE_SMOKE_PREPARE === '1') {
@@ -143,6 +148,7 @@ else {
         } catch (error) { proof.prepareError = safeError(error); }
       }
       const ok = proof.ready === 'true' && proof.api === 'function' && proof.discoveryDone === 'true' && proof.connectionModes.includes('network') && proof.connectionModes.includes('socks5') &&
+        (process.platform !== 'win32' || proof.nativeRoutesVerified === true) &&
         (process.env.GATE_EXPECT_CLAUDE !== '1' || proof.claudeFound) &&
         (process.env.GATE_SMOKE_PREPARE !== '1' || proof.runtimePrepared && proof.sourceSignatureValid);
       if (out) fs.writeFileSync(out, JSON.stringify({ ...proof, platform: process.platform, version: app.getVersion(), result: ok ? 'PASS' : 'FAIL' }, null, 2));
