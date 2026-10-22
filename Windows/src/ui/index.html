@@ -25,8 +25,8 @@
         <div class="row"><label>Часовой пояс<select id="timezone"><option>Europe/Amsterdam</option><option>Europe/London</option><option>Europe/Berlin</option><option>America/New_York</option><option>Etc/UTC</option></select></label><label>Язык<select id="language"><option>en-US</option><option>en-GB</option><option>nl-NL</option><option>de-DE</option><option>fr-FR</option></select></label></div>
         <div class="row"><label>Проверка IP<select id="interval"><option value="2">Каждые 2 секунды</option><option value="5">Каждые 5 секунд</option><option value="10">Каждые 10 секунд</option><option value="30">Каждые 30 секунд</option></select></label></div>
         <label class="check"><input type="checkbox" id="codeEnabled"> Claude Code в изоляции Guard</label>
-        <p class="hint">Работает в постоянной рабочей папке Guard. Файлы сохраняются после выхода.</p>
-        <button type="button" id="codeWorkspace" class="secondary small">Рабочая папка Code</button>
+        <p class="hint">Защищённая рабочая папка Code выбирается автоматически, если проект не указан. Файлы сохраняются после выхода. Code, Git и PowerShell работают с ограниченными правами, их сеть проходит через Guard.</p>
+        <button type="button" id="codeWorkspace" class="secondary small">Открыть защищённую папку Code</button>
         <label class="check"><input type="checkbox" id="captureBodies"> Показывать тела запросов и ответов</label>
         <p class="hint">Первый запуск проверяет страну и IP. Подтверждённая смена IP закрывает сессию. Сбой проверки, смена сети и сон приостанавливают трафик: прежний IP позволяет продолжить без перезапуска Claude.</p>
         <div class="actions"><button id="start" type="submit">Проверить и запустить</button><button id="stop" type="button" class="secondary" disabled>Остановить</button></div>

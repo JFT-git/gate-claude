@@ -6,7 +6,7 @@ const { execFile } = require('node:child_process');
 const run = promisify(execFile);
 const { parseArchive, addBootstrap, updatePEIntegrity, windowsBootstrap, hash } = require('./asar.cjs');
 const { powershell, psQuote } = require('./windows.cjs');
-const { findManagedCliSDK, patchManagedCliSDK, findManagedCliMain, patchManagedCliMain } = require('./managed-cli-patch.cjs');
+const { findManagedCliSDK, patchManagedCliSDK, findManagedCliMain, patchManagedCliMain, findManagedCliSessions, patchManagedCliSessions } = require('./managed-cli-patch.cjs');
 
 async function discoverClaude() {
   return (await require('./discovery.cjs').discoverClaude()).path;
@@ -32,11 +32,12 @@ async function prepareRuntime(sourcePath, root, bootstrapPath, onStatus = () => 
   const networkGuard = require('node:fs').readFileSync(path.join(__dirname, 'runtime-network-guard.cjs'), 'utf8');
   const extraEntries = [];
   if (codeEnabled) {
-    const sdk = findManagedCliSDK(parsed), codeMain = findManagedCliMain(parsed), mainDirectory = path.posix.dirname(metadata.main || '');
-    if (path.posix.dirname(sdk.filename) !== mainDirectory || path.posix.dirname(codeMain.filename) !== mainDirectory) throw Error('Неподдерживаемое расположение SDK Claude Code.');
+    const sdk = findManagedCliSDK(parsed), codeMain = findManagedCliMain(parsed), codeSessions = findManagedCliSessions(parsed), mainDirectory = path.posix.dirname(metadata.main || '');
+    if ([sdk, codeMain, codeSessions].some(item => path.posix.dirname(item.filename) !== mainDirectory)) throw Error('Неподдерживаемое расположение SDK Claude Code.');
     const transport = require('node:fs').readFileSync(path.join(__dirname, 'managed-cli.cjs'));
     extraEntries.push({ name: sdk.filename, source: patchManagedCliSDK(sdk.source) },
       { name: codeMain.filename, source: patchManagedCliMain(codeMain.source) },
+      { name: codeSessions.filename, source: patchManagedCliSessions(codeSessions.source) },
       { name: path.posix.join(mainDirectory, 'proxy-guard-managed-cli.cjs'), source: transport });
   }
   const base = await fs.readFile(bootstrapPath, 'utf8'), bootstrap = windowsBootstrap(base, networkGuard, { codeEnabled }), executable = await fs.readFile(source);

@@ -1,7 +1,7 @@
 {
   "name": "gate-claude",
   "productName": "Claude Proxy Guard",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Independent guarded network companion for an installed Claude Desktop",
   "author": "gate-claude contributors",
   "license": "MIT",
