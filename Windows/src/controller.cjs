@@ -387,9 +387,22 @@ class GuardController extends EventEmitter {
     }
     clearTimeout(this.pollTimer);
     const task = { epoch, revision: this.revalidationRevision || 0, started: performance.now() };
+    const rechecking = this.state === 'rechecking';
     const active = () => this.epoch === epoch && !this.policy.blocked && this.relay;
     const before = networkFingerprint(), relayPort = this.relay.port, checkToken = this.relay.checkToken;
     task.promise = (async () => {
+      // Reopening traffic requires an IP sample taken between two stable route
+      // snapshots. A concurrent route result may belong to a newer route than
+      // the IP request, even when no interface event increments the revision.
+      let beforeRoute;
+      if (rechecking) {
+        try { beforeRoute = await this.routeFingerprint(); }
+        catch {
+          if (active()) this.pauseForRevalidation('Не удалось проверить маршрут сети. Повторяем проверку.', false);
+          return;
+        }
+        if (!active()) return;
+      }
       // Validate an IP result as soon as it arrives; a slow route query cannot delay a confirmed kill.
       const address = this.requestIP(epoch, currentIP, relayPort, checkToken).then(result => {
         if (!active()) return null;
@@ -404,7 +417,9 @@ class GuardController extends EventEmitter {
         if (active()) this.pauseForRevalidation('Не удалось подтвердить закреплённый IP. Повторяем проверку.', false);
         throw error;
       });
-      const routes = Promise.resolve().then(() => this.routeFingerprint()).then(route => {
+      const routes = (rechecking
+        ? address.then(ip => active() && ip ? this.routeFingerprint() : null, () => null)
+        : Promise.resolve().then(() => this.routeFingerprint())).then(route => {
         if (active() && route !== this.route && this.state !== 'rechecking') {
           this.pauseForRevalidation('Изменился маршрут сети. Проверяем закреплённый IP.');
         }
@@ -427,6 +442,10 @@ class GuardController extends EventEmitter {
       }
       // An event arriving during the request requires a fresh answer after that event.
       if (task.revision !== (this.revalidationRevision || 0)) return;
+      if (rechecking && beforeRoute !== route.value) {
+        this.pauseForRevalidation('Во время проверки изменился маршрут сети. Проверяем IP повторно.');
+        return;
+      }
       if (route.value !== this.route && this.state !== 'rechecking') {
         this.pauseForRevalidation('Изменился маршрут сети. Проверяем закреплённый IP.');
         return;
