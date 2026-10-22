@@ -20,6 +20,7 @@ child.spawn = () => { launches++; throw Error('The cancelled runtime must not be
 class Relay extends EventEmitter {
   constructor() { super(); this.port = 12345; this.checkToken = 'fixture'; this.closed = false; this.unlocks = 0; relayInstances.push(this); }
   async start() { return this.port; }
+  pinIPFamily(family) { this.ipFamily = family; }
   unlock() { this.unlocks++; }
   pause() {}
   close() { this.closed = true; }
@@ -37,6 +38,8 @@ class Fence extends EventEmitter {
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gate-fence-startup-'));
   const controller = new GuardController(root, root); controller.routeFingerprint = async () => '';
+  controller.networkProxyConfiguration = async () => Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) });
+  controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: '203.0.113.7', country_code: 'NL' });
   relayInstances = []; launches = 0;
   t.after(async () => { controller.stop(); await fs.rm(root, { recursive: true, force: true }); });
   return controller;

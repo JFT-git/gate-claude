@@ -93,7 +93,7 @@ for (const mode of ['signal', 'inactive', 'relay-close']) test(mode + ' cancels 
   await rejected; assert.deepEqual(contents(root), [sha256(body)]); assert.deepEqual(fs.readdirSync(path.join(root, 'CodeAssets', sha256(body))), []);
 });
 test('locked or paused actual Guard relay denies asset traffic without a control exception', async t => {
-  const root = await directory(t), relay = new NetworkRelay(), h = load(); await relay.start(); t.after(() => relay.close());
+  const root = await directory(t), relay = new NetworkRelay(), h = load(); await relay.start(); relay.pinIPFamily(4); t.after(() => relay.close());
   for (const paused of [false, true]) { if (paused) { relay.unlock(); relay.pause(); } await assert.rejects(h.api.ensureNativeCodeAsset(root, relay.port, { active: () => true }), denied); }
   assert.equal(h.tlsCalls.length, 0); assert.equal(relay.controlSockets.size, 0);
 });

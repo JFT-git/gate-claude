@@ -55,7 +55,8 @@ checker.currentIP = async () => {
 };
 policyModule.networkFingerprint = () => context.fingerprint || 'fixture-network';
 class Relay extends EventEmitter {
-  constructor() { super(); this.owner = context; this.port = 12345; this.unlocked = false; this.closed = false; this.checkToken = 'b'.repeat(64); this.owner.relay = this; }
+  constructor(options) { super(); this.owner = context; this.upstream = options?.upstream; this.port = 12345; this.unlocked = false; this.closed = false; this.checkToken = 'b'.repeat(64); this.owner.relay = this; }
+  pinIPFamily(family) { this.ipFamily = family; this.owner.events.push('family-pin'); }
   async start() { this.owner.events.push('relay-listen'); return this.port; }
   unlock() { this.unlocked = true; this.owner.events.push('relay-unlock'); }
   resume() { this.unlock(); }
@@ -142,6 +143,9 @@ async function fixture(t) {
   c.tools = { toolRoots: ['C:\\Guard\\CodeTools\\Git-' + 'e'.repeat(64), 'C:\\Guard\\CodeTools\\PowerShell-' + 'f'.repeat(64)],
     environment: { PATH: 'C:\\Guard\\CodeTools\\Git-' + 'e'.repeat(64) + '\\cmd;C:\\Guard\\CodeTools\\PowerShell-' + 'f'.repeat(64), GIT_CONFIG_NOSYSTEM: '1' } };
   context = c; c.controller = new GuardController(root, root); c.controller.routeFingerprint = async () => '';
+  c.proxyDescriptor = Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) });
+  c.controller.networkProxyConfiguration = async () => c.proxyDescriptor;
+  c.controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: hostname === 'claude.ai' ? '203.0.113.20' : '203.0.113.21', country_code: 'NL' });
   t.after(async () => {
     c.runtimePending?.resolve(); c.assetPending?.resolve(); c.filesPending?.resolve(); c.toolsPending?.resolve(); c.fencePending?.resolve(); c.fenceClosePending?.resolve();
     c.controller.stop(); for (const process of c.processes) process.finish(0);
@@ -199,6 +203,52 @@ test('CodeGate is active only for the current runtime, matching fence proof, pin
   const policy = controller.policy; controller.policy = { blocked: false, pinned: null };
   assert.equal(c.gate.active(), null); controller.policy = policy;
   controller.policy.block(); assert.equal(c.gate.active(), null);
+});
+test('Code captures the static system proxy and pins family and both destination exits before downloading', async t => {
+  const c = await fixture(t);
+  c.proxyDescriptor = Object.freeze({ kind: 'http', host: '127.0.0.1', port: 9697, fingerprint: 'e'.repeat(64) });
+  c.onAssetDownload = () => {
+    assert.equal(c.controller.destinationPolicies.size, 2); assert.equal(c.relay.ipFamily, 4);
+    assert.equal(c.controller.destinationPolicies.get('claude.ai').pinned, '203.0.113.20');
+    return { path: c.assetPath };
+  };
+  await c.controller.start(input);
+  assert.deepEqual(c.relay.upstream, c.proxyDescriptor); assert.equal(Object.isFrozen(c.relay.upstream), true);
+  assert.ok(c.events.indexOf('family-pin') < c.events.indexOf('current-ip'));
+  assert.equal(c.hostSpawns, 1); assert.equal(c.controller.policy.blocked, false);
+});
+test('an initial RU destination prevents every Code download and guest launch', async t => {
+  const c = await fixture(t);
+  c.controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: '203.0.113.20', country_code: 'RU' });
+  await c.controller.start(input);
+  assert.equal(c.controller.state, 'blocked'); assert.equal(c.assetCalls, 0); assert.equal(c.fenceCalls, 0); assert.equal(c.hostSpawns, 0);
+});
+test('stable mixed-family destination exits are pinned independently before Code starts', async t => {
+  const c = await fixture(t);
+  c.controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: hostname === 'claude.ai' ? '2001:db8::20' : '203.0.113.21', country_code: 'NL' });
+  await c.controller.start(input); await c.controller.poll(c.controller.epoch);
+  assert.equal(c.controller.policy.pinned, '203.0.113.7');
+  assert.equal(c.controller.destinationPolicies.get('claude.ai').pinned, '2001:db8::20');
+  assert.equal(c.controller.destinationPolicies.get('api.anthropic.com').pinned, '203.0.113.21');
+  assert.equal(c.hostSpawns, 1); assert.equal(c.controller.policy.blocked, false); assert.equal(c.relay.unlocked, true);
+});
+test('the final Code confirmation checks destination exits even when its route read fails', async t => {
+  const c = await fixture(t), normal = c.controller.requestDestinationIP; let routes = 0;
+  c.controller.routeFingerprint = async () => { if (++routes > 1) throw Error('fixture route timeout'); return 'route-A'; };
+  c.controller.requestDestinationIP = async (...args) => {
+    const result = await normal(...args);
+    return c.fenceCalls && result.hostname === 'claude.ai' ? { ...result, ip: '203.0.113.22' } : result;
+  };
+  await c.controller.start(input); await until(() => c.cleanups === 1);
+  assert.equal(c.controller.state, 'blocked'); assert.equal(c.hostSpawns, 0); assert.equal(c.gate.closed, true);
+  assert.ok(c.controller.events.some(event => event.kind === 'blocked' && event.message.includes('маршрута Claude изменился')));
+});
+test('a removed system proxy during WFP approval prevents the final Code launch', async t => {
+  const c = await fixture(t);
+  c.proxyDescriptor = Object.freeze({ kind: 'http', host: '127.0.0.1', port: 9697, fingerprint: 'e'.repeat(64) });
+  c.controller.networkProxyConfiguration = async () => c.fenceCalls ? { kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) } : c.proxyDescriptor;
+  await c.controller.start(input); await until(() => c.cleanups === 1);
+  assert.equal(c.controller.state, 'blocked'); assert.equal(c.hostSpawns, 0); assert.equal(c.gate.closed, true);
 });
 test('gate closes first, and the AppContainer profile is deleted only after host exit and confirmed fence drain', async t => {
   const c = await fixture(t); c.holdHostExit = true; c.fenceClosePending = deferred(); await c.controller.start(input);
@@ -445,6 +495,50 @@ test('a changed IP in the final post-WFP check closes the gate and never launche
   await c.controller.start(input); await until(() => c.cleanups === 1);
   assert.equal(c.controller.state, 'blocked'); assert.equal(c.hostSpawns, 0); assert.equal(c.gate.closed, true);
   assert.ok(c.events.indexOf('fence-prepare') < c.events.lastIndexOf('current-ip'));
+});
+
+test('a failed prelaunch route read cannot suppress a changed IP or launch Code', async t => {
+  const c = await fixture(t); let routes = 0;
+  c.controller.routeFingerprint = async () => { if (++routes > 1) throw Error('fixture route timeout'); return 'route-A'; };
+  c.onCurrentIP = () => ({ ip: c.ipChecks >= 3 ? '203.0.113.8' : '203.0.113.7' });
+  await c.controller.start(input); await until(() => c.cleanups === 1);
+  assert.equal(c.ipChecks, 3); assert.equal(routes, 2); assert.equal(c.hostSpawns, 0);
+  assert.equal(c.controller.state, 'blocked'); assert.equal(c.gate.closed, true); assert.equal(c.relay.closed, true);
+  assert.ok(c.controller.events.some(event => event.kind === 'blocked' && event.message.includes('Внешний IP изменился')));
+});
+
+test('repeated prelaunch route failures still inspect unchanged IP and never reopen or launch Code', async t => {
+  const c = await fixture(t); let routes = 0;
+  c.controller.routeFingerprint = async () => { if (++routes > 1) throw Error('fixture route timeout'); return 'route-A'; };
+  await c.controller.start(input); await until(() => c.cleanups === 1);
+  assert.equal(c.ipChecks, 5); assert.equal(routes, 4); assert.equal(c.hostSpawns, 0);
+  assert.equal(c.controller.state, 'blocked'); assert.equal(c.gate.closed, true); assert.equal(c.relay.closed, true);
+  assert.equal(c.events.slice(c.events.indexOf('relay-pause') + 1).includes('relay-unlock'), false);
+  assert.equal(c.controller.events.some(event => event.message.includes('Внешний IP изменился')), false);
+});
+
+test('a temporary prelaunch route failure requires a fresh successful route-IP-route bracket', async t => {
+  const c = await fixture(t), order = []; let routes = 0;
+  c.controller.routeFingerprint = async () => {
+    if (++routes === 2) { order.push('route-error'); throw Error('fixture route timeout'); }
+    order.push('route'); return 'route-A';
+  };
+  c.onCurrentIP = () => { order.push('ip'); return { ip: '203.0.113.7' }; };
+  await c.controller.start(input);
+  assert.equal(c.ipChecks, 4); assert.equal(c.hostSpawns, 1); assert.equal(c.controller.policy.blocked, false);
+  assert.equal(c.relay.unlocked, true);
+  assert.deepEqual(order, ['route', 'ip', 'route-error', 'ip', 'route', 'ip', 'route']);
+});
+
+test('stop after a failed prelaunch route read rejects the late unchanged IP without launching Code', async t => {
+  const c = await fixture(t), answer = deferred(); let routes = 0;
+  c.controller.routeFingerprint = async () => { if (++routes > 1) throw Error('fixture route timeout'); return 'route-A'; };
+  c.onCurrentIP = () => c.ipChecks === 3 ? answer.promise : { ip: '203.0.113.7' };
+  const starting = c.controller.start(input); await until(() => c.ipChecks === 3);
+  c.controller.stop(); const stoppedEpoch = c.controller.epoch; answer.resolve({ ip: '203.0.113.7' }); await starting;
+  assert.equal(c.controller.epoch, stoppedEpoch); assert.equal(c.controller.state, 'blocked'); assert.equal(c.hostSpawns, 0);
+  assert.equal(c.gate.closed, true); assert.equal(c.relay.closed, true);
+  assert.equal(c.events.slice(c.events.indexOf('relay-pause') + 1).includes('relay-unlock'), false);
 });
 
 test('stable-IP interface and route transitions are freshly rechecked before launch without blocking the session', async t => {
