@@ -3,6 +3,7 @@ const { app, BrowserWindow, ipcMain, dialog, powerMonitor, shell } = require('el
 const fs = require('node:fs');
 const path = require('node:path');
 const { GuardController } = require('./controller.cjs');
+const { NetworkFence } = require('./fence.cjs');
 const { discoverClaude } = require('./discovery.cjs');
 const { prepareRuntime } = require('./runtime.cjs');
 const { validateSettings } = require('./policy.cjs');
@@ -101,6 +102,7 @@ else {
     });
     handle('stop', () => { controller.stop(); return controller.snapshot(); });
     handle('restart', async () => {
+      if (NetworkFence.approvalPending) throw Error('Сначала ответьте на системный запрос Windows. Для отмены запуска выберите «Нет», затем перезапустите Guard.');
       const host = controller.host; controller.stop();
       if (host && host.exitCode == null) await Promise.race([new Promise(resolve => host.once('exit', resolve)), new Promise(resolve => setTimeout(resolve, 1500))]);
       app.relaunch(); app.exit(0);

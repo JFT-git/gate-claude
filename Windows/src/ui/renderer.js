@@ -37,6 +37,8 @@ function showState(value) {
   state = value;
   $('state').textContent = ({ idle: 'Готов к проверке', checking: 'Проверка подключения', starting: 'Проверяем профиль Claude', rechecking: 'Трафик приостановлен', running: 'Claude под защитой Guard', blocked: 'Сессия закрыта' })[value.state] || value.state;
   $('message').textContent = value.message; $('lamp').className = 'lamp ' + value.state;
+  $('restart').disabled = value.windowsApprovalPending === true;
+  $('approvalHint').hidden = value.windowsApprovalPending !== true;
   $('country').textContent = value.country ? value.country + ' · ' + (value.exitIP || 'IP закреплён') : 'IP не закреплён';
   const busy = value.state !== 'idle';
   for (const id of fields) $(id).disabled = busy;
@@ -89,7 +91,11 @@ $('protocolCheck').addEventListener('click', async () => {
 });
 $('mode').addEventListener('change', () => { if ($('mode').value === 'network') $('password').value = ''; connectionMode(); });
 $('stop').addEventListener('click', () => window.guard.stop());
-$('restart').addEventListener('click', () => { $('restart').disabled = true; window.guard.restart(); });
+$('restart').addEventListener('click', async () => {
+  $('restart').disabled = true;
+  try { if (error(await window.guard.restart())) $('restart').disabled = state?.windowsApprovalPending === true; }
+  catch { $('message').textContent = 'Не удалось перезапустить Guard. Повторите после ответа на запрос Windows.'; $('restart').disabled = state?.windowsApprovalPending === true; }
+});
 $('export').addEventListener('click', async () => error(await window.guard.export()));
 function tab(traffic) {
   $('traffic').hidden = !traffic; $('logs').hidden = traffic;

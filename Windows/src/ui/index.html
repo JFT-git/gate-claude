@@ -10,7 +10,7 @@
 <body>
 <header><div class="brand"><span class="shield">G</span><div><h1>Claude Proxy Guard</h1><span class="muted">Контроль подключения · Windows <span id="version"></span></span></div></div><button id="restart" class="secondary">Перезапустить Guard</button></header>
 <main>
-  <section class="status" aria-live="polite"><span id="lamp" class="lamp"></span><div><strong id="state">Готов к проверке</strong><p id="message">Выберите текущую сеть / VPN или SOCKS5.</p></div><span id="country" class="pill">IP не закреплён</span></section>
+  <section class="status" aria-live="polite"><span id="lamp" class="lamp"></span><div><strong id="state">Готов к проверке</strong><p id="message">Выберите текущую сеть / VPN или SOCKS5.</p><p id="approvalHint" class="muted" hidden>Ответьте на системный запрос Windows. Чтобы отменить запуск, выберите в нём «Нет». После ответа станет доступен перезапуск Guard.</p></div><span id="country" class="pill">IP не закреплён</span></section>
   <div class="columns">
     <section class="panel connection"><h2>Подключение</h2>
       <form id="settings">
