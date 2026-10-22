@@ -16,7 +16,9 @@ async function restrictRoot(root) {
   if (process.platform !== 'win32') return;
   const sid = await powershell('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value');
   if (!/^S-1-5-\d+(?:-\d+)+$/.test(sid)) throw Error('Не удалось проверить владельца папки Guard.');
-  await run(path.join(process.env.SystemRoot, 'System32', 'icacls.exe'), [root, '/inheritance:r', '/grant:r', '*' + sid + ':(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F'], { windowsHide: true, timeout: 15000 });
+  // Windows propagates inheritable grants to an existing profile and Code tools.
+  // Keep a bounded wait, but allow the same 120-second setup budget as the fence.
+  await run(path.join(process.env.SystemRoot, 'System32', 'icacls.exe'), [root, '/inheritance:r', '/grant:r', '*' + sid + ':(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F'], { windowsHide: true, timeout: 120000 });
 }
 
 async function prepareRuntime(sourcePath, root, bootstrapPath, onStatus = () => {}, options = {}) {
