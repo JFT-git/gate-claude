@@ -132,6 +132,36 @@ function brokerEnvironment() {
   }
   return output;
 }
+function configureLocalSessions(api) {
+  if (!installed || !ownObject(api) || typeof api.start !== 'function') throw denied();
+  const workspace = installed.code.workspaceRoot;
+  return { ...api,
+    start(info) {
+      if (!ownObject(info)) throw denied();
+      const descriptors = Object.getOwnPropertyDescriptors(info);
+      if (Object.values(descriptors).some(item => !('value' in item))) throw denied();
+      // Resolve "No folder" before the vendor creates session metadata or builds
+      // its SDK options. Redirecting only the final spawn would leave the model,
+      // transcript and file tools pointing at the user's home directory.
+      if (info.remoteTarget != null || info.sshConfig != null) throw denied();
+      const requested = info.cwd;
+      if (requested !== undefined && !text(requested)) throw denied();
+      const cwd = requested === undefined || !requested.trim() ? workspace : absolute(requested);
+      if (cwd.toLowerCase() !== workspace.toLowerCase() && !cwd.toLowerCase().startsWith(workspace.toLowerCase() + '\\')) {
+        const error = Error(WORKSPACE_FAILURE); error.code = 'ERR_GUARD_CODE_WORKSPACE_REQUIRED'; throw error;
+      }
+      return api.start.call(api, { ...info, cwd });
+    },
+    // The renderer negotiates a directory through this legacy RPC before start.
+    // Return the real persistent folder, without minting/registering scratch
+    // data. Pinned vendor recognition/cleanup only accepts Profile's separate
+    // scratch-workspaces scope; CodeState/Workspace is outside that scope.
+    createScratchWorkspace: async () => ({ cwd: workspace }),
+    // Optional prewarms still create disposable directories and spare processes.
+    prewarmFolderless: async () => ({ refusedReason: 'unavailable' }),
+    prewarmLocal: async () => ({ refusedReason: 'unavailable' })
+  };
+}
 function spawnManaged(options) {
   let child;
   try {
@@ -210,4 +240,4 @@ function runManagedCommand(command, args, options = {}) {
     } catch (error) { try { child?.kill(); } catch {} finish(error?.code ? error : denied()); }
   });
 }
-module.exports = { initCodeTransport, spawnManaged, runManagedCommand, resolveManagedCliPath, mergeManagedSettings, MAX_PACKET_BYTES };
+module.exports = { initCodeTransport, spawnManaged, runManagedCommand, resolveManagedCliPath, mergeManagedSettings, configureLocalSessions, MAX_PACKET_BYTES };

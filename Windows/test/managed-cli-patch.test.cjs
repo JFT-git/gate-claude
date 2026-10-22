@@ -51,6 +51,83 @@ const PREFIX = '"use strict";const __gateCli=require("./proxy-guard-managed-cli.
 const HOST_PRESEED = 'async getHostPreseedInPlacePath(){if(!pi()||this.skipPreseedThisProcess)return null;let e=this.getHostTarget();return BHr(e.platform,e.binaryName)}';
 const COMPRESSED_SHA = 'aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81';
 const MANAGED_PRESEED = 'async getHostPreseedInPlacePath(){let e=this.getHostTarget();if(e.platform!=="win32-x64"||this.targetVersion!=="2.1.304"||this.expectedChecksumForTarget(e)!=="' + COMPRESSED_SHA + '")throw Error("Unsupported Claude Code version; protected launch is unavailable.");return __gateCli.resolveManagedCliPath(this.getBinaryPathForTarget(e,this.targetVersion))}';
+const SESSIONS_FACTORY = 'function Kt(e,t){let n={...t};';
+function sessionsFixture(extra = '') {
+  const source = SESSIONS_FACTORY + 'return n}exports.createLocalSessionsApi=(api)=>Kt({},api);' + extra;
+  return Buffer.concat([Buffer.from(source), Buffer.alloc(P.SESSIONS_BYTES - Buffer.byteLength(source), 32)]);
+}
+function sessionsArchive(bytes = sessionsFixture()) {
+  return { header: { files: { '.vite': { files: { build: { files: { 'index.chunk-CFHSNuch.js': { size: P.SESSIONS_BYTES } } } } } } }, read: filename => { assert.equal(filename, P.SESSIONS_FILE); return bytes; } };
+}
+test('local session adapter requires the exact pinned module and one factory anchor', () => {
+  for (const value of [null, 'source', Buffer.from('unknown'), sessionsFixture()]) assert.throws(() => P.patchManagedCliSessions(value), /Unsupported/);
+  const p = transformerWithDigestFixture(P.SESSIONS_SHA256), changed = p.patchManagedCliSessions(sessionsFixture());
+  new vm.Script(changed.toString());
+  for (const extra of [SESSIONS_FACTORY, '__gateCli']) assert.throws(() => p.patchManagedCliSessions(sessionsFixture('/*' + extra + '*/')), /Unsupported/);
+  assert.throws(() => p.patchManagedCliSessions(Buffer.from(sessionsFixture().toString().replace(SESSIONS_FACTORY, ' '.repeat(SESSIONS_FACTORY.length)))), /Unsupported/);
+  assert.throws(() => p.patchManagedCliSessions(changed), /Unsupported/);
+});
+test('local session factory receives the Guard adapter before exposing any API methods', () => {
+  const p = transformerWithDigestFixture(P.SESSIONS_SHA256), events = [], module = { exports: {} };
+  vm.runInNewContext(p.patchManagedCliSessions(sessionsFixture()).toString(), { module, exports: module.exports, require: name => {
+    assert.equal(name, './proxy-guard-managed-cli.cjs'); return { configureLocalSessions: api => { events.push(api); return { ...api, guarded: true }; } };
+  } });
+  const api = { start() {} }, wrapped = module.exports.createLocalSessionsApi(api);
+  assert.equal(events[0], api); assert.equal(wrapped.guarded, true); assert.equal(wrapped.start, api.start);
+});
+test('local session selection refuses linked, unpacked, renamed or changed modules', () => {
+  const p = transformerWithDigestFixture(P.SESSIONS_SHA256);
+  assert.equal(p.findManagedCliSessions(sessionsArchive()).filename, P.SESSIONS_FILE);
+  for (const level of ['.vite', 'build', 'index.chunk-CFHSNuch.js']) for (const attribute of ['link', 'unpacked']) {
+    const a = sessionsArchive(); let entry = a.header.files['.vite']; if (level !== '.vite') entry = entry.files.build; if (level === 'index.chunk-CFHSNuch.js') entry = entry.files[level];
+    entry[attribute] = attribute === 'link' ? '../outside' : true; assert.throws(() => p.findManagedCliSessions(a), /Unsupported/);
+  }
+  const bad = sessionsArchive(); bad.header.files['.vite'].files.build.files['index.chunk-CFHSNuch.js'].size--; assert.throws(() => p.findManagedCliSessions(bad), /Unsupported/);
+  assert.throws(() => P.findManagedCliSessions(sessionsArchive()), /Unsupported/);
+});
+test('the installed original local session factory passes its real digest and retains vendor lifecycle guards', t => {
+  const file = path.resolve(__dirname, '../../../../work/windows/source/app/resources/app.asar'); if (!fs.existsSync(file)) return t.skip('Original vendor source cache is not distributed.');
+  const archive = require('../src/asar.cjs').parseArchive(fs.readFileSync(file)), item = P.findManagedCliSessions(archive), changed = P.patchManagedCliSessions(item.source).toString();
+  new vm.Script(changed); assert.equal(item.sha256, P.SESSIONS_SHA256);
+  assert.equal(changed, PREFIX + item.source.toString().replace(SESSIONS_FACTORY, 'function Kt(e,t){t=__gateCli.configureLocalSessions(t);let n={...t};'));
+  for (const marker of ['isHiddenPrewarm', 'isParkedSession', 'saveWorkspaceTrust', 'startSession(f,']) assert.equal(changed.split(marker).length, item.source.toString().split(marker).length);
+});
+test('scratch lifecycle selection rejects unknown bytes, links, unpacked entries and size changes', () => {
+  const bytes = Buffer.alloc(P.SCRATCH_BYTES, 32);
+  function fixture() { return { header: { files: { '.vite': { files: { build: { files: { 'index.chunk-zA4nMcEF.js': { size: P.SCRATCH_BYTES } } } } } } }, read: () => bytes }; }
+  assert.throws(() => P.findManagedCliScratch(fixture()), /Unsupported/);
+  const p = transformerWithDigestFixture(P.SCRATCH_SHA256);
+  assert.equal(p.findManagedCliScratch(fixture()).filename, P.SCRATCH_FILE);
+  for (const level of ['.vite', 'build', 'index.chunk-zA4nMcEF.js']) for (const attribute of ['link', 'unpacked']) {
+    const a = fixture(); let entry = a.header.files['.vite']; if (level !== '.vite') entry = entry.files.build; if (level === 'index.chunk-zA4nMcEF.js') entry = entry.files[level];
+    entry[attribute] = attribute === 'link' ? '../outside' : true; assert.throws(() => p.findManagedCliScratch(a), /Unsupported/);
+  }
+  const bad = fixture(); bad.header.files['.vite'].files.build.files['index.chunk-zA4nMcEF.js'].size--; assert.throws(() => p.findManagedCliScratch(bad), /Unsupported/);
+});
+test('actual pinned vendor scratch recognition and removal never classify or delete the permanent Workspace', async t => {
+  const file = path.resolve(__dirname, '../../../../work/windows/source/app/resources/app.asar'); if (!fs.existsSync(file)) return t.skip('Original vendor source cache is not distributed.');
+  const archive = require('../src/asar.cjs').parseArchive(fs.readFileSync(file)), main = P.findManagedCliMain(archive).source.toString(), scratch = P.findManagedCliScratch(archive);
+  const begin = main.indexOf('var ACr="scratch-workspaces";'), end = main.indexOf('var ICr=', begin); assert.ok(begin > 0 && end > begin);
+  const profile = 'C:\\Guard\\Profile', workspace = 'C:\\Guard\\CodeState\\Workspace', context = { n: path.win32, a: { app: { getPath: () => profile } } };
+  vm.runInNewContext(main.slice(begin, end) + ';globalThis.recognize=MCr;globalThis.isScratch=NCr;globalThis.matchesScratch=FCr;', context);
+  const calls = [], module = { exports: {} };
+  vm.runInNewContext(scratch.source.toString(), { module, exports: module.exports, process: { env: {} }, require: name => {
+    if (name === './index.chunk-7dsQFims.js') return { yO: context.recognize, WD: async paths => calls.push(['forget', ...paths]) };
+    if (name === 'node:fs/promises') return { rm: async (cwd, options) => calls.push(['remove', cwd, options.recursive, options.force]) };
+    if (name === 'node:path') return path.win32;
+    if (name.startsWith('./') || name === 'electron') return {};
+    return require(name);
+  } });
+  for (const cwd of [workspace, workspace + '\\project', profile, profile + '\\scratch-workspaces-other\\account\\org\\scratch-2026-10-22-aabbcc']) {
+    assert.equal(context.recognize(cwd), null); assert.equal(context.isScratch(cwd), false); assert.equal(context.matchesScratch(cwd), false);
+    await module.exports.removeScratchWorkspace(cwd);
+  }
+  assert.deepEqual(calls, [], 'Persistent directory must never reach removal or trust-forgetting');
+  const disposable = path.win32.join(profile, 'scratch-workspaces', 'account', 'org', 'scratch-2026-10-22-aabbcc');
+  assert.equal(context.recognize(disposable), disposable); assert.equal(context.isScratch(disposable), true); assert.equal(context.matchesScratch(disposable), true);
+  await module.exports.removeScratchWorkspace(disposable);
+  assert.deepEqual(calls, [['remove', disposable, true, true], ['forget', disposable]], 'Positive control exercises the real vendor removal guard');
+});
 function expectedMainPatch(source) { return PREFIX + source.replace(PLUGIN_RUN, PLUGIN_RUN.replace('Yf(', '__gateCli.runManagedCommand(')).replace(HOST_PRESEED, MANAGED_PRESEED); }
 function mainFixture(extra = '') {
   const source = 'async function hAa(e,t={}){const i=t.command,a="identity";' + PLUGIN_AUTH + 'const r=t.timeout??3e4,s="vendor-path";return await ' + PLUGIN_RUN + '}function unrelated(){return Yf("other.exe",[],{})}class CodeManager{' + HOST_PRESEED + '}' + extra;

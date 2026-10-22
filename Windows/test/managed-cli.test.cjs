@@ -189,6 +189,46 @@ test('projects inside the permanent workspace retain their canonical working dir
   }
 });
 
+test('folderless Code sessions resolve the permanent workspace before the vendor builds session state', () => {
+  const h = harness(), calls = [], api = { start(info) { assert.equal(this, api); calls.push(info); return { sessionId: 'owned-session', cwd: info.cwd }; }, getSession: () => 'unchanged' };
+  const protectedApi = h.api.configureLocalSessions(api);
+  for (const cwd of [undefined, '', ' \t\r\n ']) {
+    const input = { cwd, message: 'owned prompt', model: 'kept', permissionMode: 'plan' }, before = { ...input };
+    const value = protectedApi.start(input);
+    assert.equal(value.cwd, config().stateRoot + '\\Workspace'); assert.deepEqual(input, before);
+    assert.equal(calls.at(-1).message, input.message); assert.equal(calls.at(-1).permissionMode, 'plan'); assert.equal(calls.at(-1).model, 'kept');
+  }
+  assert.equal(protectedApi.getSession(), 'unchanged');
+  const nested = config().stateRoot + '\\Workspace\\project';
+  assert.equal(protectedApi.start({ cwd: nested }).cwd, nested);
+});
+
+test('automatic workspace selection never redirects an explicit outside path or remote target', () => {
+  const h = harness(), calls = [], api = h.api.configureLocalSessions({ start: info => calls.push(info) });
+  for (const cwd of ['C:\\Users\\owner', config().stateRoot, config().stateRoot + '\\Workspace-other', config().stateRoot + '\\Workspace\\..\\Other', '~', '..\\outside', null, 1]) assert.throws(() => api.start({ cwd }));
+  for (const input of [{ cwd: '', sshConfig: {} }, { cwd: '', remoteTarget: { kind: 'ssh' } }, null, []]) assert.throws(() => api.start(input));
+  let getters = 0; const info = { get cwd() { getters++; return ''; } }; rejects(() => api.start(info));
+  assert.equal(calls.length, 0); assert.equal(getters, 0);
+  const fresh = load(); rejects(() => fresh.api.configureLocalSessions({ start() {} }));
+});
+
+test('protected sessions decline optional disposable prewarms without creating or relabelling the permanent folder', async () => {
+  const h = harness(), api = h.api.configureLocalSessions({ start: info => info, prewarmFolderless() { assert.fail('No disposable prewarm'); }, prewarmLocal() { assert.fail('No spare CLI'); }, createScratchWorkspace() { assert.fail('No scratch folder'); } });
+  for (const method of ['prewarmFolderless', 'prewarmLocal']) assert.deepEqual(await api[method]({ cwd: '' }), { refusedReason: 'unavailable' });
+  const info = api.start({ cwd: '', message: 'kept' }); assert.equal(info.cwd, config().stateRoot + '\\Workspace'); assert.equal(info.isScratchWorkspace, undefined);
+});
+
+test('renderer folderless directory negotiation resolves Workspace before its required start call', async () => {
+  const h = harness(), calls = [], api = h.api.configureLocalSessions({ start: info => { calls.push(info); return { sessionId: 'real-start' }; }, createScratchWorkspace() { assert.fail('No temporary directory may be minted'); } });
+  const directory = await api.createScratchWorkspace();
+  assert.deepEqual(directory, { cwd: config().stateRoot + '\\Workspace' });
+  assert.equal(calls.length, 0, 'Directory negotiation must not create a hidden session');
+  assert.deepEqual(api.start({ cwd: directory.cwd, message: 'owned request' }), { sessionId: 'real-start' });
+  assert.equal(calls[0].cwd, directory.cwd); assert.equal(calls[0].isScratchWorkspace, undefined);
+  directory.cwd = 'C:\\Outside';
+  assert.equal((await api.createScratchWorkspace()).cwd, config().stateRoot + '\\Workspace', 'Returned objects cannot change the immutable directory');
+});
+
 
 test('vendor readiness resolves only an approved immutable cache identity without reading a profile or downloading', () => {
   const h = load(), cfg = config();
