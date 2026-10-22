@@ -3,9 +3,10 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
+const http = require('node:http');
 const dns = require('node:dns');
 const { once } = require('node:events');
-const { NetworkRelay, SOCKSRelay } = require('../src/relay.cjs');
+const { NetworkRelay, SOCKSRelay, SocketReader } = require('../src/relay.cjs');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(predicate, message) { const end = Date.now() + 1500; while (!predicate()) { if (Date.now() > end) assert.fail(message); await delay(5); } }
 async function server(t, handler) {
@@ -17,23 +18,105 @@ async function open(t, port) { const socket = net.createConnection({ host: '127.
 function response(socket) { return new Promise(resolve => { const chunks = []; socket.on('data', chunk => chunks.push(chunk)); const done = () => resolve(Buffer.concat(chunks)); socket.once('end', done).once('close', done); }); }
 async function exchange(t, relay, bytes) { const socket = await open(t, relay.port), result = response(socket); socket.write(bytes); return { socket, bytes: await result }; }
 function split(bytes) { const end = bytes.indexOf('\r\n\r\n'); return { header: bytes.subarray(0, end).toString('latin1'), body: bytes.subarray(end + 4) }; }
+async function httpOrigin(t, handler) {
+  const peers = new Set(), ended = [], s = http.createServer(handler);
+  s.on('connection', socket => {
+    peers.add(socket); const chunks = []; socket.on('data', chunk => chunks.push(chunk));
+    socket.getFixtureBytes = () => Buffer.concat(chunks);
+    socket.on('error', () => {}); socket.once('end', () => ended.push(socket)); socket.once('close', () => peers.delete(socket));
+  });
+  s.listen(0, '127.0.0.1'); await once(s, 'listening');
+  t.after(async () => { for (const socket of peers) socket.destroy(); if (s.listening) await new Promise(resolve => s.close(resolve)); });
+  return { port: s.address().port, peers, ended, server: s };
+}
 async function origin(t, hold = false) {
-  const requests = [], ended = []; const peer = await server(t, socket => { const chunks = []; socket.on('data', chunk => chunks.push(chunk)); socket.on('end', () => { const all = Buffer.concat(chunks); requests.push(all); ended.push(socket); if (!hold) socket.end('HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello'); }); socket.getFixtureBytes = () => Buffer.concat(chunks); }); return { ...peer, requests, ended };
+  const requests = [], peer = await httpOrigin(t, (request, reply) => {
+    request.on('error', () => {}); request.resume();
+    request.once('end', () => { requests.push(request.socket.getFixtureBytes()); if (!hold) { reply.writeHead(200, { 'Content-Length': 5 }); reply.end('hello'); } });
+  }); return { ...peer, requests };
 }
 async function socks(t, hold = '', refusal = false) {
+  const httpServer = http.createServer((request, reply) => { request.on('error', () => {}); request.resume(); request.once('end', () => { reply.writeHead(200, { 'Content-Length': 2 }); reply.end('ok'); }); });
   const targets = [], greetings = [], application = []; const peer = await server(t, socket => {
-    let pending = Buffer.alloc(0), state = 'greeting'; const chunks = [];
+    let pending = Buffer.alloc(0), state = 'greeting';
     const parse = () => {
       if (state === 'greeting' && pending.length >= 2 + pending[1]) { greetings.push(Buffer.from(pending.subarray(0, 2 + pending[1]))); pending = pending.subarray(2 + pending[1]); state = hold === 'greeting' ? 'held-greeting' : 'request'; if (state === 'request') socket.write(Buffer.from([5, 0])); }
       if (state === 'request' && pending.length >= 5 && pending.length >= 7 + pending[4]) { const n = pending[4]; assert.equal(pending[3], 3); targets.push({ host: pending.subarray(5, 5 + n).toString(), port: pending.readUInt16BE(5 + n) }); pending = pending.subarray(7 + n); state = hold === 'connect' ? 'held-connect' : 'stream'; if (state === 'stream') socket.write(Buffer.from([5, refusal ? 5 : 0, 0, 1, 127, 0, 0, 1, 0, 0])); }
-      if (state === 'stream' && pending.length) { chunks.push(Buffer.from(pending)); application.push(Buffer.from(pending)); pending = Buffer.alloc(0); }
+      if (state === 'stream' && !refusal) {
+        state = 'http'; socket.off('data', onData); socket.pause();
+        const head = pending; pending = Buffer.alloc(0); httpServer.emit('connection', socket);
+        socket.on('data', chunk => application.push(Buffer.from(chunk)));
+        if (head.length) socket.unshift(head); socket.resume();
+      }
     };
-    socket.on('data', chunk => { pending = Buffer.concat([pending, chunk]); parse(); }); socket.on('end', () => { if (state === 'stream' && !refusal) socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok'); else socket.end(); });
+    const onData = chunk => { pending = Buffer.concat([pending, chunk]); parse(); };
+    socket.on('data', onData); socket.on('end', () => { if (state !== 'http') socket.end(); });
     socket.release = () => { if (state === 'held-greeting') { state = 'request'; socket.write(Buffer.from([5, 0])); } else if (state === 'held-connect') { state = 'stream'; socket.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0])); } parse(); };
   }); return { ...peer, targets, greetings, application, release() { for (const socket of peer.peers) socket.release(); } };
 }
+async function socksOrigin(t, destination) {
+  const targets = [], failures = [], peer = await server(t, async socket => {
+    const reader = new SocketReader(socket); let upstream;
+    try {
+      const greeting = await reader.read(2); await reader.read(greeting[1]); socket.write(Buffer.from([5, 0]));
+      const request = await reader.read(5); assert.equal(request[3], 3);
+      const host = (await reader.read(request[4])).toString(), port = (await reader.read(2)).readUInt16BE();
+      assert.equal(host, 'delayed-http.invalid'); assert.equal(port, 80); targets.push({ host, port });
+      upstream = net.createConnection({ host: '127.0.0.1', port: destination.port });
+      upstream.on('error', () => socket.destroy()); t.after(() => upstream.destroy()); await once(upstream, 'connect');
+      socket.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0])); reader.release();
+      socket.once('close', () => upstream.destroy());
+      upstream.once('close', () => { if (upstream.readableEnded) { if (!socket.writableEnded) socket.end(); } else socket.destroy(); });
+      socket.pipe(upstream); upstream.pipe(socket); socket.resume();
+    } catch (error) { failures.push(error); reader.release(); socket.destroy(); upstream?.destroy(); }
+  }); return { ...peer, targets, failures };
+}
 function mockDNS(t, implementation) { const original = dns.lookup; dns.lookup = implementation; t.after(() => { dns.lookup = original; }); }
 function answer(options, callback) { if (options?.all) callback(null, [{ address: '127.0.0.1', family: 4 }]); else callback(null, '127.0.0.1', 4); }
+
+for (const mode of ['network', 'socks5']) test(`delayed HTTP responses survive complete GET, HEAD and POST framing (${mode})`, { timeout: 5000 }, async t => {
+  const requests = [], dest = await httpOrigin(t, (request, reply) => {
+    const chunks = []; request.on('data', chunk => chunks.push(chunk)); request.on('error', () => {});
+    request.once('end', () => {
+      const timer = setTimeout(() => {
+        requests.push({ method: request.method, body: Buffer.concat(chunks).toString(), ended: request.socket.readableEnded, connection: request.headers.connection });
+        reply.writeHead(200, { 'Content-Length': 5 }); reply.end('hello');
+      }, 60); t.after(() => clearTimeout(timer));
+    });
+  });
+  const proxy = mode === 'socks5' ? await socksOrigin(t, dest) : undefined, { relay } = await relayFixture(t, proxy); relay.unlock();
+  const target = proxy ? 'delayed-http.invalid' : `127.0.0.1:${dest.port}`;
+  const cases = [
+    { method: 'GET', framing: '', parts: [], body: '' },
+    { method: 'HEAD', framing: '', parts: [], body: '' },
+    { method: 'POST', framing: 'Content-Length: 4\r\n', parts: ['bo', 'dy'], body: 'body', halfClose: true },
+    { method: 'POST', framing: 'Transfer-Encoding: chunked\r\n', parts: ['4\r', '\nbody\r\n0\r\n', '\r\n'], body: 'body' }
+  ];
+  for (const item of cases) {
+    const socket = await open(t, relay.port), result = response(socket), ready = once(relay, 'tunnel');
+    socket.write(`${item.method} http://${target}/delayed HTTP/1.1\r\n${item.framing}\r\n`); await ready;
+    for (const part of item.parts) { socket.write(part); await delay(2); }
+    if (item.halfClose) socket.end();
+    const actual = split(await result); assert.match(actual.header, /^HTTP\/1\.1 200 /);
+    assert.equal(actual.body.toString(), item.method === 'HEAD' ? '' : 'hello');
+  }
+  assert.deepEqual(requests, cases.map(item => ({ method: item.method, body: item.body, ended: false, connection: 'close' })));
+  if (proxy) { assert.equal(proxy.targets.length, cases.length); assert.deepEqual(proxy.failures, []); }
+  await until(() => relay.sockets.size === 0 && dest.peers.size === 0, 'Completed HTTP response left a socket open');
+});
+
+for (const mode of ['network', 'socks5']) for (const action of ['client-abort', 'pause', 'close']) test(`waiting HTTP response is retired on ${action} (${mode})`, { timeout: 5000 }, async t => {
+  let reply, received = false;
+  const dest = await httpOrigin(t, (request, response) => { reply = response; request.resume(); request.on('error', () => {}); request.once('end', () => { received = true; }); });
+  const proxy = mode === 'socks5' ? await socksOrigin(t, dest) : undefined, { relay } = await relayFixture(t, proxy); relay.unlock();
+  const target = proxy ? 'delayed-http.invalid' : `127.0.0.1:${dest.port}`, socket = await open(t, relay.port), result = response(socket);
+  socket.write(`GET http://${target}/waiting HTTP/1.1\r\n\r\n`); await until(() => received, 'Origin did not receive complete request');
+  if (action === 'client-abort') socket.resetAndDestroy(); else relay[action]();
+  assert.equal((await result).length, 0);
+  await until(() => relay.sockets.size === 0 && dest.peers.size === 0, 'Cancellation left the waiting origin open');
+  assert.equal(reply.destroyed, true); reply.end('must-not-arrive');
+  if (proxy) assert.deepEqual(proxy.failures, []);
+});
 
 test('HTTP current-network POST preserves exact binary body, rewrites origin/Host and strips all proxy and hop-by-hop credentials', async t => {
   const dest = await origin(t), { relay } = await relayFixture(t); relay.unlock();
@@ -100,7 +183,7 @@ test('a second HTTP request sent after the framed body never reaches the first d
 });
 
 test('a clean HTTP upstream close drains a large response under downstream backpressure without truncation', async t => {
-  const body = Buffer.alloc(2 * 1024 * 1024, 211), dest = await server(t, socket => { socket.on('data', () => {}); socket.on('end', () => socket.end(Buffer.concat([Buffer.from(`HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n`), body]))); });
+  const body = Buffer.alloc(2 * 1024 * 1024, 211), dest = await httpOrigin(t, (request, reply) => { request.resume(); request.once('end', () => { reply.writeHead(200, { 'Content-Length': body.length }); reply.end(body); }); });
   const { relay } = await relayFixture(t); relay.unlock(); const socket = await open(t, relay.port), ready = once(relay, 'tunnel'), result = response(socket);
   socket.pause(); socket.write(`GET http://127.0.0.1:${dest.port}/large-response HTTP/1.1\r\n\r\n`); await ready; await delay(60); socket.resume();
   const actual = split(await result); assert.ok(actual.body.equals(body));

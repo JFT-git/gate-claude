@@ -32,7 +32,7 @@ test('fence inventory includes bundled executables and rejects a foreign runtime
   await assert.rejects(collectExecutables({ executable: path.join(item.parent, 'Claude.exe') }), /отдельной копии/);
 });
 
-test('fence refuses symlink directories and executable links before UAC', { skip: process.platform === 'win32' }, async t => {
+test('fence refuses symlink directories and executable links before UAC', { skip: process.platform === 'win32' && process.env.GATE_WINDOWS_SYMLINK_TEST !== '1' }, async t => {
   const item = await fixture(t);
   await fs.writeFile(item.executable, Buffer.alloc(32));
   const external = path.join(item.parent, 'external'); await fs.mkdir(external);

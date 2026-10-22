@@ -261,13 +261,14 @@ class SOCKSRelay extends EventEmitter {
             try {
               request.body.consume(data);
               if (!upstream.write(data)) { blocked = true; client.pause(); }
-              if (request.body.complete) upstream.end();
             } catch { close(); }
           };
-          client.on('data', forward).once('end', () => { if (request.body.complete) upstream.end(); else close(); });
+          // HTTP framing completes the request, not a TCP FIN. Keep the origin's
+          // read side open for asynchronous responses; Connection: close asks it
+          // to close after replying. Extra client bytes still fail body.consume.
+          client.on('data', forward).once('end', () => { if (!request.body.complete) close(); });
           upstream.on('drain', () => { blocked = false; if (allowed()) client.resume(); });
           upstream.pipe(client); upstream.resume();
-          if (request.body.complete) upstream.end();
           if (!blocked) client.resume();
         }
         this.emit('tunnel', { host, port });

@@ -10,7 +10,7 @@ const PROXY_NAME = /^(?:https?|all|no)_proxy$/i;
 const TOOL_ENV = new Set(['PATH','GIT_EXEC_PATH','GIT_TEMPLATE_DIR','GIT_CONFIG_NOSYSTEM','CLAUDE_CODE_USE_POWERSHELL_TOOL','PSMODULEPATH','POWERSHELL_TELEMETRY_OPTOUT','POWERSHELL_UPDATECHECK']);
 // Desktop's Sentry propagator adds this optional SDK carrier. Its hyphenated
 // name is outside the native broker's environment contract.
-const PRIVATE_ENV = /^(?:PROXY_GUARD_|GATE_|ELECTRON_|CLAUDE_CDP_AUTH$|NODE_OPTIONS$|SSLKEYLOGFILE$|SHELL$|CLAUDE_CODE_GIT_BASH_PATH$|SENTRY-TRACE$)/i;
+const PRIVATE_ENV = /^(?:PROXY_GUARD_|GATE_|ELECTRON_|CLAUDE_CDP_AUTH$|NODE_OPTIONS$|SSLKEYLOGFILE$|SHELL$|CLAUDE_CODE_GIT_BASH_PATH$|GIT_CEILING_DIRECTORIES$|SENTRY-TRACE$)/i;
 let installed;
 function denied() { const error = Error(FAILURE); error.code = 'ERR_GUARD_CODE_DENIED'; return error; }
 function ownObject(value) { return value && typeof value === 'object' && !Array.isArray(value) && [null, Object.prototype].includes(Object.getPrototypeOf(value)); }
@@ -34,6 +34,7 @@ function configCopy(input) {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(input.containerName || '') || !/^S-1-15-2-(?:\d+-){6}\d+$/.test(input.containerSid || '')) throw denied();
   const output = { hostPath: absolute(input.hostPath, true), containerName: input.containerName, containerSid: input.containerSid,
     relayURL: relayURL(input.relayURL), stateRoot: absolute(input.stateRoot), runtimeExecutable: absolute(input.runtimeExecutable, true), gatePipe: input.gatePipe, gateToken: input.gateToken, codeJobName: input.codeJobName, approved: [] };
+  if (output.stateRoot.includes(';')) throw denied(); // Git's Windows path-list separator has no quoting escape.
   output.workspaceRoot = absolute(input.workspaceRoot === undefined ? path.join(output.stateRoot, 'Workspace') : input.workspaceRoot);
   if (output.workspaceRoot.toLowerCase() !== path.join(output.stateRoot, 'Workspace').toLowerCase() || !/^Global\\gate-code-job-[a-f0-9]{32}$/.test(output.codeJobName || '')) throw denied();
   if (!/^\\\\\.\\pipe\\gate-claude-code-[a-f0-9]{32}$/.test(output.gatePipe || '') || !/^[a-f0-9]{64}$/.test(output.gateToken || '')) throw denied();
@@ -81,6 +82,9 @@ function proxyEnv(env, lowerCase = false) {
     names.set(key.toUpperCase(), key); Object.defineProperty(result, key, { value: descriptor.value, writable: true, enumerable: true, configurable: true });
   }
   Object.assign(result, installed.code.tools.environment);
+  // An empty Workspace must not make Git discover repositories above the
+  // readable state tree. AppContainer deliberately cannot inspect that parent.
+  result.GIT_CEILING_DIRECTORIES = installed.code.stateRoot;
   for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) result[key] = installed.code.relayURL;
   result.NO_PROXY = '';
   result.CLAUDE_CODE_PROXY_RESOLVES_HOSTS = '1';
