@@ -88,7 +88,7 @@ function proxyRequest(headers) {
   if (/[^\x09\x0a\x0d\x20-\x7e]/.test(headers) || !headers.endsWith('\r\n\r\n')) throw Error('Неверные заголовки прокси.');
   const lines = headers.slice(0, -4).split('\r\n'), requestLine = lines.shift();
   const fields = lines.map(line => {
-    const match = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([\x09\x20-\x7e]*)$/.exec(line);
+    const match = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):([\x09\x20-\x7e]*)$/.exec(line);
     if (!match) throw Error('Неверные заголовки прокси.');
     return { name: match[1].toLowerCase(), value: match[2].trim() };
   });

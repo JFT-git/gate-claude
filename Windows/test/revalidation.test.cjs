@@ -8,6 +8,10 @@ const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
 const child = require('node:child_process');
 const runtime = require('../src/runtime.cjs'), checker = require('../src/ip-check.cjs');
+const policy = require('../src/policy.cjs');
+const { RouteReadError } = require('../src/route-reader.cjs');
+let interfaces = 'interfaces-A';
+policy.networkFingerprint = () => interfaces;
 require('../src/fence.cjs').NetworkFence.prepare = async () => ({ on() {}, close: async () => {} });
 const { Channel } = require('../src/channel.cjs');
 let provider, initialProvider, onSpawn, waitForChannel;
@@ -31,6 +35,7 @@ class Relay extends EventEmitter {
   close() { this.closed = true; this.paused = true; }
 }
 async function fixture(t) {
+  interfaces = 'interfaces-A';
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gate-revalidation-'));
   const controller = new GuardController(root, root); controller.policy.pin({ country_code: 'NL', ip: pinned });
   controller.state = 'running'; controller.settings = { interval: 2 }; controller.route = 'route-A';
@@ -73,6 +78,65 @@ test('route changes pause immediately and require a fresh unchanged IP answer be
   first.resolve({ ip: pinned }); await pending; clearTimeout(c.pollTimer);
   assert.equal(relay.resumes, 0);
   await c.poll(c.epoch); assert.equal(checks, 2); assert.equal(c.state, 'running'); assert.equal(c.route, 'route-B'); assert.equal(relay.resumes, 1);
+});
+test('rechecking rejects an old-route IP answer combined with a new-route fingerprint', async t => {
+  const c = await fixture(t), relay = c.relay; let route = 'route-A', checks = 0;
+  c.pauseForRevalidation('Recheck the existing pin');
+  c.routeFingerprint = async () => route;
+  provider = async () => { checks++; route = 'route-B'; return { ip: pinned }; };
+  await c.poll(c.epoch); clearTimeout(c.pollTimer);
+  assert.equal(c.state, 'rechecking'); assert.equal(c.policy.blocked, false); assert.equal(relay.paused, true); assert.equal(relay.resumes, 0);
+  await c.poll(c.epoch);
+  assert.equal(checks, 2); assert.equal(c.state, 'running'); assert.equal(c.route, 'route-B'); assert.equal(relay.resumes, 1);
+});
+test('a stable recheck brackets one external IP request with two native route reads', async t => {
+  const c = await fixture(t), relay = c.relay, order = [];
+  c.pauseForRevalidation('Recheck the existing pin');
+  c.routeFingerprint = async () => { order.push('route'); return 'route-A'; };
+  provider = async () => { order.push('ip'); return { ip: pinned }; };
+  await c.poll(c.epoch);
+  assert.deepEqual(order, ['route', 'ip', 'route']); assert.equal(relay.resumes, 1); assert.equal(c.state, 'running');
+});
+for (const failedRead of [1, 2]) {
+  test(`a route error at recheck boundary ${failedRead} stays paused and a later stable check recovers`, async t => {
+    const c = await fixture(t), relay = c.relay; let reads = 0, checks = 0;
+    c.pauseForRevalidation('Recheck the existing pin');
+    c.routeFingerprint = async () => { if (++reads === failedRead) throw new RouteReadError('TIMEOUT'); return 'route-A'; };
+    provider = async () => { checks++; return { ip: pinned }; };
+    await c.poll(c.epoch); clearTimeout(c.pollTimer);
+    assert.equal(relay.paused, true); assert.equal(relay.resumes, 0); assert.equal(c.policy.blocked, false); assert.equal(checks, failedRead - 1);
+    await c.poll(c.epoch);
+    assert.equal(checks, failedRead); assert.equal(relay.resumes, 1); assert.equal(c.state, 'running');
+  });
+}
+test('an interface change during a recheck bracket requires another unchanged-IP sample', async t => {
+  const c = await fixture(t), relay = c.relay; let checks = 0;
+  c.pauseForRevalidation('Recheck the existing pin');
+  provider = async () => { checks++; interfaces = 'interfaces-B'; return { ip: pinned }; };
+  await c.poll(c.epoch); clearTimeout(c.pollTimer);
+  assert.equal(relay.paused, true); assert.equal(relay.resumes, 0); assert.equal(c.policy.blocked, false);
+  await c.poll(c.epoch);
+  assert.equal(checks, 2); assert.equal(relay.resumes, 1); assert.equal(c.state, 'running');
+});
+test('a revision during the final recheck route read invalidates the bracket', async t => {
+  const c = await fixture(t), relay = c.relay, finalRoute = deferred(); let reads = 0, checks = 0;
+  c.pauseForRevalidation('Recheck the existing pin');
+  c.routeFingerprint = () => ++reads === 2 ? finalRoute.promise : Promise.resolve('route-A');
+  provider = async () => { checks++; return { ip: pinned }; };
+  const pending = c.poll(c.epoch); await until(() => reads === 2);
+  c.revalidate('New event while the final route read is pending');
+  finalRoute.resolve('route-A'); await pending; clearTimeout(c.pollTimer);
+  assert.equal(relay.paused, true); assert.equal(relay.resumes, 0); assert.equal(c.policy.blocked, false);
+  await c.poll(c.epoch);
+  assert.equal(checks, 2); assert.equal(relay.resumes, 1); assert.equal(c.state, 'running');
+});
+test('stopping during the final recheck route read prevents late reopening', async t => {
+  const c = await fixture(t), relay = c.relay, finalRoute = deferred(); let reads = 0;
+  c.pauseForRevalidation('Recheck the existing pin');
+  c.routeFingerprint = () => ++reads === 2 ? finalRoute.promise : Promise.resolve('route-A');
+  const pending = c.poll(c.epoch); await until(() => reads === 2);
+  c.stop(); finalRoute.resolve('route-A'); await pending;
+  assert.equal(relay.closed, true); assert.equal(relay.resumes, 0); assert.equal(c.state, 'blocked');
 });
 test('an event during an in-flight check discards that old result and never overlaps IP requests', async t => {
   const c = await fixture(t), relay = c.relay, first = deferred(), second = deferred(); let active = 0, max = 0, checks = 0;

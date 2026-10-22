@@ -89,6 +89,36 @@ function dnsAnswer(options, callback, address = '127.0.0.1') {
   if (options?.all) callback(null, [{ address, family: 4 }]); else callback(null, address, 4);
 }
 
+test('proxy headers preserve optional spaces, tabs and empty values while normalizing private authorization', async t => {
+  const proxy = await proxyFixture(t), { relay } = await startRelay(t, proxy);
+  const headers = `Proxy-Authorization:\t  Bearer ${relay.checkToken} \t\r\nX-Empty:\t  \r\nX-Visible:  first\tsecond \t\r\n`;
+  const result = await request(t, relay, 'ipwho.is:443', '', headers);
+  assert.match(result.header, /^HTTP\/1\.1 200 /);
+  assert.deepEqual(proxy.targets, [{ host: 'ipwho.is', port: 443 }]);
+  const echoed = once(result.socket, 'data'); result.socket.write('whitespace-fixture');
+  assert.equal((await echoed)[0].toString(), 'whitespace-fixture');
+  assert.equal(Buffer.concat(proxy.applicationBytes).includes(Buffer.from(relay.checkToken)), false);
+});
+
+test('complete headers at the 16 KiB boundary reject whitespace followed by bare CR or LF before opening an upstream', { timeout: 5000 }, async t => {
+  const proxy = await proxyFixture(t), { relay } = await startRelay(t, proxy); relay.unlock();
+  const lookups = []; mockDNS(t, (host, options, callback) => { lookups.push(host); callback(Error('Unexpected malformed-header DNS')); });
+  for (const requestLine of ['CONNECT malformed-header.invalid:443 HTTP/1.1', 'GET http://malformed-header.invalid/ HTTP/1.1']) {
+    for (const invalid of ['\r', '\n']) {
+      const prefix = requestLine + '\r\nX-Padding:', suffix = invalid + '\r\n\r\n';
+      const bytes = prefix + ' '.repeat(16384 - prefix.length - suffix.length) + suffix;
+      assert.equal(Buffer.byteLength(bytes), 16384);
+      assert.equal(bytes.indexOf('\r\n\r\n'), 16380, 'Complete input must reach header parsing within the existing size bound');
+      const socket = await client(t, relay.port), reply = responseHeader(socket);
+      socket.write(bytes); assert.match(await reply, /^HTTP\/1\.1 502 /); socket.destroy();
+    }
+  }
+  assert.deepEqual(lookups, []); assert.equal(proxy.greetings.length, 0); assert.equal(proxy.targets.length, 0); assert.equal(proxy.applicationBytes.length, 0);
+  const valid = await request(t, relay, 'valid-after-malformed.invalid:443');
+  assert.match(valid.header, /^HTTP\/1\.1 200 /);
+  assert.deepEqual(proxy.targets, [{ host: 'valid-after-malformed.invalid', port: 443 }]);
+});
+
 test('leak boundary: locked relay rejects disguised precheck names, ports and malformed authorities before opening SOCKS', async t => {
   const proxy = await proxyFixture(t), { relay } = await startRelay(t, proxy);
   const blocked = ['ipwho.is:443', 'api64.ipify.org:443', 'api.ipify.org:443', 'api6.ipify.org:443', 'ipwho.is:80', 'ipwho.is:444', 'ipwho.is.:443', 'ipwho.is.evil.test:443',
