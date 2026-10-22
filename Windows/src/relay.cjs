@@ -1,5 +1,6 @@
 'use strict';
 const net = require('node:net');
+const dns = require('node:dns');
 const { EventEmitter, once } = require('node:events');
 const { randomBytes, timingSafeEqual } = require('node:crypto');
 const securityError = message => Object.assign(Error(message), { guardSecurity: true });
@@ -71,6 +72,45 @@ async function connectSOCKS(proxy, host, port, onSocket = () => {}) {
     socket.setTimeout(0); reader.release();
     return socket;
   } catch (error) { reader.release(); socket.destroy(); throw error; }
+}
+
+async function connectHTTP(proxy, host, port, onSocket = () => {}) {
+  const destination = (net.isIPv6(host) ? '[' + host + ']' : host) + ':' + port;
+  authority(destination);
+  const socket = net.createConnection({ host: proxy.host, port: proxy.port }); onSocket(socket);
+  socket.on('error', () => {});
+  socket.setTimeout(8000, () => socket.destroy(Error('Тайм-аут HTTP-прокси.')));
+  try {
+    await new Promise((resolve, reject) => {
+      const connected = () => { cleanup(); resolve(); }, failed = error => { cleanup(); reject(error); };
+      const closed = () => failed(Error('Соединение с HTTP-прокси закрыто.'));
+      const cleanup = () => socket.off('connect', connected).off('error', failed).off('close', closed);
+      socket.once('connect', connected).once('error', failed).once('close', closed);
+      if (socket.destroyed) closed();
+    });
+    // Only the CONNECT authority crosses this boundary. Neither the Guard's
+    // private bearer nor an application's headers/cookies authenticate upstream.
+    socket.write('CONNECT ' + destination + ' HTTP/1.1\r\nHost: ' + destination + '\r\n\r\n');
+    await new Promise((resolve, reject) => {
+      let bytes = Buffer.alloc(0);
+      const failed = error => { cleanup(); reject(error); }, closed = () => failed(Error('HTTP-прокси закрыл настройку туннеля.'));
+      const data = chunk => {
+        bytes = Buffer.concat([bytes, chunk]); const end = bytes.indexOf('\r\n\r\n');
+        if ((end < 0 && bytes.length > 16384) || end + 4 > 16384) return failed(Error('Слишком большой ответ HTTP-прокси.'));
+        if (end < 0) return;
+        const header = bytes.subarray(0, end).toString('latin1'), lines = header.split('\r\n');
+        if (!/^HTTP\/1\.[01] 200(?: [\x20-\x7e]*)?$/.test(lines.shift()) || lines.some(line => !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+:[\x09\x20-\x7e]*$/.test(line)))
+          return failed(Object.assign(Error('HTTP-прокси не подтвердил CONNECT кодом 200.'), { targetRefused: true }));
+        if (lines.some(line => /^transfer-encoding:/i.test(line) || (/^content-length:/i.test(line) && !/^content-length:[\x09\x20]*0[\x09\x20]*$/i.test(line))))
+          return failed(Error('Неоднозначный ответ HTTP-прокси.'));
+        socket.pause(); cleanup(); if (bytes.length > end + 4) socket.unshift(bytes.subarray(end + 4)); resolve();
+      };
+      const cleanup = () => socket.off('data', data).off('error', failed).off('end', closed).off('close', closed);
+      socket.on('data', data).once('error', failed).once('end', closed).once('close', closed);
+      if (socket.destroyed) closed();
+    });
+    socket.setTimeout(0); return socket;
+  } catch (error) { socket.destroy(); throw error; }
 }
 
 function authority(text) {
@@ -158,8 +198,31 @@ function requestBody(length) {
   return body;
 }
 
-async function connectCurrentNetwork(host, port, onSocket = () => {}) {
-  const socket = net.createConnection({ host, port }); onSocket(socket);
+function mappedIPv4(address) {
+  if (!net.isIPv6(address)) return false;
+  // DNS may return a scoped IPv6 literal, which WHATWG URLs cannot represent.
+  // Canonicalize its address portion without allowing a malformed answer to
+  // throw outside the DNS callback and terminate the relay process.
+  try { return new URL('http://[' + address.split('%', 1)[0] + ']/').hostname.startsWith('[::ffff:'); }
+  catch { return true; }
+}
+function familyRefusal() { return Object.assign(Error('Семейство IP назначения не совпадает с закреплённым маршрутом.'), { targetRefused: true }); }
+async function connectCurrentNetwork(host, port, onSocket = () => {}, family = 0) {
+  if (![0, 4, 6].includes(family)) throw familyRefusal();
+  const literal = net.isIP(host);
+  if (mappedIPv4(host) || (family && literal && literal !== family)) throw familyRefusal();
+  const options = { host, port };
+  if (family) {
+    options.family = family; options.autoSelectFamily = false;
+    // Check the actual answer as well as the requested DNS family. In particular,
+    // an IPv4-mapped AAAA answer must not open an unmonitored IPv4 connection.
+    options.lookup = (name, lookupOptions, callback) => dns.lookup(name, { ...lookupOptions, family, all: false }, (error, address, answerFamily) => {
+      if (error) callback(error);
+      else if (net.isIP(address) !== family || answerFamily !== family || mappedIPv4(address)) callback(familyRefusal());
+      else callback(null, address, answerFamily);
+    });
+  }
+  const socket = net.createConnection(options); onSocket(socket);
   socket.setTimeout(8000, () => socket.destroy(Error('Тайм-аут подключения через текущую сеть.')));
   try {
     await new Promise((resolve, reject) => {
@@ -192,6 +255,9 @@ class SOCKSRelay extends EventEmitter {
     this.sockets.add(socket); if (control) this.controlSockets.add(socket);
     socket.once('close', () => { this.sockets.delete(socket); this.controlSockets.delete(socket); }); socket.on('error', () => {}); return socket;
   }
+  connectUpstream(host, port, onSocket, control = false) {
+    return this.mode === 'network' ? connectCurrentNetwork(host, port, onSocket, this.ipFamily || 0) : connectSOCKS(this.proxy, host, port, onSocket);
+  }
   accept(client) {
     this.track(client); let bytes = Buffer.alloc(0), processing = false;
     client.setTimeout(10000, () => client.destroy());
@@ -223,14 +289,14 @@ class SOCKSRelay extends EventEmitter {
         const credentials = request.fields.filter(field => field.name === 'proxy-authorization');
         const token = credentials.length === 1 && /^Bearer ([a-f0-9]{64})$/i.exec(credentials[0].value);
         const control = request.kind === 'connect' && token && timingSafeEqual(Buffer.from(token[1]), Buffer.from(this.checkToken)) &&
-          port === 443 && ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org'].includes(host);
+          port === 443 && ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org', 'claude.ai', 'api.anthropic.com'].includes(host);
         if (control) this.controlSockets.add(client);
         const allowed = () => !this.closed && !client.destroyed && (this.unlocked || control);
         if (!allowed()) {
           client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return;
         }
         const opened = socket => { pending = this.track(socket, Boolean(control)); if (!allowed()) socket.destroy(); };
-        try { upstream = this.mode === 'network' ? await connectCurrentNetwork(host, port, opened) : await connectSOCKS(this.proxy, host, port, opened); }
+        try { upstream = await this.connectUpstream(host, port, opened, Boolean(control)); }
         catch (error) {
           if (allowed() && !error.targetRefused) {
             if (error.guardSecurity) this.emit('fatal', error.message);
@@ -277,7 +343,11 @@ class SOCKSRelay extends EventEmitter {
     };
     client.on('data', onData);
   }
-  unlock() { if (this.closed) throw Error('Шлюз закрыт.'); this.unlocked = true; }
+  unlock() {
+    if (this.closed) throw Error('Шлюз закрыт.');
+    if (this.mode === 'network' && ![4, 6].includes(this.ipFamily)) throw Error('Семейство IP ещё не закреплено.');
+    this.unlocked = true;
+  }
   resume() { this.unlock(); }
   pause() {
     if (this.closed) return;
@@ -290,7 +360,41 @@ class SOCKSRelay extends EventEmitter {
     this.server?.close(); this.proxy = null;
   }
 }
-class NetworkRelay extends SOCKSRelay { constructor() { super(null, 'network'); } }
+class NetworkRelay extends SOCKSRelay {
+  #ipFamily = 0;
+  #upstream;
+  constructor({ upstream = { kind: 'direct' } } = {}) {
+    super(null, 'network');
+    if (!upstream || typeof upstream !== 'object' || Array.isArray(upstream) || !['direct', 'http', 'socks5'].includes(upstream.kind) ||
+      Object.keys(upstream).some(key => !['kind', 'host', 'port', 'fingerprint'].includes(key))) throw Error('Неверная конфигурация системного прокси.');
+    if (upstream.kind === 'direct') {
+      if (('host' in upstream && upstream.host !== '') || ('port' in upstream && upstream.port !== 0)) throw Error('Прямой маршрут не должен задавать прокси.');
+    } else if (typeof upstream.host !== 'string' || upstream.host.length > 253 || (!net.isIPv6(upstream.host) && !/^[a-zA-Z0-9._-]+$/.test(upstream.host)) ||
+      !Number.isInteger(upstream.port) || upstream.port < 1 || upstream.port > 65535) throw Error('Неверный адрес системного прокси.');
+    if ('fingerprint' in upstream && (typeof upstream.fingerprint !== 'string' || !/^[\x20-\x7e]{1,256}$/.test(upstream.fingerprint))) throw Error('Неверный отпечаток системного прокси.');
+    this.#upstream = Object.freeze({ ...upstream });
+  }
+  get upstream() { return this.#upstream; }
+  // A trusted upstream chooses a hostname's remote address family. The local
+  // Guard only promises that its sockets go to the captured proxy endpoint.
+  get ipFamilyBound() { return this.#upstream.kind === 'direct' ? 'direct' : 'upstream-proxy'; }
+  get ipFamily() { return this.#ipFamily; }
+  connectUpstream(host, port, onSocket, control = false) {
+    if (this.#upstream.kind === 'direct') return connectCurrentNetwork(host, port, onSocket, this.#ipFamily);
+    const literal = net.isIP(host);
+    if (mappedIPv4(host) || (this.#ipFamily && literal && literal !== this.#ipFamily)) return Promise.reject(familyRefusal());
+    return this.#upstream.kind === 'http' ? connectHTTP(this.#upstream, host, port, onSocket) : connectSOCKS(this.#upstream, host, port, onSocket);
+  }
+  pinIPFamily(family) {
+    if (this.closed) throw Error('Шлюз закрыт.');
+    if (![4, 6].includes(family)) throw Error('Для текущей сети требуется семейство IP 4 или 6.');
+    if (this.#ipFamily || this.unlocked) throw Error('Семейство IP уже закреплено. Перезапустите защищённую сессию.');
+    this.#ipFamily = family;
+    // The first country-IP probe may use either family. It cannot leave a
+    // bootstrap connection alive after the monitored family becomes mandatory.
+    for (const socket of this.controlSockets) socket.destroy();
+  }
+}
 
 async function connectTunnel(port, host, targetPort = 443, checkToken = '', onSocket = () => {}) {
   const socket = net.createConnection({ host: '127.0.0.1', port });
@@ -325,4 +429,4 @@ async function connectTunnel(port, host, targetPort = 443, checkToken = '', onSo
   socket.setTimeout(0); return socket;
 }
 
-module.exports = { SOCKSRelay, NetworkRelay, connectSOCKS, connectCurrentNetwork, connectTunnel, SocketReader, authority };
+module.exports = { SOCKSRelay, NetworkRelay, connectSOCKS, connectHTTP, connectCurrentNetwork, connectTunnel, SocketReader, authority };

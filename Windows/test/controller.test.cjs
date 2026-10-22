@@ -16,6 +16,9 @@ const pause = () => new Promise(resolve => setTimeout(resolve, 10));
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gate-controller-'));
   const controller = new GuardController(root, root); controller.routeFingerprint = async () => '';
+  const direct = Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) });
+  controller.networkProxy = direct; controller.networkProxyConfiguration = async () => direct;
+  controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: '203.0.113.7', country_code: 'NL' });
   t.after(async () => { controller.stop(); await fs.rm(root, { recursive: true, force: true }); });
   return controller;
 }
@@ -36,7 +39,8 @@ test('current network session closes its live tunnel and latches on a new foreig
   const controller = await fixture(t); let address = '203.0.113.7';
   current = async () => ({ ip: address }); controller.policy.pin({ country_code: 'NL', ip: address });
   const echo = net.createServer(socket => { socket.on('error', () => {}); socket.pipe(socket); }); echo.listen(0, '127.0.0.1'); await once(echo, 'listening'); t.after(() => echo.close());
-  controller.relay = new NetworkRelay(); await controller.relay.start(); controller.relay.unlock();
+  controller.relay = new NetworkRelay(); await controller.relay.start(); controller.relay.pinIPFamily(4); controller.relay.unlock();
+  await controller.queryDestinations(controller.epoch, controller.relay.port, controller.relay.checkToken, true);
   controller.state = 'running'; controller.settings = { interval: 2 }; controller.route = '';
   const port = controller.relay.port, socket = await connectTunnel(port, '127.0.0.1', echo.address().port); socket.resume();
   const closed = once(socket, 'close'); address = '203.0.113.8'; await controller.poll(controller.epoch); await closed;

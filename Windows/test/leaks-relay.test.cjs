@@ -56,8 +56,9 @@ async function proxyFixture(t, hold = '') {
   return { ...fixture, targets, greetings, applicationBytes,
     release() { for (const socket of fixture.peers) socket.releaseFixture(); } };
 }
-async function startRelay(t, proxy, network = false) {
+async function startRelay(t, proxy, network = false, family = 4) {
   const relay = network ? new NetworkRelay() : new SOCKSRelay({ host: '127.0.0.1', port: proxy.port });
+  if (network) relay.pinIPFamily(family);
   const fatals = []; relay.on('fatal', error => fatals.push(error)); await relay.start();
   t.after(() => relay.close()); return { relay, fatals };
 }
@@ -245,7 +246,7 @@ test('leak boundary: current-network IPv6 stays in relay tracking and is closed 
   let echo;
   try { echo = await listening(t, socket => socket.pipe(socket), '::1'); }
   catch (error) { if (['EAFNOSUPPORT', 'EADDRNOTAVAIL'].includes(error.code)) { t.skip('IPv6 loopback unavailable'); return; } throw error; }
-  const { relay } = await startRelay(t, null, true); relay.unlock();
+  const { relay } = await startRelay(t, null, true, 6); relay.unlock();
   const { socket, header } = await request(t, relay, `[::1]:${echo.port}`);
   assert.match(header, /^HTTP\/1\.1 200 /);
   const echoed = once(socket, 'data'); socket.write('ipv6-current-network');

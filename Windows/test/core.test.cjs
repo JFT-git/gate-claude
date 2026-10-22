@@ -96,7 +96,7 @@ test('current network/VPN works without SOCKS, gates precheck and closes live co
   t.after(() => { for (const socket of clients) socket.destroy(); echo.close(); });
   const relay = new NetworkRelay(), failures = []; relay.on('fatal', x => failures.push(x)); await relay.start(); t.after(() => relay.close());
   await assert.rejects(connectTunnel(relay.port, '127.0.0.1', echo.address().port)); assert.equal(accepted, 0);
-  relay.unlock();
+  relay.pinIPFamily(4); relay.unlock();
   const socket = await connectTunnel(relay.port, '127.0.0.1', echo.address().port); socket.resume(); socket.write('current-network-fixture');
   assert.equal((await once(socket, 'data'))[0].toString(), 'current-network-fixture');
   const ended = once(socket, 'close'), port = relay.port; relay.close(); await ended;

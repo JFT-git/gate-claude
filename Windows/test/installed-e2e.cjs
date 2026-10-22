@@ -1,7 +1,8 @@
 'use strict';
 // Run explicitly on Windows against an official local Claude, using a fresh profile.
 // Local TLS fixtures and certificate trust below exist only in this test.
-// The production IP checker and production Windows network fence are not substituted.
+// The production external IP checker and Windows network fence are not substituted.
+// Per-destination route results and system-proxy selection are synthetic test-only seams.
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const path = require('node:path');
@@ -26,6 +27,8 @@ const fixtureDeepLink = 'claude://claude.ai/magic-link#guard-fixture-id:syntheti
 let observed = '203.0.113.7', failNextCurrentIP = false, holdCurrentIP = false;
 const heldIPResponses = [], activeStreams = new Set();
 const { GuardController } = require('../src/controller.cjs');
+const fixtureNetworkProxy = Object.freeze({ kind: 'direct', host: '', port: 0,
+  fingerprint: crypto.createHash('sha256').update('gate-claude/installed-e2e/direct-proxy/v1').digest('hex') });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, label, timeout = 30000) {
   const started = Date.now();
@@ -56,6 +59,20 @@ async function fixtureCookieDisk(profile) {
   return { databaseCount: files.length, rows };
 }
 const sockets = new Set(), observations = {}, proof = { platform: process.platform, test: 'official Windows Claude, separate profile, local TLS fixture', observedIPSource: 'controlled test-only provider; no physical WAN change' };
+function fixtureNetworkChecks(controller) {
+  controller.networkProxyConfiguration = async () => fixtureNetworkProxy;
+  controller.requestDestinationIP = async (epoch, hostname, port, token) => {
+    assert.equal(epoch, controller.epoch, 'Destination fixture belongs to the active controller epoch');
+    assert.ok(['claude.ai', 'api.anthropic.com'].includes(hostname), 'Only the two production destination checks are substituted');
+    assert.equal(port, controller.relay.port); assert.equal(token, controller.relay.checkToken);
+    (observations.destinationChecks ||= {})[hostname] = (observations.destinationChecks?.[hostname] || 0) + 1;
+    // Read the same mutable test provider as production initialIP/currentIP. The
+    // synthetic address switch therefore exercises every destination policy too,
+    // without ever contacting a real Claude account or public trace endpoint.
+    return { ip: observed, country_code: 'NL', hostname };
+  };
+  return controller;
+}
 const track = socket => { sockets.add(socket); socket.on('error', () => {}); socket.once('close', () => sockets.delete(socket)); return socket; };
 const html = `<!doctype html><html><body><h1>Guard Windows fixture</h1><script>
 const profile=()=>({timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,language:navigator.language,locale:Intl.DateTimeFormat().resolvedOptions().locale});
@@ -232,7 +249,7 @@ command=async m=>{
   proof.sourceVersion = runtime.version; proof.sourceSignature = runtime.signature;
   let controller;
   try {
-    controller = new GuardController(root, resources); controller.on('log', e => console.log(e.kind + ': ' + e.message));
+    controller = fixtureNetworkChecks(new GuardController(root, resources)); controller.on('log', e => console.log(e.kind + ': ' + e.message));
     const states = []; controller.on('state', state => states.push(state.state));
     const captures = new Map(); controller.on('record', r => captures.set(r.id, r));
     const input = { mode: connectionMode, host: '127.0.0.1', port: socks.address().port, timezone: 'Europe/Amsterdam', language: 'en-US', interval: 2, captureBodies: true, claudePath: source };
@@ -379,7 +396,7 @@ command=async m=>{
     await until(() => firstFence.closed && firstFence.installed === false, 'old WFP broker acknowledged filter removal', 20000);
     observations.fixtureCookieDiskStopped=await fixtureCookieDisk(firstProfile);
     observed = '203.0.113.7';
-    controller = new GuardController(root, resources);
+    controller = fixtureNetworkChecks(new GuardController(root, resources));
     controller.on('log', event => console.log('restart ' + event.kind + ': ' + event.message));
     assert.equal(controller.policy.pinned, null); assert.equal(controller.policy.blocked, false);
     await controller.start(input);
@@ -428,6 +445,9 @@ command=async m=>{
     assert.ok(observations.ipChecks?.['ipwho.is'] >= 1);
     assert.ok(ipHosts.filter(host => host !== 'ipwho.is').reduce((total, host) => total + (observations.ipChecks?.[host] || 0), 0) >= 4);
     proof.ipChecksThroughLocalTLS = true;
+    for (const hostname of ['claude.ai', 'api.anthropic.com']) assert.ok(observations.destinationChecks?.[hostname] >= 2, 'Each destination is checked for the initial session and restart');
+    proof.destinationRouteChecks = { source: 'controlled test-only per-host results; no WAN destination trace',
+      sameSyntheticIPProvider: true, counts: { ...observations.destinationChecks }, capturedProxy: 'fixed test-only direct route' };
     proof.profileDiagnostics={electronVersion:flush.electronVersion,sameRuntimeExecutable:observations.sameRuntimeExecutable,
       keysBefore:observations.ownKeyPresenceBefore,keysAfterSettling:observations.ownKeyPresenceAfterSettling,keysAfterRestart:observations.ownKeyPresenceAfter,
       beforeKillDBLocked:observations.fixtureCookieDiskBefore.locked===true,persistedFixtureRowsBeforeReload:observations.fixtureCookieDiskStopped.rows.length,

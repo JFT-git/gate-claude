@@ -3,9 +3,11 @@ const { EventEmitter } = require('node:events');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
+const net = require('node:net');
 const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
 const { SOCKSRelay, NetworkRelay } = require('./relay.cjs');
-const { initialIP, currentIP } = require('./ip-check.cjs');
+const { initialIP, currentIP, queryDestinationIP } = require('./ip-check.cjs');
+const { readSystemProxy } = require('./system-proxy.cjs');
 const { prepareRuntime } = require('./runtime.cjs');
 const { Channel } = require('./channel.cjs');
 const { Inspector } = require('./inspector.cjs');
@@ -18,10 +20,12 @@ const { ensureNativeCodeAsset } = require('./native-code-asset.cjs');
 const { CodeGate } = require('./code-gate.cjs');
 const { randomBytes } = require('node:crypto');
 const { DeepLinkInbox, messages: linkMessages } = require('./deep-link.cjs');
+const DESTINATIONS = Object.freeze(['claude.ai', 'api.anthropic.com']);
 
 class GuardController extends EventEmitter {
   constructor(root, resources) {
     super(); this.codeCleanups = new WeakMap(); this.codeStatePreparations = new WeakMap();
+    this.destinationPolicies = new Map(); this.destinationRequests = new Map();
     this.deepLinks = new DeepLinkInbox({
       active: () => !this.policy?.blocked && !!this.policy?.pinned && ['starting', 'running', 'rechecking'].includes(this.state) && !!this.host && this.host.exitCode == null && !this.host.killed && !!this.channel && !this.channel.closed,
       ready: () => this.deepLinkReady === true && this.state !== 'rechecking' && !!this.channel?.socket,
@@ -73,15 +77,23 @@ class GuardController extends EventEmitter {
         }
       }, 1000);
       this.route = await this.routeFingerprint(); if (!active()) return;
-      this.relay = settings.mode === 'network' ? new NetworkRelay() : new SOCKSRelay({ host: settings.host, port: settings.port, username: settings.username, password: settings.password });
+      this.networkProxy = settings.mode === 'network' ? Object.freeze({ ...await this.networkProxyConfiguration() }) : null;
+      if (!active()) return;
+      this.relay = settings.mode === 'network' ? new NetworkRelay({ upstream: this.networkProxy }) : new SOCKSRelay({ host: settings.host, port: settings.port, username: settings.username, password: settings.password });
       this.relay.on('fatal', reason => { if (active()) this.block(reason); });
       this.relay.on('revalidate', reason => { if (active()) this.revalidate(reason); });
       const port = await this.relay.start(); if (!active()) return;
       const pinExit = async () => {
         const initial = await this.requestIP(epoch, initialIP, port, this.relay.checkToken); if (!active()) return false;
         const pin = this.policy.pin(initial); this.country = pin.country;
+        if (settings.mode === 'network') this.relay.pinIPFamily(net.isIP(pin.ip));
         const current = await this.requestIP(epoch, currentIP, port, this.relay.checkToken); if (!active()) return false;
         this.policy.check(current.ip); if (!active()) return false;
+        await this.queryDestinations(epoch, port, this.relay.checkToken, true); if (!active()) return false;
+        if (!await this.confirmNetworkProxy(epoch)) {
+          if (active()) throw Error('Не удалось подтвердить настройки прокси Windows перед запуском.');
+          return false;
+        }
         this.log('Исходный IP закреплён: [IP скрыт] · ' + pin.country);
         this.schedulePoll(epoch, settings.interval * 1000);
         return true;
@@ -236,25 +248,33 @@ class GuardController extends EventEmitter {
       clearTimeout(this.pollTimer);
       if (!active()) return false;
       const revision = this.revalidationRevision || 0, interfaces = networkFingerprint();
-      let beforeRoute, address, afterRoute;
+      let beforeRoute, afterRoute, beforeRouteFailed = false;
       try {
-        beforeRoute = await this.routeFingerprint(); if (!active()) return false;
-        const current = await this.requestIP(epoch, currentIP, port, token); if (!active()) return false;
-        address = canonicalIP(current?.ip);
+        beforeRoute = await this.routeFingerprint();
       } catch {
+        if (!active()) return false;
+        beforeRouteFailed = true;
+        this.pauseForRevalidation('Не удалось проверить маршрут перед запуском Claude Code. Повторяем проверку.');
+      }
+      if (!active()) return false;
+      // A failed route read forbids launch, but must not hide a confirmed new exit.
+      const checked = await Promise.allSettled([
+        this.checkCurrentIP(epoch, port, token), this.queryDestinations(epoch, port, token), this.confirmNetworkProxy(epoch)
+      ]);
+      if (!active()) return false;
+      if (checked.some(result => result.status !== 'fulfilled' || !result.value)) {
         if (!active()) return false;
         this.pauseForRevalidation('Не удалось подтвердить сеть перед запуском Claude Code. Повторяем проверку.');
         continue;
       }
-      if (address !== this.policy.pinned) {
-        this.block('Внешний IP изменился. Сессия закрыта до перезапуска Guard.'); return false;
-      }
-      this.policy.check(address);
+      if (beforeRouteFailed) continue;
       try { afterRoute = await this.routeFingerprint(); } catch {
         if (!active()) return false;
         this.pauseForRevalidation('Не удалось проверить маршрут перед запуском Claude Code. Повторяем проверку.');
         continue;
       }
+      if (!active()) return false;
+      if (!await this.confirmNetworkProxy(epoch)) continue;
       if (!active()) return false;
       const afterInterfaces = networkFingerprint();
       if (revision !== (this.revalidationRevision || 0) || interfaces !== afterInterfaces || beforeRoute !== afterRoute) {
@@ -340,6 +360,86 @@ class GuardController extends EventEmitter {
       try { child.stdin.end(Buffer.concat([header, body])); } catch { fail(); }
     });
   }
+  networkProxyConfiguration() { return readSystemProxy(); }
+  async confirmNetworkProxy(epoch) {
+    const active = () => this.epoch === epoch && !this.policy.blocked && !!this.relay;
+    if (!active()) return false;
+    if (this.settings?.mode !== 'network') return true;
+    let current;
+    try { current = await this.networkProxyConfiguration(); }
+    catch {
+      if (active()) this.pauseForRevalidation('Не удалось подтвердить настройки прокси Windows. Повторяем проверку.', false);
+      return false;
+    }
+    if (!active()) return false;
+    if (!this.networkProxy || current.fingerprint !== this.networkProxy.fingerprint) {
+      this.block('Настройки системного прокси изменились. Сессия закрыта до перезапуска Guard.');
+      return false;
+    }
+    return true;
+  }
+  async requestDestinationIP(epoch, hostname, port, token) {
+    while (this.destinationRequests.has(hostname)) {
+      try { await this.destinationRequests.get(hostname); } catch {}
+      if (this.epoch !== epoch) throw Error('Проверка отменена.');
+    }
+    if (this.epoch !== epoch) throw Error('Проверка отменена.');
+    const request = Promise.resolve().then(() => queryDestinationIP(port, token, hostname, net.isIP(this.policy.pinned || '')));
+    this.destinationRequests.set(hostname, request);
+    try { return await request; }
+    finally { if (this.destinationRequests.get(hostname) === request) this.destinationRequests.delete(hostname); }
+  }
+  async queryDestinations(epoch, port, token, pin = false) {
+    const active = () => this.epoch === epoch && !this.policy.blocked && !!this.relay;
+    const results = await Promise.allSettled(DESTINATIONS.map(async hostname => {
+      try {
+        const result = await this.requestDestinationIP(epoch, hostname, port, token);
+        if (!active()) return false;
+        const ip = canonicalIP(result?.ip);
+        if (result?.hostname !== hostname) throw Error('Invalid destination response');
+        const policy = new IPPolicy();
+        try { policy.pin(result); }
+        catch {
+          if (String(result.country_code || '').toUpperCase() === 'RU') this.block('Маршрут Claude вышел через RU. Сессия закрыта до перезапуска Guard.');
+          throw Error('Invalid destination country');
+        }
+        if (pin) this.destinationPolicies.set(hostname, policy);
+        else {
+          const pinned = this.destinationPolicies.get(hostname);
+          if (!pinned) throw Error('Destination is not pinned');
+          if (pinned.pinned !== ip) {
+            this.block('Внешний IP маршрута Claude изменился. Сессия закрыта до перезапуска Guard.');
+            return false;
+          }
+          pinned.check(ip);
+        }
+        return true;
+      } catch {
+        if (active()) this.pauseForRevalidation('Не удалось подтвердить маршрут Claude. Повторяем проверку.', false);
+        throw Error('Не удалось подтвердить маршрут Claude.');
+      }
+    }));
+    if (!active()) return false;
+    if (results.some(result => result.status !== 'fulfilled' || !result.value)) throw Error('Не удалось подтвердить маршрут Claude.');
+    return true;
+  }
+  async checkCurrentIP(epoch, port, token) {
+    const active = () => this.epoch === epoch && !this.policy.blocked && !!this.relay;
+    try {
+      const result = await this.requestIP(epoch, currentIP, port, token);
+      if (!active()) return null;
+      const ip = canonicalIP(result?.ip);
+      if (net.isIP(ip) !== net.isIP(this.policy.pinned)) throw Error('Unexpected IP family');
+      if (ip !== this.policy.pinned) {
+        this.block('Внешний IP изменился. Сессия закрыта до перезапуска Guard.');
+        return null;
+      }
+      this.policy.check(ip); return ip;
+    } catch {
+      if (active()) this.pauseForRevalidation('Не удалось подтвердить закреплённый IP. Повторяем проверку.', false);
+      throw Error('Не удалось подтвердить закреплённый IP.');
+    }
+  }
   async routeFingerprint() {
     if (process.platform !== 'win32') return '';
     const epoch = this.epoch;
@@ -401,31 +501,22 @@ class GuardController extends EventEmitter {
       // Reopening traffic requires an IP sample taken between two stable route
       // snapshots. A concurrent route result may belong to a newer route than
       // the IP request, even when no interface event increments the revision.
-      let beforeRoute;
+      let beforeRoute, beforeRouteFailed = false;
       if (rechecking) {
         try { beforeRoute = await this.routeFingerprint(); }
         catch {
           if (active()) this.pauseForRevalidation('Не удалось проверить маршрут сети. Повторяем проверку.', false);
-          return;
+          beforeRouteFailed = true;
         }
         if (!active()) return;
       }
       // Validate an IP result as soon as it arrives; a slow route query cannot delay a confirmed kill.
-      const address = this.requestIP(epoch, currentIP, relayPort, checkToken).then(result => {
-        if (!active()) return null;
-        const ip = canonicalIP(result?.ip); // A malformed provider answer is temporary, not a new IP.
-        if (require('node:net').isIP(ip) !== require('node:net').isIP(this.policy.pinned)) throw Error('Сервис вернул другое семейство IP.');
-        if (ip !== this.policy.pinned) {
-          this.block('Внешний IP изменился. Сессия закрыта до перезапуска Guard.');
-          return null;
-        }
-        this.policy.check(ip); return ip;
-      }).catch(error => {
-        if (active()) this.pauseForRevalidation('Не удалось подтвердить закреплённый IP. Повторяем проверку.', false);
-        throw error;
-      });
+      const address = this.checkCurrentIP(epoch, relayPort, checkToken);
+      const destinations = this.queryDestinations(epoch, relayPort, checkToken);
+      const proxy = this.confirmNetworkProxy(epoch);
+      const confirmation = Promise.allSettled([address, destinations, proxy]).then(results => results.every(result => result.status === 'fulfilled' && result.value));
       const routes = (rechecking
-        ? address.then(ip => active() && ip ? this.routeFingerprint() : null, () => null)
+        ? confirmation.then(valid => active() && valid && !beforeRouteFailed ? this.routeFingerprint() : null)
         : Promise.resolve().then(() => this.routeFingerprint())).then(route => {
         if (active() && route !== this.route && this.state !== 'rechecking') {
           this.pauseForRevalidation('Изменился маршрут сети. Проверяем закреплённый IP.');
@@ -435,12 +526,15 @@ class GuardController extends EventEmitter {
         if (active()) this.pauseForRevalidation('Не удалось проверить маршрут сети. Повторяем проверку.', false);
         throw error;
       });
-      const [ip, route] = await Promise.allSettled([address, routes]);
+      const [ip, route, destinationResult, proxyResult] = await Promise.allSettled([address, routes, destinations, proxy]);
       if (!active()) return;
-      if (ip.status !== 'fulfilled' || !ip.value || route.status !== 'fulfilled') {
+      if (beforeRouteFailed || ip.status !== 'fulfilled' || !ip.value || route.status !== 'fulfilled' ||
+          destinationResult.status !== 'fulfilled' || !destinationResult.value || proxyResult.status !== 'fulfilled' || !proxyResult.value) {
         this.pauseForRevalidation('Не удалось подтвердить закреплённый IP или маршрут. Повторяем проверку.', false);
         return;
       }
+      if (rechecking && !await this.confirmNetworkProxy(epoch)) return;
+      if (!active()) return;
       const after = networkFingerprint();
       if (before !== after) {
         this.fingerprint = after;
