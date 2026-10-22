@@ -70,6 +70,20 @@ test('managed policy merges proxy values ephemerally and preserves all unrelated
   assert.equal(merged.env.NO_PROXY, ''); assert.equal(merged.env.no_proxy, ''); assert.equal(h.api.mergeManagedSettings(undefined).env.HTTPS_PROXY, config().relayURL);
   merged.permissions.deny.push('changed'); assert.equal(original.permissions.deny.length, 1);
 });
+test('Git discovery stops at owned state even when the SDK or managed settings supply another ceiling', () => {
+  const h = harness(), input = { GIT_CEILING_DIRECTORIES: 'C:\\', git_ceiling_directories: 'C:\\Other', ANTHROPIC_AUTH_TOKEN: 'fixture-auth' }, before = JSON.stringify(input);
+  h.api.spawnManaged(request({ env: input }));
+  const env = packet(h.child).data.env;
+  assert.equal(env.GIT_CEILING_DIRECTORIES, config().stateRoot);
+  assert.equal(env.git_ceiling_directories, undefined);
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'fixture-auth');
+  const settings = h.api.mergeManagedSettings({ env: input });
+  assert.equal(settings.env.GIT_CEILING_DIRECTORIES, config().stateRoot);
+  assert.equal(settings.env.git_ceiling_directories, undefined);
+  assert.equal(JSON.stringify(input), before);
+  const f = load(), ambiguous = config(); ambiguous.stateRoot = 'C:\\Guard;Other\\CodeState';
+  rejects(() => f.api.initCodeTransport(ambiguous, () => childFixture()));
+});
 test('Desktop SDK telemetry carrier does not invalidate native launch or remove OAuth credentials', () => {
   for (const key of ['SENTRY-TRACE', 'sentry-trace', 'SeNtRy-TrAcE']) {
     const h = harness(), env = { [key]: 'fixture-trace', ANTHROPIC_AUTH_TOKEN: 'fixture-auth', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-oauth', 'ProgramFiles(x86)': 'C:\\Program Files (x86)', TRACEPARENT: 'fixture-parent' };

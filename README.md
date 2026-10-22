@@ -1,6 +1,6 @@
 # gate-claude
 
-Независимый Claude Proxy Guard: **macOS 0.3.3** и **Windows x64 0.6.0**.
+Независимый Claude Proxy Guard: **macOS 0.3.3** и **Windows x64 0.6.2**.
 
 Готовые сборки: [GitHub Releases](https://github.com/JFT-git/gate-claude/releases). Исходники распространяются по MIT; Claude в комплект не входит.
 
