@@ -8,6 +8,7 @@ const { powershell, psQuote } = require('./windows.cjs');
 
 const COVERAGE = 'private-runtime-executables';
 const MAX_EXECUTABLES = 512;
+let approvalOwner = null;
 
 async function assertNoLinks(file) {
   let cursor = file;
@@ -62,6 +63,7 @@ function safeError(message) {
 
 class NetworkFence extends EventEmitter {
   constructor() { super(); this.closed = false; this.closing = false; this.installed = false; }
+  static get approvalPending() { return approvalOwner !== null; }
 
   static async prepare(runtime, relayPort, options = {}) {
     if (process.platform !== 'win32') throw Error('Сетевая защита WFP доступна только в Windows.');
@@ -75,10 +77,21 @@ class NetworkFence extends EventEmitter {
     const name = 'gate-network-fence-' + randomBytes(16).toString('hex');
     const pipe = '\\\\.\\pipe\\' + name;
     const server = net.createServer(); instance.server = server;
+    let authenticated = false, settled = false, timeout, launchStarted = false;
+    const stage = value => { options.onStage?.(value); };
+    let armDeadline;
     const ready = new Promise((resolve, reject) => {
-      let authenticated = false, connected = false;
-      const timeout = setTimeout(() => reject(Error('Windows не подтвердила сетевую защиту. Повторите запуск и подтвердите запрос UAC.')), options.timeout || 120000);
-      const finish = (error, value) => { clearTimeout(timeout); if (error) reject(error); else resolve(value); };
+      let connected = false;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true; clearTimeout(timeout);
+        if (error) reject(error); else resolve(value);
+      };
+      armDeadline = message => {
+        if (settled) return;
+        clearTimeout(timeout);
+        timeout = setTimeout(() => finish(Error(message)), options.timeout || 120000);
+      };
       instance.once('prepare-error', error => finish(error));
       server.on('error', () => finish(Error('Не удалось открыть канал сетевой защиты.')));
       server.on('connection', socket => {
@@ -95,7 +108,9 @@ class NetworkFence extends EventEmitter {
             let message; try { message = JSON.parse(line); } catch { socket.destroy(); return; }
             if (!authenticated) {
               if (message.type !== 'hello' || message.version !== 1 || message.token !== token) { socket.destroy(); return; }
-              authenticated = true; socket.write(request); continue;
+              authenticated = true;
+              armDeadline('Windows не подтвердила установку сетевой защиты за отведённое время. Claude не запущен.');
+              stage('installing'); socket.write(request); continue;
             }
             if (message.type === 'installed') {
               if (message.version !== 1 || message.coverage !== COVERAGE || message.paths !== inventory.files.length || message.filters !== inventory.files.length * 6 || message.persistent !== true) { finish(safeError()); socket.destroy(); return; }
@@ -122,12 +137,27 @@ class NetworkFence extends EventEmitter {
     // named-pipe handshake. The runtime is never spawned from elevated code.
     ready.catch(() => {});
     try {
+      if (approvalOwner) throw Error('Сначала ответьте на предыдущий запрос Windows. Повторное подтверждение пока не запрошено.');
+      approvalOwner = instance;
       server.listen(pipe); await once(server, 'listening');
       const script = "$p=Start-Process -FilePath " + psQuote(path.resolve(helper)) + " -Verb RunAs -ArgumentList @('--pipe'," + psQuote(name) + ",'--token'," + psQuote(token) + ") -WindowStyle Hidden -PassThru; $p.Id";
-      const launch = options.launch || (value => powershell(value, options.timeout || 120000));
-      Promise.resolve(launch(script)).catch(() => instance.emit('prepare-error', Error('Не удалось включить сетевую защиту Windows. Подтвердите запрос UAC.')));
+      // ShellExecute waits for a human on the secure desktop. Its wait is not
+      // broker installation time, and killing PowerShell does not cancel UAC.
+      const launch = options.launch || (value => powershell(value, 0));
+      stage('approval'); launchStarted = true;
+      Promise.resolve().then(() => launch(script)).then(() => {
+        if (!authenticated) armDeadline('Повышенный процесс Windows не подключился к Guard. Claude не запущен.');
+      }, () => {
+        if (!settled) instance.emit('prepare-error', Error('Подтверждение Windows отменено или запуск защиты отклонён. Claude не запущен.'));
+      }).finally(() => {
+        if (approvalOwner === instance) approvalOwner = null;
+        stage('approval-ended');
+      });
       return await ready;
-    } catch (error) { instance.abandon(); throw error; }
+    } catch (error) {
+      if (!launchStarted && approvalOwner === instance) approvalOwner = null;
+      instance.abandon(); throw error;
+    }
   }
 
   async close() {

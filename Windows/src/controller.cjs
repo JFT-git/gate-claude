@@ -32,7 +32,7 @@ class GuardController extends EventEmitter {
     try { this.events = JSON.parse(fs.readFileSync(path.join(root, 'diagnostics.json'), 'utf8')).slice(-80); } catch {}
   }
   status(message) { this.message = message; this.emit('state', this.snapshot()); }
-  snapshot() { return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null, country: this.country || '', exitIP: this.policy.pinned || '' }; }
+  snapshot() { return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null, country: this.country || '', exitIP: this.policy.pinned || '', windowsApprovalPending: NetworkFence.approvalPending }; }
   log(message, kind = 'event') {
     const event = { date: new Date().toISOString(), kind, message: diagnostic(message) };
     this.events.push(event); this.events = this.events.slice(-80);
@@ -142,6 +142,13 @@ class GuardController extends EventEmitter {
       let fence;
       try { fence = await NetworkFence.prepare(this.runtime, port, {
         helperPath: path.join(this.resources, 'NetworkFence.exe'),
+        onStage: stage => {
+          if (active() && this.state !== 'rechecking') {
+            if (stage === 'approval') this.status('Подтвердите системный запрос Windows. До подтверждения защиты Claude не запускается.');
+            else if (stage === 'installing') this.status('Windows разрешила запуск защиты. Устанавливаем сетевые ограничения…');
+            else this.emit('state', this.snapshot());
+          } else this.emit('state', this.snapshot());
+        },
         ...(codeConfig ? { code: { containerName: codeConfig.containerName, containerSid: codeConfig.containerSid,
           codeJobName: codeConfig.codeJobName, relayExecutable: process.execPath } } : {})
       }); }
