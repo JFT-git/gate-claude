@@ -9,6 +9,9 @@ const SESSIONS_FILE = '.vite/build/index.chunk-CFHSNuch.js';
 const SESSIONS_SHA256 = 'a64cdcffa713797bc736cd2f7ac35425259779435f52116ca96c41322bcc130f';
 const SESSIONS_BYTES = 96497;
 const SESSIONS_FACTORY = 'function Kt(e,t){let n={...t};';
+const SCRATCH_FILE = '.vite/build/index.chunk-zA4nMcEF.js';
+const SCRATCH_SHA256 = 'dcc5d0e4208a9beb947422d4ac0c40bc68200e039889f2592efd1561a21b3f7e';
+const SCRATCH_BYTES = 4263;
 const SPAWN = 'spawnLocalProcess(e){let{command:t,args:n,cwd:r,env:i,signal:a}=e,o=(0,h.spawn)(t,n,{cwd:r,stdio:["pipe","pipe","pipe"],signal:a,env:i,windowsHide:!0});';
 const SETTINGS = 'managedSettings:l?O(l):void 0';
 const EXPORT = 'exports.query=Ske';
@@ -88,6 +91,19 @@ function findManagedCliSessions(archive) {
   patchManagedCliSessions(source);
   return { filename: SESSIONS_FILE, source, sha256: SESSIONS_SHA256 };
 }
+function findManagedCliScratch(archive) {
+  if (!archive || typeof archive.read !== 'function' || !archive.header?.files) throw failure();
+  let entry = archive.header;
+  for (const component of SCRATCH_FILE.split('/')) {
+    entry = entry.files?.[component];
+    if (!entry || entry.link || entry.unpacked) throw failure();
+  }
+  if (entry.files || entry.size !== SCRATCH_BYTES) throw failure();
+  const source = archive.read(SCRATCH_FILE);
+  if (!Buffer.isBuffer(source) || source.length !== SCRATCH_BYTES || digest(source) !== SCRATCH_SHA256) throw failure();
+  return { filename: SCRATCH_FILE, source, sha256: SCRATCH_SHA256 };
+}
 module.exports = { patchManagedCliSDK, findManagedCliSDK, SDK_SHA256, SDK_BYTES,
   patchManagedCliMain, findManagedCliMain, MAIN_FILE, MAIN_SHA256, MAIN_BYTES,
-  patchManagedCliSessions, findManagedCliSessions, SESSIONS_FILE, SESSIONS_SHA256, SESSIONS_BYTES };
+  patchManagedCliSessions, findManagedCliSessions, SESSIONS_FILE, SESSIONS_SHA256, SESSIONS_BYTES,
+  findManagedCliScratch, SCRATCH_FILE, SCRATCH_SHA256, SCRATCH_BYTES };

@@ -152,12 +152,14 @@ function configureLocalSessions(api) {
       }
       return api.start.call(api, { ...info, cwd });
     },
-    // Optional vendor prewarms create disposable scratch directories outside the
-    // permanent workspace. Decline them; normal starts above use the real folder
-    // and never label it as scratch data that the vendor may later delete.
+    // The renderer negotiates a directory through this legacy RPC before start.
+    // Return the real persistent folder, without minting/registering scratch
+    // data. Pinned vendor recognition/cleanup only accepts Profile's separate
+    // scratch-workspaces scope; CodeState/Workspace is outside that scope.
+    createScratchWorkspace: async () => ({ cwd: workspace }),
+    // Optional prewarms still create disposable directories and spare processes.
     prewarmFolderless: async () => ({ refusedReason: 'unavailable' }),
-    prewarmLocal: async () => ({ refusedReason: 'unavailable' }),
-    createScratchWorkspace: async () => ({ refusedReason: 'unavailable' })
+    prewarmLocal: async () => ({ refusedReason: 'unavailable' })
   };
 }
 function spawnManaged(options) {

@@ -214,8 +214,19 @@ test('automatic workspace selection never redirects an explicit outside path or 
 
 test('protected sessions decline optional disposable prewarms without creating or relabelling the permanent folder', async () => {
   const h = harness(), api = h.api.configureLocalSessions({ start: info => info, prewarmFolderless() { assert.fail('No disposable prewarm'); }, prewarmLocal() { assert.fail('No spare CLI'); }, createScratchWorkspace() { assert.fail('No scratch folder'); } });
-  for (const method of ['prewarmFolderless', 'prewarmLocal', 'createScratchWorkspace']) assert.deepEqual(await api[method]({ cwd: '' }), { refusedReason: 'unavailable' });
+  for (const method of ['prewarmFolderless', 'prewarmLocal']) assert.deepEqual(await api[method]({ cwd: '' }), { refusedReason: 'unavailable' });
   const info = api.start({ cwd: '', message: 'kept' }); assert.equal(info.cwd, config().stateRoot + '\\Workspace'); assert.equal(info.isScratchWorkspace, undefined);
+});
+
+test('renderer folderless directory negotiation resolves Workspace before its required start call', async () => {
+  const h = harness(), calls = [], api = h.api.configureLocalSessions({ start: info => { calls.push(info); return { sessionId: 'real-start' }; }, createScratchWorkspace() { assert.fail('No temporary directory may be minted'); } });
+  const directory = await api.createScratchWorkspace();
+  assert.deepEqual(directory, { cwd: config().stateRoot + '\\Workspace' });
+  assert.equal(calls.length, 0, 'Directory negotiation must not create a hidden session');
+  assert.deepEqual(api.start({ cwd: directory.cwd, message: 'owned request' }), { sessionId: 'real-start' });
+  assert.equal(calls[0].cwd, directory.cwd); assert.equal(calls[0].isScratchWorkspace, undefined);
+  directory.cwd = 'C:\\Outside';
+  assert.equal((await api.createScratchWorkspace()).cwd, config().stateRoot + '\\Workspace', 'Returned objects cannot change the immutable directory');
 });
 
 

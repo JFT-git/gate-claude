@@ -17,7 +17,7 @@ function archive(files) {
   }
   const raw = Buffer.from(JSON.stringify(header)), pad = (4 - raw.length % 4) % 4, prefix = Buffer.alloc(16); prefix.writeUInt32LE(4); prefix.writeUInt32LE(raw.length + pad + 8, 4); prefix.writeUInt32LE(raw.length + pad + 4, 8); prefix.writeUInt32LE(raw.length, 12); return Buffer.concat([prefix, raw, Buffer.alloc(pad), payload]);
 }
-function fixtureArchive() { return archive({ 'package.json': Buffer.from(JSON.stringify({ name: '@ant/desktop', version: 'fixture', main: '.vite/build/main.js' })), '.vite/build/main.js': Buffer.from('module.exports.vendorFixture=true;'), '.vite/build/index.chunk-fixture.js': Buffer.from('module.exports.queryFixture=true;'), '.vite/build/index.chunk-main-fixture.js': Buffer.from('module.exports.pluginFixture=true;'), '.vite/build/index.chunk-sessions-fixture.js': Buffer.from('module.exports.sessionsFixture=true;') }); }
+function fixtureArchive() { return archive({ 'package.json': Buffer.from(JSON.stringify({ name: '@ant/desktop', version: 'fixture', main: '.vite/build/main.js' })), '.vite/build/main.js': Buffer.from('module.exports.vendorFixture=true;'), '.vite/build/index.chunk-fixture.js': Buffer.from('module.exports.queryFixture=true;'), '.vite/build/index.chunk-main-fixture.js': Buffer.from('module.exports.pluginFixture=true;'), '.vite/build/index.chunk-sessions-fixture.js': Buffer.from('module.exports.sessionsFixture=true;'), '.vite/build/index.chunk-scratch-fixture.js': Buffer.from('module.exports.scratchFixture=true;') }); }
 function guardSection(options, code) {
   const fake = 'module.exports.installNetworkGuard=function(){events.push("guard");return {spawnCodeBroker:capability}};';
   const generated = A.windowsBootstrap(base, fake, options).toString(), start = generated.indexOf('\n{const guardModule='), end = generated.indexOf('\nconst sessions =', start);
@@ -46,20 +46,22 @@ test('ordinary bootstraps never initialize Code and refuse an unexpected enabled
 });
 test('the actual original ASAR receives the pinned SDK and marketplace patches with their shared sibling transport', t => {
   const filename = path.resolve(__dirname, '../../../../work/windows/source/app/resources/app.asar'); if (!fs.existsSync(filename)) return t.skip('Original vendor source cache is not distributed.');
-  const original = fs.readFileSync(filename), unchangedHash = A.hash(original), parsed = A.parseArchive(original), sdk = P.findManagedCliSDK(parsed), codeMain = P.findManagedCliMain(parsed), codeSessions = P.findManagedCliSessions(parsed), own = fs.readFileSync(path.join(__dirname, '../src/managed-cli.cjs'));
-  const patched = A.addBootstrap(original, A.windowsBootstrap(base, fs.readFileSync(path.join(__dirname, '../src/runtime-network-guard.cjs'), 'utf8'), { codeEnabled: true }), [{ name: sdk.filename, source: P.patchManagedCliSDK(sdk.source) }, { name: codeMain.filename, source: P.patchManagedCliMain(codeMain.source) }, { name: codeSessions.filename, source: P.patchManagedCliSessions(codeSessions.source) }, { name: '.vite/build/proxy-guard-managed-cli.cjs', source: own }]);
+  const original = fs.readFileSync(filename), unchangedHash = A.hash(original), parsed = A.parseArchive(original), sdk = P.findManagedCliSDK(parsed), codeMain = P.findManagedCliMain(parsed), codeSessions = P.findManagedCliSessions(parsed), codeScratch = P.findManagedCliScratch(parsed), own = fs.readFileSync(path.join(__dirname, '../src/managed-cli.cjs'));
+  const patched = A.addBootstrap(original, A.windowsBootstrap(base, fs.readFileSync(path.join(__dirname, '../src/runtime-network-guard.cjs'), 'utf8'), { codeEnabled: true }), [{ name: sdk.filename, source: P.patchManagedCliSDK(sdk.source) }, { name: codeMain.filename, source: P.patchManagedCliMain(codeMain.source) }, { name: codeSessions.filename, source: P.patchManagedCliSessions(codeSessions.source) }, { name: codeScratch.filename, source: codeScratch.source }, { name: '.vite/build/proxy-guard-managed-cli.cjs', source: own }]);
   const result = A.parseArchive(patched.archive); assert.equal(A.hash(original), unchangedHash); assert.ok(result.read('.vite/build/proxy-guard-managed-cli.cjs').equals(own)); assert.match(result.read(sdk.filename).toString(), /__gateCli\.spawnManaged\(e\)/); new vm.Script(result.read(sdk.filename).toString()); new vm.Script(result.read('.vite/build/proxy-guard-boot.cjs').toString());
   assert.equal(A.hash(parsed.read(codeMain.filename)), P.MAIN_SHA256); assert.ok(result.read(codeMain.filename).equals(P.patchManagedCliMain(codeMain.source))); assert.equal(result.entry(codeMain.filename).integrity.hash, A.hash(result.read(codeMain.filename))); new vm.Script(result.read(codeMain.filename).toString());
   assert.equal(A.hash(parsed.read(codeSessions.filename)), P.SESSIONS_SHA256); assert.ok(result.read(codeSessions.filename).equals(P.patchManagedCliSessions(codeSessions.source))); assert.equal(result.entry(codeSessions.filename).integrity.hash, A.hash(result.read(codeSessions.filename))); new vm.Script(result.read(codeSessions.filename).toString());
+  assert.ok(result.read(codeScratch.filename).equals(codeScratch.source)); assert.equal(result.entry(codeScratch.filename).integrity.hash, P.SCRATCH_SHA256);
 });
 async function runtimeFixture(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gate-runtime-managed-'))); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const sourceDir = path.join(root, 'Source'), guardRoot = path.join(root, 'Guard'); fs.mkdirSync(path.join(sourceDir, 'resources'), { recursive: true }); const source = path.join(sourceDir, 'claude.exe'); fs.writeFileSync(source, 'owned-executable-fixture'); fs.writeFileSync(path.join(sourceDir, 'resources', 'app.asar'), fixtureArchive());
-  let transport = Buffer.from('module.exports={initCodeTransport(){}};/* fixture-v1 */'), patchCalls = 0, selections = 0, mainPatchCalls = 0, mainSelections = 0, rejectMain = false, rejectSessions = false; const status = [];
+  let transport = Buffer.from('module.exports={initCodeTransport(){}};/* fixture-v1 */'), patchCalls = 0, selections = 0, mainPatchCalls = 0, mainSelections = 0, rejectMain = false, rejectSessions = false, rejectScratch = false; const status = [];
   const asar = { ...A, updatePEIntegrity: (bytes, before, after) => Buffer.from('owned-prepared-exe-' + after) };
   const patch = { findManagedCliSDK: parsed => { selections++; return { filename: '.vite/build/index.chunk-fixture.js', source: parsed.read('.vite/build/index.chunk-fixture.js') }; }, patchManagedCliSDK: bytes => { patchCalls++; return Buffer.concat([Buffer.from('const protectedFixture=true;'), bytes]); },
     findManagedCliMain: parsed => { mainSelections++; if (rejectMain) throw Error('Unsupported fixture main'); return { filename: '.vite/build/index.chunk-main-fixture.js', source: parsed.read('.vite/build/index.chunk-main-fixture.js') }; }, patchManagedCliMain: bytes => { mainPatchCalls++; return Buffer.concat([Buffer.from('const protectedMainFixture=true;'), bytes]); },
-    findManagedCliSessions: parsed => { if (rejectSessions) throw Error('Unsupported fixture sessions'); return { filename: '.vite/build/index.chunk-sessions-fixture.js', source: parsed.read('.vite/build/index.chunk-sessions-fixture.js') }; }, patchManagedCliSessions: bytes => Buffer.concat([Buffer.from('const protectedSessionsFixture=true;'), bytes]) };
+    findManagedCliSessions: parsed => { if (rejectSessions) throw Error('Unsupported fixture sessions'); return { filename: '.vite/build/index.chunk-sessions-fixture.js', source: parsed.read('.vite/build/index.chunk-sessions-fixture.js') }; }, patchManagedCliSessions: bytes => Buffer.concat([Buffer.from('const protectedSessionsFixture=true;'), bytes]),
+    findManagedCliScratch: parsed => { if (rejectScratch) throw Error('Unsupported fixture scratch'); return { filename: '.vite/build/index.chunk-scratch-fixture.js', source: parsed.read('.vite/build/index.chunk-scratch-fixture.js') }; } };
   const module = { exports: {} }, realRequire = require;
   const localRequire = name => {
     if (name === './raw-fs.cjs') return { promises: fs.promises }; if (name === './asar.cjs') return asar; if (name === './managed-cli-patch.cjs') return patch;
@@ -68,7 +70,7 @@ async function runtimeFixture(t) {
     return realRequire(name);
   };
   new Function('require', 'module', 'exports', 'process', '__dirname', fs.readFileSync(path.join(__dirname, '../src/runtime.cjs'), 'utf8'))(localRequire, module, module.exports, { platform: 'darwin' }, path.resolve(__dirname, '../src'));
-  return { root, guardRoot, source, status, prepare: options => module.exports.prepareRuntime(source, guardRoot, basePath, value => status.push(value), options), counters: () => ({ patchCalls, selections, mainPatchCalls, mainSelections }), setTransport: value => { transport = Buffer.from(value); }, rejectMain: () => { rejectMain = true; }, rejectSessions: () => { rejectSessions = true; } };
+  return { root, guardRoot, source, status, prepare: options => module.exports.prepareRuntime(source, guardRoot, basePath, value => status.push(value), options), counters: () => ({ patchCalls, selections, mainPatchCalls, mainSelections }), setTransport: value => { transport = Buffer.from(value); }, rejectMain: () => { rejectMain = true; }, rejectSessions: () => { rejectSessions = true; }, rejectScratch: () => { rejectScratch = true; } };
 }
 test('runtime Code preparation is explicit, has its own cache fingerprint and reuses only matching actual module bytes', async t => {
   const f = await runtimeFixture(t), originalArchive = fs.readFileSync(path.join(path.dirname(f.source), 'resources', 'app.asar')), ordinary = await f.prepare(); assert.equal(ordinary.codeEnabled, false); assert.deepEqual(f.counters(), { patchCalls: 0, selections: 0, mainPatchCalls: 0, mainSelections: 0 });
@@ -80,7 +82,9 @@ test('runtime Code preparation is explicit, has its own cache fingerprint and re
   await f.prepare({ codeEnabled: true }); assert.equal(f.status.length, 4, 'A changed marketplace module payload must also invalidate the cache');
   const sessionBytes = fs.readFileSync(archivePath), sessionArchive = A.parseArchive(sessionBytes), sessionEntry = sessionArchive.entry('.vite/build/index.chunk-sessions-fixture.js'); sessionBytes[sessionArchive.payloadStart + Number(sessionEntry.offset)] ^= 1; fs.writeFileSync(archivePath, sessionBytes);
   await f.prepare({ codeEnabled: true }); assert.equal(f.status.length, 5, 'A changed session factory payload must invalidate the cache');
-  f.setTransport('module.exports={initCodeTransport(){}};/* fixture-v2 */'); const updated = await f.prepare({ codeEnabled: true }); assert.notEqual(updated.executable, enabled.executable); assert.equal(f.status.length, 6);
+  const scratchBytes = fs.readFileSync(archivePath), scratchArchive = A.parseArchive(scratchBytes), scratchEntry = scratchArchive.entry('.vite/build/index.chunk-scratch-fixture.js'); scratchBytes[scratchArchive.payloadStart + Number(scratchEntry.offset)] ^= 1; fs.writeFileSync(archivePath, scratchBytes);
+  await f.prepare({ codeEnabled: true }); assert.equal(f.status.length, 6, 'Unmodified scratch lifecycle bytes must also remain pinned in the runtime cache');
+  f.setTransport('module.exports={initCodeTransport(){}};/* fixture-v2 */'); const updated = await f.prepare({ codeEnabled: true }); assert.notEqual(updated.executable, enabled.executable); assert.equal(f.status.length, 7);
   assert.ok(fs.readFileSync(path.join(path.dirname(f.source), 'resources', 'app.asar')).equals(originalArchive), 'Original signed source remains the hash authority');
 });
 test('an unsupported Code main fails before creating a runtime while ordinary Chat remains available', async t => {
@@ -90,5 +94,10 @@ test('an unsupported Code main fails before creating a runtime while ordinary Ch
 
 test('an unsupported local session module cannot create a protected runtime', async t => {
   const f = await runtimeFixture(t); f.rejectSessions(); await assert.rejects(f.prepare({ codeEnabled: true }), /Unsupported fixture sessions/); assert.equal(f.status.length, 0); assert.equal(fs.existsSync(f.guardRoot), false);
+  assert.equal((await f.prepare()).codeEnabled, false);
+});
+
+test('an unsupported scratch lifecycle module cannot create a protected runtime', async t => {
+  const f = await runtimeFixture(t); f.rejectScratch(); await assert.rejects(f.prepare({ codeEnabled: true }), /Unsupported fixture scratch/); assert.equal(f.status.length, 0); assert.equal(fs.existsSync(f.guardRoot), false);
   assert.equal((await f.prepare()).codeEnabled, false);
 });
