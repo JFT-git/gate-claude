@@ -15,6 +15,7 @@ enum IPIdentity {
 }
 
 struct SessionPolicy {
+    private(set) var destinationPins: [String: String] = [:]
     private(set) var pinnedIP: String?
     private(set) var lockedReason: String?
     private(set) var suspended = false
@@ -39,9 +40,24 @@ struct SessionPolicy {
         suspended = false
     }
 
+    mutating func verifyDestination(hostname: String, ip: String, countryCode: String) throws {
+        guard !requiresRestart, pinnedIP != nil, IPChecker.destinationHosts.contains(hostname) else { throw GuardError.message("Исходный маршрут не подтверждён.") }
+        let canonical = try IPIdentity.canonical(ip)
+        guard countryCode.range(of: "^[A-Z]{2}$", options: .regularExpression) != nil else { throw GuardError.message("Страна маршрута Claude не определена.") }
+        if countryCode == "RU" {
+            let reason = "Маршрут Claude вышел через RU. Перезапустите Guard."
+            latch(reason); throw GuardError.message(reason)
+        }
+        if let baseline = destinationPins[hostname], baseline != canonical {
+            let reason = "Внешний IP маршрута Claude изменился: \(baseline) → \(canonical). Перезапустите Guard."
+            latch(reason); throw GuardError.message(reason)
+        }
+        destinationPins[hostname] = canonical
+    }
+
     mutating func suspend() { if !requiresRestart, pinnedIP != nil { suspended = true } }
     mutating func latch(_ reason: String) { if lockedReason == nil { lockedReason = reason }; suspended = true }
-    mutating func manualStop() { if !requiresRestart { pinnedIP = nil; suspended = false } }
+    mutating func manualStop() { if !requiresRestart { pinnedIP = nil; destinationPins = [:]; suspended = false } }
 }
 
 struct LaunchProfile {

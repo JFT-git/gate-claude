@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import Darwin
+import Security
 
 enum GuardError: LocalizedError {
     case message(String)
@@ -66,8 +67,8 @@ struct IPReport: Equatable {
 enum IPChecker {
     // curl is bundled with macOS. -q must be the first argument: ignore ~/.curlrc.
     // Clear proxy environment variables so the only route is the explicitly selected one.
-    static func check(relayPort: UInt16?) async throws -> IPReport {
-        try IPReport.parse(await fetch(url: "https://ipwho.is/?fields=success,ip,country_code", relayPort: relayPort, timeout: 12))
+    static func check(relayPort: UInt16?, token: String) async throws -> IPReport {
+        try IPReport.parse(await fetch(url: "https://ipwho.is/?fields=success,ip,country_code", relayPort: relayPort, token: token, timeout: 12))
     }
 
     static func publicIPURL(for pinnedIP: String?) -> String {
@@ -77,24 +78,55 @@ enum IPChecker {
         return "https://\(host)?format=json"
     }
 
-    static func publicIP(relayPort: UInt16?, pinnedIP: String? = nil) async throws -> String {
-        let data = try await fetch(url: publicIPURL(for: pinnedIP), relayPort: relayPort, timeout: 4)
+    static func publicIP(relayPort: UInt16?, token: String, pinnedIP: String? = nil) async throws -> String {
+        let data = try await fetch(url: publicIPURL(for: pinnedIP), relayPort: relayPort, token: token, timeout: 4)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let ip = json["ip"] as? String else { throw GuardError.message("Не удалось определить внешний IP.") }
         return try IPIdentity.canonical(ip)
     }
 
-    private static func fetch(url: String, relayPort: UInt16?, timeout: Int) async throws -> Data {
+    static let destinationHosts = ["claude.ai", "api.anthropic.com"]
+
+    static func parseDestinationTrace(_ data: Data, hostname: String, family: Int) throws -> (ip: String, countryCode: String) {
+        func invalid() -> GuardError { .message("Не удалось проверить маршрут Claude. Соединение закрыто.") }
+        guard destinationHosts.contains(hostname), [4, 6].contains(family), data.count <= 16384,
+              data.allSatisfy({ (32...126).contains($0) || $0 == 10 || $0 == 13 }),
+              let body = String(data: data, encoding: .ascii),
+              body.range(of: "\\r(?!\\n)", options: .regularExpression) == nil else { throw invalid() }
+        var fields: [String: String] = [:]
+        for line in body.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n") where !line.isEmpty {
+            guard let split = line.firstIndex(of: "=") else { throw invalid() }
+            let key = String(line[..<split]), value = String(line[line.index(after: split)...])
+            guard key.range(of: "^[a-z_]+$", options: .regularExpression) != nil else { throw invalid() }
+            if ["h", "ip", "loc"].contains(key) {
+                guard fields[key] == nil else { throw invalid() }
+                fields[key] = value
+            }
+        }
+        guard fields["h"] == hostname, let ip = fields["ip"], !ip.contains("%"),
+              let code = fields["loc"], code.range(of: "^[A-Z]{2}$", options: .regularExpression) != nil else { throw invalid() }
+        let canonical = try IPIdentity.canonical(ip)
+        guard !canonical.lowercased().hasPrefix("::ffff:") else { throw invalid() }
+        return (canonical, code)
+    }
+
+    static func destinationTrace(relayPort: UInt16, token: String, hostname: String, family: Int) async throws -> (ip: String, countryCode: String) {
+        guard destinationHosts.contains(hostname), [4, 6].contains(family) else { throw GuardError.message("Неверное назначение проверки Claude.") }
+        return try parseDestinationTrace(await fetch(url: "https://\(hostname)/cdn-cgi/trace", relayPort: relayPort, token: token, timeout: 4, limit: 16384), hostname: hostname, family: family)
+    }
+
+    private static func fetch(url: String, relayPort: UInt16?, token: String, timeout: Int, limit: Int = 65536) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
                     var args = ["-q", "--silent", "--show-error", "--fail", "--connect-timeout", "3",
-                                "--max-time", String(timeout), "--max-filesize", "65536", "--proto", "=https",
+                                "--max-time", String(timeout), "--max-filesize", String(limit), "--proto", "=https",
                                 "--max-redirs", "0", "--header", "Cache-Control: no-cache"]
                     if let port = relayPort {
-                        args += ["--proxy", "http://127.0.0.1:\(port)", "--noproxy", ""]
+                        guard token.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { throw GuardError.message("Неверный токен проверки.") }
+                        args += ["--proxy", "http://127.0.0.1:\(port)", "--noproxy", "", "--proxy-header", "Proxy-Authorization: Bearer \(token)"]
                     } else {
                         args += ["--proxy", "", "--noproxy", "*"]
                     }
@@ -106,7 +138,11 @@ enum IPChecker {
                     let output = Pipe()
                     process.standardOutput = output; process.standardError = FileHandle.nullDevice
                     try process.run()
-                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    var data = Data()
+                    while let chunk = try output.fileHandleForReading.read(upToCount: 4096), !chunk.isEmpty {
+                        if data.count + chunk.count > limit { process.terminate(); process.waitUntilExit(); throw GuardError.message("Слишком большой ответ проверки IP.") }
+                        data.append(chunk)
+                    }
                     process.waitUntilExit()
                     guard process.terminationStatus == 0 else {
                         throw GuardError.message("Ошибка проверки IP (сеть, прокси или сервис). Доступ закрыт.")
@@ -121,6 +157,11 @@ enum IPChecker {
 /// A local CONNECT bridge. SOCKS mode never falls back to a direct destination.
 /// Current-network mode is an explicit choice and still passes through this gate.
 final class SOCKSRelay: @unchecked Sendable {
+    let checkToken: String = {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { fatalError("Не удалось создать токен шлюза.") }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }()
     enum Mode { case probeOnly, open, blocked }
     enum PinFamily { case v4, v6 }
     private let queue = DispatchQueue(label: "local.proxyguard.relay")
@@ -168,12 +209,12 @@ final class SOCKSRelay: @unchecked Sendable {
                             connection.cancel(); return
                         }
                         let id = UUID()
-                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily)
-                        tunnel.isAllowed = { [weak self] host, port in
+                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily, checkToken: self.checkToken)
+                        tunnel.isAllowed = { [weak self] host, port, control in
                             guard let self, self.alive else { return false }
                             switch self.mode {
                             case .open: return true
-                            case .probeOnly: return ["ipwho.is", "api.ipify.org", "api6.ipify.org", "api64.ipify.org"].contains(host.lowercased()) && port == 443
+                            case .probeOnly: return control
                             case .blocked: return false
                             }
                         }
@@ -214,12 +255,12 @@ final class SOCKSRelay: @unchecked Sendable {
         }
     }
 
-    /// Close every existing stream before allowing only fresh IP-control requests.
+    /// Pause application streams while preserving authenticated control checks.
     func pause() {
         queue.sync {
             guard alive else { return }
             mode = .probeOnly
-            for tunnel in Array(tunnels.values) { tunnel.close() }
+            for tunnel in Array(tunnels.values) where !tunnel.isControl { tunnel.close() }
         }
     }
 
@@ -234,13 +275,15 @@ final class SOCKSRelay: @unchecked Sendable {
     private func upstreamFailed() {
         guard alive, !faultReported else { return }
         faultReported = true; mode = .probeOnly
-        for tunnel in Array(tunnels.values) { tunnel.close() }
+        for tunnel in Array(tunnels.values) where !tunnel.isControl { tunnel.close() }
         let callback = onFault
         DispatchQueue.main.async { callback?() }
     }
 }
 
 private final class RelayTunnel {
+    private let checkToken: String
+    private(set) var isControl = false
     private let client: NWConnection
     private var upstream: NWConnection?
     private let settings: ProxySettings?
@@ -255,12 +298,13 @@ private final class RelayTunnel {
     private var sentBytes = 0
     private var receivedBytes = 0
     var onEvent: ((String, UInt16, Int, Int, Bool) -> Void)?
-    var isAllowed: ((String, UInt16) -> Bool)?
+    var isAllowed: ((String, UInt16, Bool) -> Bool)?
     var onClose: (() -> Void)?
     var onUpstreamFault: (() -> Void)?
     var onProbeConnected: (() -> Void)?
 
-    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?) {
+    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?, checkToken: String) {
+        self.checkToken = checkToken
         self.client = client; self.settings = settings; self.queue = queue
         self.pinnedFamily = pinnedFamily
     }
@@ -305,15 +349,27 @@ private final class RelayTunnel {
                       words[2] == "HTTP/1.1" || words[2] == "HTTP/1.0" else {
                     self.reject(); return
                 }
+                let credentials = text.components(separatedBy: "\r\n").dropFirst().compactMap { line -> String? in
+                    guard let colon = line.firstIndex(of: ":"), line[..<colon].lowercased() == "proxy-authorization" else { return nil }
+                    return line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                }
+                var validToken = false
+                if credentials.count == 1, credentials[0].range(of: "^Bearer [a-f0-9]{64}$", options: [.regularExpression, .caseInsensitive]) != nil {
+                    let supplied = Array(credentials[0].dropFirst(7).utf8), expected = Array(self.checkToken.utf8)
+                    var difference: UInt8 = 0
+                    for i in 0..<64 { difference |= supplied[i] ^ expected[i] }
+                    validToken = difference == 0
+                }
                 let authority = String(words[1])
                 guard let split = authority.lastIndex(of: ":"),
                       let port = UInt16(authority[authority.index(after: split)...]), port > 0 else {
                     self.reject(); return
                 }
                 let host = String(authority[..<split]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+                self.isControl = validToken && port == 443 && (["ipwho.is", "api.ipify.org", "api6.ipify.org", "api64.ipify.org"] + IPChecker.destinationHosts).contains(host.lowercased())
                 guard !host.isEmpty, host.utf8.count <= 255,
                       !host.contains(where: { $0.isWhitespace }), !host.contains("@"),
-                      self.isAllowed?(host, port) == true else {
+                      self.isAllowed?(host, port, self.isControl) == true else {
                     self.reject(); return
                 }
                 self.destination = host; self.port = port
@@ -457,7 +513,7 @@ private final class RelayTunnel {
     }
 
     private func connected() {
-        guard !closed, isAllowed?(destination, port) == true else { close(); return }
+        guard !closed, isAllowed?(destination, port, isControl) == true else { close(); return }
         if ["ipwho.is", "api.ipify.org", "api6.ipify.org", "api64.ipify.org"].contains(destination.lowercased()), port == 443 { onProbeConnected?() }
         established = true
         onEvent?(destination, port, 0, 0, false)

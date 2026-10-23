@@ -108,6 +108,7 @@ import Darwin
         defer { try? FileManager.default.removeItem(at: root) }
         let model = GuardModel(diagnosticsURL: root.appendingPathComponent("diagnostics.jsonl"))
         model.e2eRuntimeRoot = root // Prevent writing actual preferences.
+        model.e2eSystemProxyCapture = { try SystemProxy.parse("<dictionary> {\n}") }
         model.useProxy = false; model.interval = 30; model.watchPublicIP = true
         model.timezone = "Europe/Amsterdam"; model.language = "en-US"
         model.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "NL", date: Date()) }
@@ -167,6 +168,30 @@ import Darwin
         expect(!model.allowed && !model.monitoring && model.e2eRelayPort == nil, "confirmed changed IP closes the relay and requires restart")
         model.stop(); model.check(andLaunch: false)
         expect(model.requiresRestart && !model.allowed, "manual stop cannot clear the confirmed IP-change lock")
+        let proxyModel = GuardModel(diagnosticsURL: root.appendingPathComponent("proxy-diagnostics.jsonl"))
+        proxyModel.e2eRuntimeRoot = root; proxyModel.useProxy = false
+        proxyModel.watchPublicIP = true
+        proxyModel.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "NL", date: Date()) }
+        proxyModel.e2ePublicCheck = { _ in "203.0.113.7" }
+        var proxyHost = "first.example"
+        var proxyReadFails = false
+        proxyModel.e2eSystemProxyCapture = {
+            if proxyReadFails { throw GuardError.message("Тестовая ошибка чтения прокси") }
+            return try SystemProxy.parse("<dictionary> {\nSOCKSEnable : 1\nSOCKSProxy : \(proxyHost)\nSOCKSPort : 1080\n}")
+        }
+        defer { proxyModel.shutdown() }
+        proxyModel.check(andLaunch: false)
+        expect(await wait { proxyModel.allowed }, "static system proxy is pinned at session start")
+        proxyReadFails = true; proxyModel.e2eVerifyNow()
+        expect(await wait { proxyModel.e2eSuspended && !proxyModel.allowed }, "proxy read failure pauses traffic for revalidation")
+        expect(!proxyModel.requiresRestart, "proxy read failure does not latch a confirmed change")
+        proxyReadFails = false
+        expect(await wait { proxyModel.allowed }, "unchanged proxy after read recovery resumes traffic")
+        proxyHost = "second.example"; proxyModel.e2eVerifyNow()
+        expect(await wait { proxyModel.requiresRestart }, "changed pinned proxy fingerprint requires restart")
+        expect(!proxyModel.allowed && !proxyModel.monitoring && proxyModel.e2eRelayPort == nil, "confirmed proxy change closes the session relay")
+        proxyModel.stop(); proxyModel.check(andLaunch: false)
+        expect(proxyModel.requiresRestart && !proxyModel.allowed, "manual stop cannot clear the proxy-change latch")
         print("RECOVERY TESTS: \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }

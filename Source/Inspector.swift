@@ -81,6 +81,29 @@ enum TrafficSanitizer {
         }
         return bounded(result)
     }
+    static func auditRequestHeaders(_ headers: [String: Any], language: String) -> [String] {
+        let expected = language.lowercased()
+        let primary = String(expected.split(separator: "-", omittingEmptySubsequences: false)[0])
+        let grammar = try! NSRegularExpression(pattern: #"^[ \t]*([a-z]{1,8}(?:-[a-z0-9]{1,8})*)[ \t]*(?:;[ \t]*q=(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?))?[ \t]*$"#, options: .caseInsensitive)
+        var flags: [String] = []
+        func flag(_ value: String) { if !flags.contains(value) { flags.append(value) } }
+        for (key, value) in headers where key.lowercased() == "accept-language" {
+            guard let value = value as? String, !value.isEmpty,
+                  !value.contains("\r"), !value.contains("\n") else {
+                flag("transport.Accept-Language.invalid"); continue
+            }
+            for part in value.components(separatedBy: ",") {
+                let range = NSRange(part.startIndex..., in: part)
+                guard let match = grammar.firstMatch(in: part, range: range), match.range == range,
+                      let tagRange = Range(match.range(at: 1), in: part) else {
+                    flag("transport.Accept-Language.invalid"); continue
+                }
+                let tag = part[tagRange].lowercased()
+                if tag != expected && tag != primary { flag("transport.Accept-Language.mismatch") }
+            }
+        }
+        return flags
+    }
     static func audit(headers: [String: Any], body: String) -> [String] {
         var flags = Set<String>()
         func inspect(key: String, value: String) {
@@ -375,9 +398,14 @@ final class ClaudeInspector: @unchecked Sendable {
             let headers = p["headers"] as? [String: Any] ?? [:]
             if var record = records[key] {
                 record.requestHeaders = TrafficSanitizer.headers(headers)
-                record.warnings = Array(Set(record.warnings + TrafficSanitizer.audit(headers: headers, body: ""))).sorted()
+                record.warnings = Array(Set(record.warnings + TrafficSanitizer.audit(headers: headers, body: "") + TrafficSanitizer.auditRequestHeaders(headers, language: profile.language))).sorted()
                 save(record)
             } else {
+                let warnings = TrafficSanitizer.auditRequestHeaders(headers, language: profile.language)
+                if !warnings.isEmpty {
+                    fatal("Проверка профиля не пройдена: " + warnings.joined(separator: ", ") + ".")
+                    return
+                }
                 if earlyRequestHeaders.count >= 200 { earlyRequestHeaders.removeAll() }
                 earlyRequestHeaders[key] = headers
             }
@@ -396,7 +424,7 @@ final class ClaudeInspector: @unchecked Sendable {
             let headers = earlyRequestHeaders.removeValue(forKey: key) ?? (request["headers"] as? [String: Any] ?? [:])
             let body = request["postData"] as? String ?? ""
             record.requestHeaders = TrafficSanitizer.headers(headers)
-            record.warnings = TrafficSanitizer.audit(headers: headers, body: body)
+            record.warnings = Array(Set(TrafficSanitizer.audit(headers: headers, body: body) + TrafficSanitizer.auditRequestHeaders(headers, language: profile.language))).sorted()
             record.sent = captureBodies ? TrafficSanitizer.body(body) : "[содержимое отключено]"
             save(record)
         case "Network.responseReceived":
@@ -436,6 +464,14 @@ final class ClaudeInspector: @unchecked Sendable {
         case "Network.webSocketCreated":
             var record = TrafficRecord(id: key); record.method = "WS"; record.kind = "WebSocket"
             record.url = TrafficSanitizer.safeURL(p["url"] as? String ?? ""); save(record)
+        case "Network.webSocketWillSendHandshakeRequest":
+            if var record = records[key] {
+                let request = p["request"] as? [String: Any] ?? [:]
+                let headers = request["headers"] as? [String: Any] ?? [:]
+                record.requestHeaders = TrafficSanitizer.headers(headers)
+                record.warnings = Array(Set(record.warnings + TrafficSanitizer.audit(headers: headers, body: "") + TrafficSanitizer.auditRequestHeaders(headers, language: profile.language))).sorted()
+                save(record)
+            }
         case "Network.webSocketFrameSent", "Network.webSocketFrameReceived":
             guard captureBodies, var record = records[key], let response = p["response"] as? [String: Any] else { return }
             let text = (response["opcode"] as? Int == 1) ? TrafficSanitizer.body(response["payloadData"] as? String ?? "") : "[бинарный WebSocket-кадр]"

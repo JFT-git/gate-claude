@@ -9,12 +9,13 @@ import Network
     static func rejected(_ label: String, _ body: () throws -> Void) {
         do { try body(); expect(false, label) } catch { expect(true, label) }
     }
-    static func request(_ port: UInt16, host: String, destinationPort: UInt16 = 443) async -> (Int32, String) {
+    static func request(_ port: UInt16, host: String, destinationPort: UInt16 = 443, token: String? = nil) async -> (Int32, String) {
         await withCheckedContinuation { continuation in
             DispatchQueue.global().async {
                 let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
                 p.arguments = ["-q", "--silent", "--show-error", "--fail", "--max-time", "5", "--noproxy", "",
                                "--proxy", "http://127.0.0.1:\(port)", "--proxytunnel", "http://\(host):\(destinationPort)/"]
+                if let token { p.arguments! += ["--proxy-header", "Proxy-Authorization: Bearer \(token)"] }
                 let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
                 do {
                     try p.run(); let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
@@ -66,6 +67,21 @@ import Network
             expect(profile.environment(["TZ": "Europe/Moscow"])["TZ"] == "Europe/Amsterdam", "process timezone override replaces Moscow")
             expect(profile.arguments.contains("--lang=en-US") && profile.arguments.contains("(en-US)"), "Chromium and native language launch arguments present")
         } catch { expect(false, "session policy setup") }
+        let trace = "h=claude.ai\nip=203.0.113.7\nloc=DE\n"
+        do {
+            let result = try IPChecker.parseDestinationTrace(Data(trace.utf8), hostname: "claude.ai", family: 4)
+            expect(result.ip == "203.0.113.7" && result.countryCode == "DE", "valid destination trace")
+            var policy = SessionPolicy()
+            try policy.establish(IPReport.parse(json("DE", "203.0.113.1")))
+            try policy.verifyDestination(hostname: "claude.ai", ip: result.ip, countryCode: result.countryCode)
+            rejected("destination IP change rejected") { try policy.verifyDestination(hostname: "claude.ai", ip: "203.0.113.8", countryCode: "DE") }
+            expect(policy.requiresRestart, "destination change latches like main IP")
+        } catch { expect(false, "destination policy setup") }
+        for (label, body) in [("bad h", trace.replacingOccurrences(of: "h=claude.ai", with: "h=example.com")),
+                              ("mapped IP", trace.replacingOccurrences(of: "203.0.113.7", with: "::ffff:203.0.113.7")),
+                              ("duplicate key", trace + "ip=203.0.113.7\n"), ("non ASCII", trace + "x=я\n"), ("invalid line", trace + "invalid\n")] {
+            rejected("trace rejects \(label)") { _ = try IPChecker.parseDestinationTrace(Data(body.utf8), hostname: "claude.ai", family: 4) }
+        }
         guard CommandLine.arguments.count > 1, let upstreamPort = UInt16(CommandLine.arguments[1]) else { exit(2) }
         do {
             // A direct HTTP fixture, separate from run.py's authenticated SOCKS server.
@@ -112,7 +128,7 @@ import Network
             let port = try await relay.start()
             let denied = await request(port, host: "destination.test")
             expect(denied.0 != 0, "arbitrary destination blocked before verification")
-            let probe = await request(port, host: "ipwho.is")
+            let probe = await request(port, host: "ipwho.is", token: relay.checkToken)
             expect(probe.0 == 0 && probe.1 == "ok:ipwho.is", "probe uses authenticated SOCKS and remote hostname")
             expect(relay.unlock(), "verified bridge unlocks")
             let allowed = await request(port, host: "destination.test")
@@ -137,7 +153,30 @@ import Network
                 queue.asyncAfter(deadline: .now() + 5) { finish(false) }
             }
             expect(connected, "long-lived tunnel established")
+            let control = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+            let controlReady: Bool = await withCheckedContinuation { continuation in
+                control.stateUpdateHandler = { state in
+                    if case .ready = state {
+                        control.send(content: Data("CONNECT claude.ai:443 HTTP/1.1\r\nProxy-Authorization: Bearer \(relay.checkToken)\r\n\r\n".utf8), completion: .contentProcessed { _ in
+                            control.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
+                                continuation.resume(returning: data.map { String(decoding: $0, as: UTF8.self).contains("200") } ?? false)
+                            }
+                        })
+                    }
+                }
+                control.start(queue: queue)
+            }
+            expect(controlReady, "authenticated control tunnel established")
             relay.pause()
+            let controlSurvived: Bool = await withCheckedContinuation { continuation in
+                control.send(content: Data("GET /cdn-cgi/trace HTTP/1.1\r\nHost: claude.ai\r\n\r\n".utf8), completion: .contentProcessed { _ in
+                    control.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
+                        continuation.resume(returning: data.map { String(decoding: $0, as: UTF8.self).contains("h=claude.ai") } ?? false)
+                    }
+                })
+            }
+            expect(controlSurvived, "control tunnel survives pause and receives destination trace")
+            control.cancel()
             let disconnected: Bool = await withCheckedContinuation { continuation in
                 client.receive(minimumIncompleteLength: 1, maximumLength: 1024) { _, _, done, error in continuation.resume(returning: done || error != nil) }
             }
@@ -145,7 +184,9 @@ import Network
             client.cancel()
             let duringPause = await request(port, host: "blocked-during-pause.test")
             expect(duringPause.0 != 0, "paused bridge blocks application destinations")
-            let pausedProbe = await request(port, host: "ipwho.is")
+            let unauthenticated = await request(port, host: "ipwho.is")
+            expect(unauthenticated.0 != 0, "paused relay refuses unauthenticated probe")
+            let pausedProbe = await request(port, host: "ipwho.is", token: relay.checkToken)
             expect(pausedProbe.0 == 0, "paused bridge still permits IP-control probes")
             expect(relay.unlock(), "paused bridge can resume after successful IP verification")
             let resumed = await request(port, host: "resumed.test")
@@ -171,7 +212,7 @@ import Network
             expect(interrupted.0 != 0, "interrupted SOCKS setup closes its own pending request")
             let suspended = await request(resetPort, host: "must-wait-for-probe.test")
             expect(suspended.0 != 0, "SOCKS transport failure pauses new application requests")
-            let healthyProbe = await request(resetPort, host: "ipwho.is")
+            let healthyProbe = await request(resetPort, host: "ipwho.is", token: resetRelay.checkToken)
             expect(healthyProbe.0 == 0 && resetRelay.unlock(), "successful control probe can recover the paused SOCKS transport")
             let afterTransportRecovery = await request(resetPort, host: "after-transport-recovery.test")
             expect(afterTransportRecovery.0 == 0, "recovered SOCKS transport accepts fresh application streams")
@@ -179,14 +220,14 @@ import Network
 
             let wrong = SOCKSRelay(settings: ProxySettings(host: "127.0.0.1", port: upstreamPort, username: "user", password: "wrong"))
             let wrongPort = try await wrong.start()
-            let invalidAuth = await request(wrongPort, host: "ipwho.is")
+            let invalidAuth = await request(wrongPort, host: "ipwho.is", token: wrong.checkToken)
             expect(invalidAuth.0 != 0, "wrong SOCKS password fails closed")
             expect(!wrong.unlock(), "authentication fault cannot unlock bridge")
             wrong.stop()
 
             let dead = SOCKSRelay(settings: ProxySettings(host: "127.0.0.1", port: 1, username: "", password: ""))
             let deadPort = try await dead.start()
-            let unavailable = await request(deadPort, host: "ipwho.is")
+            let unavailable = await request(deadPort, host: "ipwho.is", token: dead.checkToken)
             expect(unavailable.0 != 0 && !dead.unlock(), "unreachable SOCKS never falls back to direct")
             dead.stop()
         } catch { print("Unexpected error: \(error)"); failures += 1 }

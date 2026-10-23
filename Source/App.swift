@@ -47,6 +47,7 @@ final class GuardModel: ObservableObject {
     private var pathMonitor: NWPathMonitor?
     private var localBaseline = Set<String>()
     private var policy = SessionPolicy()
+    private var systemProxy: SystemProxy.Snapshot?
     private var revalidationTask: Task<Void, Never>?
     private var launchPending = false
     private var launchAfterValidation = false
@@ -57,6 +58,8 @@ final class GuardModel: ObservableObject {
     var onRestart: (() -> Void)?
 
     #if GUARD_E2E
+    var e2eSystemProxyCapture: (() throws -> SystemProxy.Snapshot)?
+    var e2eDestinationCheck: ((String) async throws -> (ip: String, countryCode: String))?
     var e2eInitialCheck: ((UInt16?) async throws -> IPReport)?
     var e2ePublicCheck: ((UInt16?) async throws -> String)?
     var e2eRuntimeRoot: URL?
@@ -129,10 +132,16 @@ final class GuardModel: ObservableObject {
         detail = "Подтверждаем иностранный IP и фиксируем адрес для этой сессии."
         localBaseline = NetworkSnapshot.current()
         Task { [self] in
+            defer { if launch { password = "" } }
             do {
                 try LaunchProfile(timezone: timezone, language: language).validate()
+                let networkMode = !useProxy
+                let snapshot = networkMode ? try await captureSystemProxy() : nil
+                guard operation == token else { return }
+                systemProxy = snapshot
+                if snapshot?.hasStaticProxy == true { appendLog("Статический системный прокси закреплён за сессией.") }
                 let relay: SOCKSRelay
-                if useProxy {
+                if !networkMode {
                     let config = try ProxySettings.validated(host: host, port: port, username: username, password: password)
                     relay = SOCKSRelay(settings: config)
                 } else { relay = SOCKSRelay(currentNetwork: true) }
@@ -163,6 +172,11 @@ final class GuardModel: ObservableObject {
                     guard operation == token else { return }
                     try policy.verify(actual)
                 }
+                relay.setPinnedFamily(policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
+                try await verifyDestinations(operation: token)
+                guard operation == token else { return }
+                try await confirmSystemProxy(operation: token)
+                guard operation == token else { return }
                 localBaseline = NetworkSnapshot.current()
                 if sleeping {
                     monitoring = true; busy = false; launchAfterValidation = launch
@@ -198,11 +212,19 @@ final class GuardModel: ObservableObject {
             while !Task.isCancelled, self.operation == token, !self.sleeping {
                 let revision = self.networkRevision
                 do {
+                    let wasSuspended = self.policy.suspended
                     let actual = try await self.currentIPCheck(self.relayPort)
                     guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
                     // A response started before the most recent route event cannot reopen the gate.
                     guard revision == self.networkRevision else { continue }
-                    let wasSuspended = self.policy.suspended
+                    try self.policy.verify(actual)
+                    if wasSuspended { self.policy.suspend() }
+                    try await self.verifyDestinations(operation: token)
+                    guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
+                    guard revision == self.networkRevision else { continue }
+                    try await self.confirmSystemProxy(operation: token)
+                    guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
+                    guard revision == self.networkRevision else { continue }
                     try self.policy.verify(actual)
                     self.relay?.setPinnedFamily(self.policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
                     if wasSuspended, let relay = self.relay, !relay.unlock() {
@@ -224,6 +246,13 @@ final class GuardModel: ObservableObject {
                 } catch {
                     guard !Task.isCancelled, self.operation == token else { return }
                     if self.policy.requiresRestart { self.block(error.localizedDescription, latch: true); return }
+                    // A failed IP/destination probe must not hide a confirmed proxy change.
+                    do { try await self.confirmSystemProxy(operation: token) }
+                    catch {
+                        guard !Task.isCancelled, self.operation == token else { return }
+                        if self.policy.requiresRestart { self.block(error.localizedDescription, latch: true); return }
+                    }
+                    guard !Task.isCancelled, self.operation == token else { return }
                     self.suspendTraffic(error.localizedDescription)
                     do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
                 }
@@ -285,17 +314,64 @@ final class GuardModel: ObservableObject {
         monitor.start(queue: DispatchQueue(label: "local.proxyguard.path"))
     }
 
+    private func verifyDestinations(operation expected: UUID) async throws {
+        guard let relay, let relayPort else { throw GuardError.message("Локальный шлюз закрыт.") }
+        for host in IPChecker.destinationHosts {
+            let result: (ip: String, countryCode: String)
+            #if GUARD_E2E
+            // Existing recovery fixtures replace the entire external route check.
+            if let e2eDestinationCheck {
+                result = try await e2eDestinationCheck(host)
+            } else if e2eInitialCheck != nil, let report {
+                result = (report.ip, report.countryCode)
+            } else {
+                result = try await IPChecker.destinationTrace(relayPort: relayPort, token: relay.checkToken, hostname: host, family: policy.pinnedIP?.contains(":") == true ? 6 : 4)
+            }
+            #else
+            result = try await IPChecker.destinationTrace(relayPort: relayPort, token: relay.checkToken, hostname: host, family: policy.pinnedIP?.contains(":") == true ? 6 : 4)
+            #endif
+            guard operation == expected, !Task.isCancelled else { throw CancellationError() }
+            try policy.verifyDestination(hostname: host, ip: result.ip, countryCode: result.countryCode)
+        }
+    }
+
+    private func captureSystemProxy() async throws -> SystemProxy.Snapshot {
+        #if GUARD_E2E
+        if let e2eSystemProxyCapture { return try e2eSystemProxyCapture() }
+        #endif
+        return try await Task.detached { try SystemProxy.capture() }.value
+    }
+
+    private func confirmSystemProxy(operation expected: UUID) async throws {
+        // The pinned mode belongs to the session, independently of editable UI settings.
+        guard let pinned = systemProxy else { return }
+        let current: SystemProxy.Snapshot
+        do { current = try await captureSystemProxy() }
+        catch {
+            guard operation == expected, !Task.isCancelled else { throw CancellationError() }
+            let reason = "Не удалось подтвердить настройки прокси macOS. Повторяем проверку."
+            suspendTraffic(reason)
+            throw GuardError.message(reason)
+        }
+        guard operation == expected, !Task.isCancelled else { throw CancellationError() }
+        if current.fingerprint != pinned.fingerprint {
+            let reason = "Настройки системного прокси изменились. Сессия закрыта до перезапуска Guard."
+            policy.latch(reason)
+            throw GuardError.message(reason)
+        }
+    }
+
     private func initialIPCheck(_ port: UInt16?) async throws -> IPReport {
         #if GUARD_E2E
         if let e2eInitialCheck { return try await e2eInitialCheck(port) }
         #endif
-        return try await IPChecker.check(relayPort: port)
+        return try await IPChecker.check(relayPort: port, token: relay?.checkToken ?? "")
     }
     private func currentIPCheck(_ port: UInt16?) async throws -> String {
         #if GUARD_E2E
         if let e2ePublicCheck { return try await e2ePublicCheck(port) }
         #endif
-        return try await IPChecker.publicIP(relayPort: port, pinnedIP: policy.pinnedIP)
+        return try await IPChecker.publicIP(relayPort: port, token: relay?.checkToken ?? "", pinnedIP: policy.pinnedIP)
     }
     private func attemptLaunch() {
         guard !busy, !requiresRestart else { return }
@@ -303,7 +379,7 @@ final class GuardModel: ObservableObject {
         let token = operation
         runtimeStatus = "Подготавливаем отдельную локальную копию Claude…"
         Task {
-            defer { if operation == token { launchPending = false; busy = revalidationTask != nil } }
+            defer { password = ""; if operation == token { launchPending = false; busy = revalidationTask != nil } }
             var checkingRoute = false
             do {
                 let source = URL(fileURLWithPath: claudePath).standardizedFileURL.resolvingSymlinksInPath()
@@ -320,6 +396,8 @@ final class GuardModel: ObservableObject {
                 while policy.suspended, operation == token {
                     try await Task.sleep(nanoseconds: 100_000_000)
                 }
+                guard operation == token else { return }
+                try await confirmSystemProxy(operation: token)
                 guard operation == token else { return }
                 checkingRoute = false
                 runtimeStatus = "Локальная копия Claude \(prepared.sourceVersion), отдельный профиль"
@@ -352,6 +430,7 @@ final class GuardModel: ObservableObject {
         try profile.validate()
         let child = Process()
         var environment = ProcessInfo.processInfo.environment.filter {
+            !$0.key.hasPrefix("ELECTRON_") && !$0.key.hasPrefix("CLAUDE_") &&
             !["http_proxy", "https_proxy", "all_proxy", "no_proxy", "electron_run_as_node", "node_options", "claude_cdp_auth", "claude_user_data_dir"].contains($0.key.lowercased())
         }
         var config: [String: Any] = ["userData": prepared.profileURL.path, "timezone": timezone, "language": language]
@@ -440,12 +519,13 @@ final class GuardModel: ObservableObject {
         restarting = false; detail = message; appendLog(message)
     }
     private func block(_ reason: String, manual: Bool = false, latch: Bool = false) {
+        password = ""
         if latch { policy.latch(reason) }
         requiresRestart = policy.requiresRestart
         operation = UUID()
         revalidationTask?.cancel(); revalidationTask = nil
         launchPending = false; launchAfterValidation = false
-        relay?.stop(); relay = nil; relayPort = nil
+        relay?.stop(); relay = nil; relayPort = nil; systemProxy = nil
         inspector?.stop(); inspector = nil
         timer?.invalidate(); timer = nil; nextCheck = nil
         pathMonitor?.cancel(); pathMonitor = nil
