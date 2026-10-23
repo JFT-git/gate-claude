@@ -54,7 +54,7 @@ def serve(conn):
             request = b""
             while b"\r\n\r\n" not in request:
                 request += exact(conn, 1)
-            body = f"ok:{host}".encode()
+            body = (f"h={host}\nip=203.0.113.7\nloc=DE\n" if request.startswith(b"GET /cdn-cgi/trace ") else f"ok:{host}").encode()
             conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
     except (OSError, EOFError):
         pass

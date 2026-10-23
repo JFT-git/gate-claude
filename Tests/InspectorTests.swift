@@ -47,6 +47,54 @@ import Darwin
         signal(SIGPIPE, SIG_IGN)
         guard CommandLine.arguments.count == 3 else { exit(2) }
         var failures = 0
+        let proxyFixture = """
+        <dictionary> {
+          HTTPEnable : 1
+          HTTPProxy : PROXY.Example
+          HTTPPort : 8080
+          HTTPSEnable : 1
+          HTTPSProxy : 192.0.2.1
+          HTTPSPort : 443
+          SOCKSEnable : 1
+          SOCKSProxy : 2001:db8::1
+          SOCKSPort : 1080
+          ExceptionsList : <array> {
+            0 : *.local
+          }
+        }
+        """
+        func proxyTest(_ label: String, _ test: () throws -> Bool) {
+            let ok = (try? test()) == true
+            print("\(ok ? "PASS" : "FAIL") \(label)")
+            if !ok { failures += 1 }
+        }
+        func rejects(_ fixture: String) -> Bool {
+            do { _ = try SystemProxy.parse(fixture); return false } catch { return true }
+        }
+        proxyTest("static system proxy parses all three protocols") {
+            let snapshot = try SystemProxy.parse(proxyFixture)
+            return snapshot.http == SystemProxy.Endpoint(host: "proxy.example", port: 8080) &&
+                snapshot.https == SystemProxy.Endpoint(host: "192.0.2.1", port: 443) &&
+                snapshot.socks == SystemProxy.Endpoint(host: "2001:db8::1", port: 1080) && snapshot.fingerprint.count == 64
+        }
+        proxyTest("PAC fails closed") { rejects(proxyFixture.replacingOccurrences(of: "HTTPEnable : 1", with: "ProxyAutoConfigEnable : 1\nHTTPEnable : 1")) }
+        proxyTest("PAC URL fails closed even when disabled") { rejects(proxyFixture.replacingOccurrences(of: "HTTPEnable : 1", with: "ProxyAutoConfigURLString : https://pac.example/script\nHTTPEnable : 1")) }
+        proxyTest("enabled protocol without port fails closed") { rejects(proxyFixture.replacingOccurrences(of: "HTTPPort : 8080", with: "")) }
+        for value in ["0", "65536", "-1", "8x"] {
+            proxyTest("invalid system proxy port \(value) fails closed") { rejects(proxyFixture.replacingOccurrences(of: "8080", with: value)) }
+        }
+        for value in ["user@proxy.example", "bad host", "127.1", "bad..example", "2001:invalid::1"] {
+            proxyTest("invalid system proxy host \(value) fails closed") { rejects(proxyFixture.replacingOccurrences(of: "PROXY.Example", with: value)) }
+        }
+        proxyTest("duplicate keys fail closed") { rejects(proxyFixture.replacingOccurrences(of: "HTTPEnable : 1", with: "HTTPEnable : 1\nhttpenable : 1")) }
+        proxyTest("fingerprint and equality ignore key order and host case") {
+            let changed = proxyFixture.replacingOccurrences(of: "HTTPEnable : 1\n  HTTPProxy : PROXY.Example", with: "HTTPProxy : proxy.example\n  HTTPEnable : 1")
+            let a = try SystemProxy.parse(proxyFixture), b = try SystemProxy.parse(changed)
+            return a == b && a.fingerprint == b.fingerprint
+        }
+        proxyTest("SOCKS host change changes fingerprint") {
+            try SystemProxy.parse(proxyFixture).fingerprint != SystemProxy.parse(proxyFixture.replacingOccurrences(of: "2001:db8::1", with: "2001:db8::2")).fingerprint
+        }
         for (mode, capture, label) in [("normal", true, "pipe profile verification and two-way HTTP capture with redaction"),
                                        ("normal", false, "body capture can be disabled"),
                                        ("unsupported", true, "unsupported locale override fails closed"),
@@ -61,6 +109,24 @@ import Darwin
                                        ("shared-locale-unverified", true, "missing inherited locale verification fails closed")] {
             let ok = await scenario(helper: CommandLine.arguments[1], fixture: CommandLine.arguments[2], mode: mode, capture: capture)
             print("\(ok ? "PASS" : "FAIL") \(label)"); if !ok { failures += 1 }
+        }
+        let headerCases: [([String: Any], [String], String)] = [
+            (["Accept-Language": "en-US,en;q=0.9"], [], "expected language and primary fallback"),
+            (["Accept-Language": "ru-RU"], ["transport.Accept-Language.mismatch"], "different language"),
+            (["Accept-Language": "fr;q=0"], ["transport.Accept-Language.mismatch"], "q=0 still discloses a language"),
+            (["Accept-Language": "en-US;q=1.1"], ["transport.Accept-Language.invalid"], "malformed entry"),
+            ([:], [], "missing header"),
+            (["accept-language": "EN-us;Q=0.,en;q=1.000"], [], "case insensitive tags and q grammar"),
+            (["Accept-Language": 42], ["transport.Accept-Language.invalid"], "non-string header"),
+            (["Accept-Language": ""], ["transport.Accept-Language.invalid"], "empty header"),
+            (["Accept-Language": "en-US\r\n"], ["transport.Accept-Language.invalid"], "CRLF header"),
+            (["Accept-Language": "en-US,"], ["transport.Accept-Language.invalid"], "empty comma entry"),
+            (["X-Language": "ru-RU"], [], "unrelated header ignored")
+        ]
+        for (headers, expected, label) in headerCases {
+            let ok = TrafficSanitizer.auditRequestHeaders(headers, language: "en-US") == expected
+            print("\(ok ? "PASS" : "FAIL") Accept-Language: \(label)")
+            if !ok { failures += 1 }
         }
         let fragment = TrafficSanitizer.body("data: {\"access_token\":\"stream-secret\"}\nBearer abc.def.ghi")
         let safe = !fragment.contains("stream-secret") && !fragment.contains("abc.def.ghi")
