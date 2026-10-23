@@ -15,7 +15,7 @@
     <div id="sessionActions" class="action-group" role="group" aria-label="Управление сессией и приложением" tabindex="-1">
       <button id="start" type="submit" form="settings" class="primary" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#play"/></svg><span>Запустить</span></button>
       <button id="stop" type="button" class="secondary" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#stop"/></svg><span>Остановить</span></button>
-      <button id="restart" type="button" class="secondary" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#restart"/></svg><span>Перезапустить</span></button>
+      <button id="restart" type="button" class="secondary" aria-label="Перезапустить Guard" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#restart"/></svg><span>Перезапустить</span></button>
     </div>
     <p id="actionReason" class="hint">Запуск проверяет подключение. Перезапуск заново открывает Guard и закрывает его сессию Claude.</p>
     <div id="activity" class="activity" role="progressbar" aria-label="Выполняется действие Guard" hidden><span class="spinner" aria-hidden="true"></span><span id="activityText">Дождитесь завершения действия.</span></div>
