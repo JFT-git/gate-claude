@@ -101,13 +101,18 @@ function detail() {
 }
 let renderTimer;
 function renderRecords() {
+  const focusedRecord = $('requests').contains(document.activeElement) ? document.activeElement.dataset.recordId : undefined;
   renderTimer = null; $('count').textContent = records.size;
   if (!records.size) $('requests').replaceChildren(node('p','Доступные веб-запросы появятся после запуска Claude.','empty'));
   else $('requests').replaceChildren(...[...records.values()].reverse().map(value => {
-    const button = node('button','','request' + (selected === value.id ? ' selected' : '')); button.type = 'button';
+    const button = node('button','','request' + (selected === value.id ? ' selected' : '')); button.type = 'button'; button.dataset.recordId = String(value.id);
     button.append(node('span',(value.status || '·') + ' ' + value.method),document.createTextNode(value.url));
     button.setAttribute('aria-pressed',String(selected === value.id)); button.addEventListener('click',()=>{selected=value.id;renderRecords();}); return button;
   }));
+  if (focusedRecord !== undefined) {
+    const button = [...$('requests').querySelectorAll('button')].find(button => button.dataset.recordId === focusedRecord);
+    button?.focus({preventScroll: true});
+  }
   detail(); refreshControls();
 }
 function record(value) { records.set(value.id,value); while(records.size>200) records.delete(records.keys().next().value); if(!renderTimer) renderTimer=setTimeout(renderRecords,120); }

@@ -5,4 +5,4 @@
 /* Keep status text readable when zoom reduces the CSS viewport. */
 @media(max-width:700px){.status-copy{flex:1 1 180px}.pill{flex:none}}
 @media(max-width:440px){.app-header{flex-wrap:wrap;align-items:start}.brand{flex:1 1 100%;min-width:0}.brand-mark{flex:none}.action-group button{height:72px;white-space:normal}.action-group button span{max-width:100%;overflow-wrap:anywhere}}
-@media(max-width:360px){.action-group{gap:4px}.action-group button{font-size:.6rem;padding:4px;white-space:nowrap;height:58px}.action-group button span{overflow-wrap:normal}}
+@media(max-width:360px){.action-group{gap:6px}.action-group button{font-size:.75rem;padding:6px 4px;white-space:normal;height:auto;min-height:52px;flex-direction:column;gap:4px}.action-group button span{overflow-wrap:anywhere}}

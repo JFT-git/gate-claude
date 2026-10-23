@@ -551,6 +551,7 @@ struct GuardView: View {
                         HStack(spacing: 9) {
                             Circle().fill(statusColor).frame(width: 8, height: 8)
                             Text(model.phase).font(.system(size: 16, weight: .semibold))
+                                .accessibilityAddTraits(.updatesFrequently)
                             Spacer()
                             if model.busy { ProgressView().controlSize(.small) }
                         }
@@ -561,6 +562,7 @@ struct GuardView: View {
                             }
                         } else { Text("Внешний IP ещё не проверен").font(.system(size: 23, weight: .medium)).foregroundStyle(.secondary) }
                         Text(model.detail).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            .accessibilityAddTraits(.updatesFrequently)
                         if let previous = model.previousStop, !model.monitoring {
                             Text("Последняя причина завершения: \(previous)").font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         }
@@ -582,17 +584,18 @@ struct GuardView: View {
                                 .keyboardShortcut(".", modifiers: .command)
                                 .help("Закрыть шлюз и остановить собственную копию Claude")
                             Button { presentation.lastAction = "Перезапуск: ожидаем новое окно"; model.restart() } label: {
-                                Label("Перезапустить", systemImage: "arrow.clockwise")
+                                Label("Перезапустить Guard", systemImage: "arrow.clockwise")
                             }.buttonStyle(GuardActionStyle(primary: model.requiresRestart))
                                 .disabled(model.restarting)
                                 .help("Заново открыть Guard и закрыть текущую сессию. Пароль прокси потребуется ввести снова.")
                         }
                         Text("Последнее действие: \(presentation.lastAction)").font(.system(size: 12)).foregroundStyle(.secondary)
                             .accessibilityLabel("Последнее действие: \(presentation.lastAction)")
+                            .accessibilityAddTraits(.updatesFrequently)
                         HStack {
                             Label("Системная служба не используется", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(.secondary)
                             Spacer()
-                            Button("Журнал") { model.showLog = true; model.showDiagnostics() }.keyboardShortcut("l", modifiers: .command)
+                            Button("Показать файл журнала") { model.showLog = true; model.showDiagnostics() }.keyboardShortcut("l", modifiers: .command)
                         }
                     }
                 }
@@ -612,7 +615,7 @@ struct GuardView: View {
                                 field("Логин, если нужен", placeholder: "Необязательно", value: $model.username)
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text("Пароль").font(.system(size: 11)).foregroundStyle(.secondary)
-                                    SecureField("Необязательно", text: $model.password).textFieldStyle(.roundedBorder)
+                                    SecureField("Необязательно", text: $model.password).textFieldStyle(.roundedBorder).accessibilityLabel("Пароль")
                                 }
                             }
                             Text("Пароль остаётся только в памяти и не сохраняется на диск.")
@@ -700,7 +703,7 @@ struct GuardView: View {
     private func field(_ title: String, placeholder: String, value: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.system(size: 11)).foregroundStyle(.secondary)
-            TextField(placeholder, text: value).textFieldStyle(.roundedBorder)
+            TextField(placeholder, text: value).textFieldStyle(.roundedBorder).accessibilityLabel(title)
         }
     }
 }
