@@ -21,6 +21,15 @@ async function restrictRoot(root) {
   await run(path.join(process.env.SystemRoot, 'System32', 'icacls.exe'), [root, '/inheritance:r', '/grant:r', '*' + sid + ':(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F'], { windowsHide: true, timeout: 120000 });
 }
 
+// lstat deliberately avoids traversing copied symlinks and Windows junctions.
+async function rejectRuntimeLinks(directory) {
+  const stat = await fs.lstat(directory);
+  if (stat.isSymbolicLink()) throw Error('Runtime staging contains a symbolic link.');
+  if (stat.isDirectory()) {
+    for (const name of await fs.readdir(directory)) await rejectRuntimeLinks(path.join(directory, name));
+  }
+}
+
 async function prepareRuntime(sourcePath, root, bootstrapPath, onStatus = () => {}, options = {}) {
   if (options.codeEnabled !== undefined && typeof options.codeEnabled !== 'boolean') throw Error('Неверный режим Claude Code.');
   const codeEnabled = options.codeEnabled === true;
@@ -56,6 +65,7 @@ async function prepareRuntime(sourcePath, root, bootstrapPath, onStatus = () => 
     catch { throw Error('Не удалось проверить подпись исходного Claude.'); }
   }
   await fs.mkdir(root, { recursive: true, mode: 0o700 }); await restrictRoot(root);
+  const guardRoot = await fs.realpath(root);
   await fs.mkdir(profile, { recursive: true, mode: 0o700 });
   try {
     const manifest = JSON.parse(await fs.readFile(path.join(directory, 'guard-manifest.json'), 'utf8'));
@@ -69,6 +79,11 @@ async function prepareRuntime(sourcePath, root, bootstrapPath, onStatus = () => 
   const staging = path.join(root, 'Preparing-' + require('node:crypto').randomUUID());
   try {
     await fs.cp(sourceDirectory, staging, { recursive: true, dereference: false, errorOnExist: true });
+    if (await fs.realpath(path.dirname(staging)) !== guardRoot ||
+        await fs.realpath(staging) !== path.join(guardRoot, path.basename(staging))) {
+      throw Error('Runtime staging is outside the Guard root.');
+    }
+    await rejectRuntimeLinks(staging);
     const patched = addBootstrap(original, bootstrap, extraEntries), patchedExecutable = updatePEIntegrity(executable, patched.oldDigest, patched.digest);
     await fs.writeFile(path.join(staging, 'resources', 'app.asar'), patched.archive);
     await fs.writeFile(path.join(staging, path.basename(source)), patchedExecutable);

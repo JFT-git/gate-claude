@@ -18,7 +18,7 @@ final class GuardModel: ObservableObject {
     @Published var inspectPages = true
     @Published var runtimeStatus = "Используется отдельная локальная копия установленного Claude"
     @Published var lastVerifiedProfile: VerifiedProfile?
-    @Published var captureBodies = true
+    @Published var captureBodies = false
     @Published var profileStatus = "Профиль страницы ещё не проверен"
     @Published var phase = "Ожидание проверки"
     @Published var detail = "Выберите маршрут и проверьте внешний IP перед запуском."
@@ -169,6 +169,7 @@ final class GuardModel: ObservableObject {
                     suspendTraffic("Mac находится в режиме сна")
                     return
                 }
+                relay.setPinnedFamily(policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
                 if !relay.unlock() { throw GuardError.message("Локальный шлюз уже закрыт.") }
                 allowed = true; monitoring = true; busy = false
                 phase = "IP закреплён за сессией"
@@ -203,6 +204,7 @@ final class GuardModel: ObservableObject {
                     guard revision == self.networkRevision else { continue }
                     let wasSuspended = self.policy.suspended
                     try self.policy.verify(actual)
+                    self.relay?.setPinnedFamily(self.policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
                     if wasSuspended, let relay = self.relay, !relay.unlock() {
                         throw GuardError.message("Шлюз ожидает успешного контрольного подключения.")
                     }

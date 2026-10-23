@@ -26,11 +26,9 @@ struct VerifiedProfile: Codable {
 
 enum TrafficSanitizer {
     static let limit = 32_768
-    static let sensitive = ["authorization", "cookie", "set-cookie", "proxy-authorization", "x-api-key", "api-key",
-                            "access_token", "refresh_token", "id_token", "password", "secret", "session_key", "sessionkey"]
     static func secretKey(_ key: String) -> Bool {
-        let lower = key.lowercased()
-        return sensitive.contains(lower) || lower.hasSuffix("token") || lower.hasSuffix("_token") || lower.hasSuffix("-token")
+        key.range(of: #"(?i)^(authorization|proxy[_-]authorization|cookie|set[_-]cookie|x[_-]api[_-]key|api[_-]?key|client[_-]secret|session[_-]?key)$|token$|(?:^|[_-])(?:secret|password|passwd)$"#,
+                  options: .regularExpression) != nil
     }
     static func bounded(_ text: String) -> String {
         String(text.prefix(limit)) + (text.count > limit ? "\n[обрезано: лимит 32 768 символов]" : "")
@@ -42,7 +40,10 @@ enum TrafficSanitizer {
     }
     static func headers(_ headers: [String: Any]) -> String {
         bounded(headers.keys.sorted().map { key in
-            "\(key): \(secretKey(key) ? "[скрыто]" : String(describing: headers[key]!))"
+            let value = String(describing: headers[key]!)
+            let cleaned = secretKey(key) ? "[скрыто]" :
+                (["referer", "origin", "location", "from"].contains(key.lowercased()) ? safeURL(value) : value)
+            return "\(key): \(cleaned)"
         }.joined(separator: "\n"))
     }
     static func body(_ text: String) -> String {
@@ -58,10 +59,18 @@ enum TrafficSanitizer {
         if let data = text.data(using: .utf8), let json = try? JSONSerialization.jsonObject(with: data),
            let cleaned = try? JSONSerialization.data(withJSONObject: redact(json), options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
            let string = String(data: cleaned, encoding: .utf8) { return bounded(string) }
+        if text.range(of: #"^[^\s&=]+=[^\s&]*(?:&[^\s&=]+=[^\s&]*)*$"#, options: .regularExpression) != nil {
+            return bounded(text.components(separatedBy: "&").map { pair in
+                let index = pair.firstIndex(of: "=")!
+                let key = String(pair[..<index])
+                let decoded = key.replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? key
+                return secretKey(decoded) ? key + "=[скрыто]" : pair
+            }.joined(separator: "&"))
+        }
         var result = text
         // Also mask common JSON fragments and bearer strings in SSE/text chunks.
         let patterns = [
-            #"(?i)("(?:access_token|refresh_token|id_token|password|secret|session_key|sessionKey)"\s*:\s*")[^"\r\n]*(")"#,
+            #"(?i)("(?:[^"\r\n]*token|authorization|proxy[_-]authorization|cookie|set[_-]cookie|x[_-]api[_-]key|api[_-]?key|client[_-]secret|(?:[^"\r\n]*[_-])?(?:password|passwd|secret)|session[_-]?key)"\s*:\s*")[^"\r\n]*(")"#,
             #"(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+"#
         ]
         for (index, pattern) in patterns.enumerated() {
@@ -439,7 +448,7 @@ final class ClaudeInspector: @unchecked Sendable {
 
     private func appendResponse(_ key: String, base64: String) {
         guard var record = records[key], let data = Data(base64Encoded: base64), let text = String(data: data, encoding: .utf8) else { return }
-        record.received = TrafficSanitizer.bounded(record.received + text); save(record)
+        record.received = TrafficSanitizer.bounded(record.received + TrafficSanitizer.body(text)); save(record)
     }
     private func save(_ record: TrafficRecord) {
         if records[record.id] == nil {

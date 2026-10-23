@@ -38,6 +38,16 @@ test('traffic masks headers, nested JSON, SSE bearer tokens and URL credentials'
   assert.equal(S.body('{"nested":{"access_token":"secret-c"},"list":[{"password":"secret-d"}]}').includes('secret-'), false);
   assert.equal(S.body('data: {"refresh_token":"secret-e"}\nBearer secret-f').includes('secret-'), false);
   assert.equal(S.safeURL('https://user:pass@example.test/path?token=secret#private'), 'https://example.test/path');
+  assert.equal(S.body('password=x&access_token=y'), 'password=[скрыто]&access_token=[скрыто]');
+  assert.equal(S.body('client%5Fsecret=x&api-key=y&message=hello'), 'client%5Fsecret=[скрыто]&api-key=[скрыто]&message=hello');
+  assert.equal(S.body('{"client_secret":"secret-g","api_key":"secret-h"}').includes('secret-'), false);
+  for (const key of ['client-secret', 'APIKEY', 'api_key', 'account-password', 'db_passwd', 'nested_secret', 'sessionkey', 'legacytoken']) {
+    assert.equal(S.secretKey(key), true, key);
+    assert.equal(S.body(`data: {"${key}":"secret-fragment"}`).includes('secret-fragment'), false);
+  }
+  for (const key of ['Referer', 'Origin', 'Location', 'From']) {
+    assert.equal(S.headers({ [key]: 'https://user:pass@example.test/path?token=secret#private' }), key + ': https://example.test/path');
+  }
   assert.equal(S.body('x'.repeat(100000)).length < 33000, true);
   assert.equal(S.auditRequestHeaders({ 'Accept-Language': 'ru-RU' }, 'en-US').length, 1);
   assert.deepEqual(S.auditRequestHeaders({ 'Accept-Language': 'en-US' }, 'en-US'), []);

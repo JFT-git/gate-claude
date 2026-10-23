@@ -122,11 +122,13 @@ enum IPChecker {
 /// Current-network mode is an explicit choice and still passes through this gate.
 final class SOCKSRelay: @unchecked Sendable {
     enum Mode { case probeOnly, open, blocked }
+    enum PinFamily { case v4, v6 }
     private let queue = DispatchQueue(label: "local.proxyguard.relay")
     private let settings: ProxySettings?
     private var listener: NWListener?
     private var tunnels: [UUID: RelayTunnel] = [:]
     private var mode: Mode = .probeOnly
+    private var pinnedFamily: PinFamily?
     private var startup: CheckedContinuation<UInt16, Error>?
     private var alive = true
     private var faultReported = false
@@ -166,7 +168,7 @@ final class SOCKSRelay: @unchecked Sendable {
                             connection.cancel(); return
                         }
                         let id = UUID()
-                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue)
+                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily)
                         tunnel.isAllowed = { [weak self] host, port in
                             guard let self, self.alive else { return false }
                             switch self.mode {
@@ -199,6 +201,11 @@ final class SOCKSRelay: @unchecked Sendable {
         }
     }
 
+    /// nil leaves destination address selection unconstrained.
+    func setPinnedFamily(_ family: PinFamily?) {
+        queue.sync { pinnedFamily = family }
+    }
+
     func unlock() -> Bool {
         queue.sync {
             guard alive, mode == .probeOnly, !faultReported else { return false }
@@ -218,7 +225,7 @@ final class SOCKSRelay: @unchecked Sendable {
 
     func stop() {
         queue.sync {
-            alive = false; mode = .blocked
+            alive = false; mode = .blocked; pinnedFamily = nil
             for tunnel in Array(tunnels.values) { tunnel.close() }
             listener?.cancel(); listener = nil
         }
@@ -238,6 +245,7 @@ private final class RelayTunnel {
     private var upstream: NWConnection?
     private let settings: ProxySettings?
     private let queue: DispatchQueue
+    var pinnedFamily: SOCKSRelay.PinFamily?
     private var closed = false
     private var established = false
     private var header = Data()
@@ -252,8 +260,9 @@ private final class RelayTunnel {
     var onUpstreamFault: (() -> Void)?
     var onProbeConnected: (() -> Void)?
 
-    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue) {
+    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?) {
         self.client = client; self.settings = settings; self.queue = queue
+        self.pinnedFamily = pinnedFamily
     }
 
     func start() {
@@ -337,7 +346,34 @@ private final class RelayTunnel {
     }
 
     private func connectCurrentNetwork() {
-        let connection = NWConnection(host: NWEndpoint.Host(destination), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        var host = destination
+        if let pinnedFamily {
+            let family = pinnedFamily == .v4 ? AF_INET : AF_INET6
+            var v4 = in_addr(); var v6 = in6_addr()
+            if inet_pton(AF_INET, destination, &v4) == 1 {
+                guard family == AF_INET else { close(); return }
+            } else if inet_pton(AF_INET6, destination, &v6) == 1 {
+                guard family == AF_INET6 else { close(); return }
+            } else {
+                var hints = addrinfo()
+                hints.ai_family = family
+                hints.ai_socktype = SOCK_STREAM
+                var results: UnsafeMutablePointer<addrinfo>?
+                let status = getaddrinfo(destination, nil, &hints, &results)
+                defer { if let results { freeaddrinfo(results) } }
+                guard status == 0, let first = results,
+                      first.pointee.ai_family == family, let address = first.pointee.ai_addr else {
+                    close(); return
+                }
+                var literal = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                guard getnameinfo(address, first.pointee.ai_addrlen, &literal,
+                                  socklen_t(literal.count), nil, 0, NI_NUMERICHOST) == 0 else {
+                    close(); return
+                }
+                host = String(cString: literal)
+            }
+        }
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
         upstream = connection
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, !self.closed else { return }

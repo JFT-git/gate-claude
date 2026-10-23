@@ -8,5 +8,9 @@ async function powershell(script, timeout = 30000) {
   const result = await run(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true, timeout, maxBuffer: 1048576 });
   return result.stdout.replace(/^\uFEFF/, '').trim();
 }
-const psQuote = value => "'" + String(value).replaceAll("'", "''") + "'";
+const psQuote = value => {
+  const text = String(value);
+  if (/[\u0000-\u001f\u2018\u2019\u201a\u201b\u201c\u201d\u201e]/.test(text)) throw Error('Unsupported character in PowerShell argument.');
+  return "'" + text.replaceAll("'", "''") + "'";
+};
 module.exports = { powershell, psQuote };

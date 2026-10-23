@@ -9,12 +9,12 @@ import Network
     static func rejected(_ label: String, _ body: () throws -> Void) {
         do { try body(); expect(false, label) } catch { expect(true, label) }
     }
-    static func request(_ port: UInt16, host: String) async -> (Int32, String) {
+    static func request(_ port: UInt16, host: String, destinationPort: UInt16 = 443) async -> (Int32, String) {
         await withCheckedContinuation { continuation in
             DispatchQueue.global().async {
                 let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
                 p.arguments = ["-q", "--silent", "--show-error", "--fail", "--max-time", "5", "--noproxy", "",
-                               "--proxy", "http://127.0.0.1:\(port)", "--proxytunnel", "http://\(host):443/"]
+                               "--proxy", "http://127.0.0.1:\(port)", "--proxytunnel", "http://\(host):\(destinationPort)/"]
                 let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
                 do {
                     try p.run(); let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
@@ -68,6 +68,46 @@ import Network
         } catch { expect(false, "session policy setup") }
         guard CommandLine.arguments.count > 1, let upstreamPort = UInt16(CommandLine.arguments[1]) else { exit(2) }
         do {
+            // A direct HTTP fixture, separate from run.py's authenticated SOCKS server.
+            let parameters = NWParameters.tcp
+            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+            let fixture = try NWListener(using: parameters, on: .any)
+            let fixtureQueue = DispatchQueue(label: "tests.direct-fixture")
+            fixture.newConnectionHandler = { connection in
+                connection.start(queue: fixtureQueue)
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { _, _, _, _ in
+                    connection.send(content: Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".utf8),
+                                    completion: .contentProcessed { _ in connection.cancel() })
+                }
+            }
+            let fixturePort: UInt16 = try await withCheckedThrowingContinuation { continuation in
+                fixture.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        fixture.stateUpdateHandler = nil
+                        continuation.resume(returning: fixture.port!.rawValue)
+                    case .failed(let error):
+                        fixture.stateUpdateHandler = nil
+                        continuation.resume(throwing: error)
+                    default: break
+                    }
+                }
+                fixture.start(queue: fixtureQueue)
+            }
+            defer { fixture.cancel() }
+            let direct = SOCKSRelay(currentNetwork: true)
+            let directPort = try await direct.start()
+            direct.setPinnedFamily(.v4)
+            expect(direct.unlock(), "current-network bridge unlocks with pinned IPv4")
+            let directV4 = await request(directPort, host: "127.0.0.1", destinationPort: fixturePort)
+            expect(directV4.0 == 0 && directV4.1 == "ok", "pinned IPv4 permits literal 127.0.0.1")
+            let deniedV6 = await request(directPort, host: "[::1]", destinationPort: fixturePort)
+            expect(deniedV6.0 != 0, "pinned IPv4 refuses literal ::1")
+            direct.setPinnedFamily(.v6)
+            let deniedV4 = await request(directPort, host: "127.0.0.1", destinationPort: fixturePort)
+            expect(deniedV4.0 != 0, "pinned IPv6 refuses literal 127.0.0.1")
+            direct.stop()
+
             let relay = SOCKSRelay(settings: ProxySettings(host: "127.0.0.1", port: upstreamPort, username: "user", password: "secret"))
             let port = try await relay.start()
             let denied = await request(port, host: "destination.test")
