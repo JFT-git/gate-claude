@@ -16,10 +16,10 @@ for BINARY in ClaudeProxyGuard GuardHost; do
   [[ "$ARCHS" == "x86_64 arm64" || "$ARCHS" == "arm64 x86_64" ]] || { echo "Unexpected architectures: $ARCHS" >&2; exit 1; }
 done
 codesign --verify --deep --strict "$APP"
-ditto -c -k --keepParent "$APP" "$ZIP"
+ditto -c -k --norsrc --noextattr --noqtn --keepParent "$APP" "$ZIP"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/guard-dmg.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
-ditto "$APP" "$STAGE/Claude Proxy Guard.app"
+ditto --norsrc --noextattr --noqtn "$APP" "$STAGE/Claude Proxy Guard.app"
 ln -s /Applications "$STAGE/Applications"
 cp README.md "$STAGE/README.md"
 cp SECURITY.md "$STAGE/SECURITY.md"
