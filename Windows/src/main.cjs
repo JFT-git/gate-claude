@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, powerMonitor, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, powerMonitor, shell, nativeTheme } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { GuardController } = require('./controller.cjs');
@@ -122,7 +122,7 @@ else {
       if (!result.canceled && result.filePath) { fs.writeFileSync(result.filePath, JSON.stringify([...traffic.values()], null, 2), { mode: 0o600 }); return true; }
       return false;
     });
-    window = new BrowserWindow({ width: 1240, height: 900, minWidth: 640, minHeight: 600, backgroundColor: '#101813', title: 'Claude Proxy Guard',
+    window = new BrowserWindow({ width: 1240, height: 900, minWidth: 640, minHeight: 600, backgroundColor: nativeTheme.shouldUseDarkColors ? '#101813' : '#f4f7f5', title: 'Claude Proxy Guard',
       autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false, webSecurity: true } });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('will-navigate', event => event.preventDefault());

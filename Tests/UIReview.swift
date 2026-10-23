@@ -16,6 +16,14 @@ import AppKit
         let view = NSHostingView(rootView: GuardView(model: model))
         view.frame = NSRect(x: 0, y: 0, width: 720, height: 900)
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        if CommandLine.arguments.count > 2 {
+            // Test-only appearance override for light/dark review renders.
+            switch CommandLine.arguments[2].lowercased() {
+            case "light": window.appearance = NSAppearance(named: .aqua)
+            case "dark": window.appearance = NSAppearance(named: .darkAqua)
+            default: break
+            }
+        }
         window.contentView = view
         window.orderFront(nil)
         RunLoop.current.run(until: Date().addingTimeInterval(0.4))
