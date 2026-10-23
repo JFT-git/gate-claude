@@ -1,0 +1,41 @@
+# TEMPLATE ONLY. Move to .github/workflows after maintainer authorization.
+name: macOS UI release
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: Windows/package-lock.json
+      - run: python3 packaging/scripts/verify-scope.py
+      - run: npm ci --no-audit --no-fund
+        working-directory: Windows
+      - run: npm test
+        working-directory: Windows
+      - run: npx electron scripts/ui-smoke.cjs
+        working-directory: Windows
+        env:
+          GATE_UI_TEST_OUT: ${{ runner.temp }}/guard-ui
+      - run: bash packaging/macos/test-ui.sh "$RUNNER_TEMP/guard-macos-ui.png"
+      - run: bash test.sh
+      - run: bash packaging/macos/package.sh "$RUNNER_TEMP/guard-release"
+      - name: Publish only distributable files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macOS-universal-unsigned-publisher
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/guard-release/ClaudeProxyGuard-macOS-*.zip
+            ${{ runner.temp }}/guard-release/ClaudeProxyGuard-macOS-*.dmg
+            ${{ runner.temp }}/guard-release/*.sha256
+            ${{ runner.temp }}/guard-release/macos-build-status.json
+            ${{ runner.temp }}/guard-ui/ui-validation.json

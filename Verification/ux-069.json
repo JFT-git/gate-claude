@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "versions": {
+    "windows": "0.6.9",
+    "macos": "0.3.4"
+  },
+  "engineBaseline": "6d5ede249b9992ae8222839fbd5b704d579275fb",
+  "host": "macOS arm64",
+  "nodeTests": {
+    "total": 485,
+    "passed": 471,
+    "failed": 0,
+    "skipped": [
+      "production fence authenticates a Limited controller, drains before retire, retains deny on EOF, and preserves legacy protocol",
+      "zero-capability package fence follows native sockets to PowerShell and protects the relay port",
+      "Windows native elevation requester refuses malformed arguments and invalid owners before consent",
+      "native WFP fence blocks direct TCP, UDP and IPv6; survives broker loss; retires only after runtime exit",
+      "portable PowerShell aliases preserve streams, arguments, exit codes and nested cwd",
+      "atomic GuardHost job closes its root and descendant on EOF, heartbeat timeout, helper crash and root exit",
+      "GuardHost closes its job after its controlling parent dies",
+      "forcing GuardHost termination during process creation leaves no running or suspended canary image",
+      "Windows Job Object kills child and grandchild on EOF, helper crash and missing heartbeat",
+      "original image deny blocks loopback TCP, IPv6 and UDP; removal restores connectivity",
+      "Windows parses hostile filename characters as one literal command value without executing the registry script",
+      "native route identities validate ABI, select both default and VPN split routes, and ignore aging fields",
+      "native route snapshots match ActiveStore and ten consecutive calls stay within the four-second deadline",
+      "route query mode rejects extra arguments without a successful empty snapshot"
+    ]
+  },
+  "renderer": {
+    "status": "PASS",
+    "checks": 20,
+    "mode": "REAL_RENDERER_TEST_ONLY_IPC",
+    "network": "DISABLED"
+  },
+  "macOS": {
+    "universalBuild": "PASS",
+    "localTestSuite": "PASS",
+    "passAssertions": 86,
+    "swiftUIViewRender": "PASS_TEST_MODEL_ONLY",
+    "intelExecution": "NOT_RUN",
+    "dmgIntegrity": "PASS"
+  },
+  "windows": {
+    "nativeRuntime": "NOT_RUN",
+    "installedClaude": "NOT_RUN",
+    "UACCleanMachine": "NOT_RUN",
+    "installerCompile": "NOT_RUN_INNO_UNAVAILABLE",
+    "installerInstallUninstall": "NOT_RUN",
+    "crossBuiltPackage": "PASS_SOURCE_MATCH_36_FILES_NATIVE_CODETOOLS_HASH_MATCH"
+  },
+  "service": {
+    "backend": "ABSENT",
+    "sessionRoutingSupported": false
+  },
+  "signing": {
+    "windowsAuthenticode": "NOT_CONFIGURED",
+    "macOS": "AD_HOC_ONLY",
+    "notarization": "NOT_CONFIGURED"
+  },
+  "ciActivation": "TEMPLATES_ONLY_WORKFLOW_SCOPE_MISSING"
+}

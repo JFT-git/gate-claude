@@ -10,6 +10,7 @@ const { validateSettings } = require('./policy.cjs');
 const { diagnostic } = require('./sanitize.cjs');
 const { takeDeepLinkFromArgv, LINK_REFUSED } = require('./deep-link.cjs');
 const { ensureGuardProtocolRegistration, SETTINGS_URL } = require('./protocol-registration.cjs');
+const { ServiceIntegration } = require('./service-integration.cjs');
 
 app.setName('Claude Proxy Guard');
 app.setAppUserModelId?.('local.proxyguard.gate-claude');
@@ -42,6 +43,7 @@ else {
     });
   }
   app.whenReady().then(async () => {
+    const serviceIntegration = new ServiceIntegration();
     controller = new GuardController(root, resources, {
       ownerWindow: () => {
         if (!window || window.isDestroyed()) throw Error('Окно Guard недоступно для системного запроса Windows.');
@@ -74,6 +76,8 @@ else {
       return finding;
     };
     handle('find', findClaude);
+    handle('serviceStatus', () => serviceIntegration.status());
+    handle('serviceOperation', action => serviceIntegration.invoke(action));
     handle('codeWorkspace', async () => {
       const workspace = path.join(root, 'CodeState', 'Workspace');
       for (const directory of [root, path.join(root, 'CodeState'), workspace]) {
@@ -118,7 +122,7 @@ else {
       if (!result.canceled && result.filePath) { fs.writeFileSync(result.filePath, JSON.stringify([...traffic.values()], null, 2), { mode: 0o600 }); return true; }
       return false;
     });
-    window = new BrowserWindow({ width: 1140, height: 820, minWidth: 880, minHeight: 650, backgroundColor: '#101919', title: 'Claude Proxy Guard',
+    window = new BrowserWindow({ width: 1240, height: 900, minWidth: 640, minHeight: 600, backgroundColor: '#101813', title: 'Claude Proxy Guard',
       autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false, webSecurity: true } });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('will-navigate', event => event.preventDefault());

@@ -17,6 +17,9 @@ codesign --force --sign - --identifier local.proxyguard.claude.host "$APP/Conten
 lipo -create .build/Guard-arm64 .build/Guard-x86_64 -output "$APP/Contents/MacOS/ClaudeProxyGuard"
 cp Resources/RuntimeBootstrap.cjs "$APP/Contents/Resources/RuntimeBootstrap.cjs"
 cp Info.plist "$APP/Contents/Info.plist"
+mkdir -p "$APP/Contents/Resources/Documentation"
+cp README.md SECURITY.md CHANGELOG.md "$APP/Contents/Resources/Documentation/"
+cp -R docs "$APP/Contents/Resources/Documentation/"
 if [ -f AppIcon.icns ]; then cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"; fi
 codesign --force --sign - --identifier local.proxyguard.claude "$APP"
 codesign --verify --deep --strict "$APP"

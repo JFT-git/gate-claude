@@ -1,0 +1,72 @@
+# TEMPLATE ONLY. No active workflow or service installation is added by this file.
+name: Windows x64 UI release
+on:
+  workflow_dispatch:
+    inputs:
+      tools_tag:
+        description: Existing gate-claude release tag containing pinned CodeTools assets
+        required: true
+        type: string
+      policy_sha256:
+        description: Independently verified SHA-256 of code-tools-policy.json
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: Windows/package-lock.json
+      - run: python packaging/scripts/verify-scope.py
+      - name: Fetch pinned public CodeTools assets
+        shell: pwsh
+        env:
+          TOOLS_TAG: ${{ inputs.tools_tag }}
+          POLICY_SHA256: ${{ inputs.policy_sha256 }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if($env:TOOLS_TAG -notmatch '^v[0-9A-Za-z._-]+$' -or $env:POLICY_SHA256 -notmatch '^[0-9a-fA-F]{64}$'){throw 'Invalid release inputs'}
+          $dir=Join-Path $env:RUNNER_TEMP 'guard-code-tools'
+          New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null
+          foreach($file in @('code-tools-policy.json','GateCodeTools-Git-2.56.0.zip','GateCodeTools-PowerShell-7.6.7.zip')){
+            & curl.exe --fail --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 600 ('https://github.com/JFT-git/gate-claude/releases/download/'+$env:TOOLS_TAG+'/'+$file) --output (Join-Path $dir $file)
+            if($LASTEXITCODE -ne 0){throw 'Public asset download failed'}
+          }
+          if((Get-FileHash (Join-Path $dir 'code-tools-policy.json') -Algorithm SHA256).Hash -ne $env:POLICY_SHA256){throw 'Policy checksum mismatch'}
+          # package.cjs independently validates pinned sources, every archive and policy.
+      - run: npm ci --no-audit --no-fund
+        working-directory: Windows
+      - name: Tests (retain explicit skip status)
+        run: npm test
+        working-directory: Windows
+      - name: Real renderer with test-only IPC (not Claude/WFP E2E)
+        run: npx electron scripts/ui-smoke.cjs
+        working-directory: Windows
+        env:
+          GATE_UI_TEST_OUT: ${{ runner.temp }}/guard-ui
+      - name: Native compile, portable and optional installer
+        shell: pwsh
+        run: |
+          $compiler='C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          $args=@{CodeToolsDir=(Join-Path $env:RUNNER_TEMP 'guard-code-tools');ArtifactDir=(Join-Path $env:RUNNER_TEMP 'guard-release')}
+          if(Test-Path -LiteralPath $compiler){$args.InnoCompiler=$compiler}
+          & ./packaging/windows/package.ps1 @args
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Windows-x64-no-authenticode
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/guard-release/ClaudeProxyGuard-Windows-*.zip
+            ${{ runner.temp }}/guard-release/ClaudeProxyGuard-Windows-*-Setup.exe
+            ${{ runner.temp }}/guard-release/*.sha256
+            ${{ runner.temp }}/guard-release/windows-build-status.json
+            ${{ runner.temp }}/guard-ui/ui-validation.json
