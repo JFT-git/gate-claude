@@ -55,6 +55,37 @@ final class GuardModel: ObservableObject {
     private var sleeping = false
     private var trafficWindow: NSWindow?
     private let diagnostics: GuardDiagnostics
+    private var childBundleURL: URL?
+    private var deepLinkReady: Bool {
+        allowed && !policy.suspended && !sleeping && !restarting && !requiresRestart &&
+        claudeRunning && process?.isRunning == true && lastVerifiedProfile != nil && childBundleURL != nil
+    }
+    lazy var deepLinkInbox: DeepLinkInbox = {
+        let inbox = DeepLinkInbox(
+            active: { [weak self] in
+                guard let self else { return false }
+                return !self.requiresRestart && !self.restarting && (self.busy || self.monitoring || self.claudeRunning)
+            },
+            ready: { [weak self] in self?.deepLinkReady == true },
+            deliver: { _ in throw GuardError.message(DeepLinkInbox.failed) },
+            notice: { [weak self] text in self?.appendLog(text) })
+        inbox.deliverAsync = { [weak self] raw, finish in
+            guard let self, self.deepLinkReady, let childBundleURL = self.childBundleURL,
+                  let url = URL(string: raw),
+                  NSWorkspace.shared.runningApplications.contains(where: {
+                      $0.bundleURL?.standardizedFileURL == childBundleURL.standardizedFileURL && !$0.isTerminated
+                  }) else { finish(false); return }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.createsNewApplicationInstance = false
+            let token = self.operation
+            NSWorkspace.shared.open([url], withApplicationAt: childBundleURL, configuration: configuration) { [weak self] app, error in
+                Task { @MainActor in
+                    finish(error == nil && app != nil && self?.operation == token && self?.deepLinkReady == true)
+                }
+            }
+        }
+        return inbox
+    }()
     var onRestart: (() -> Void)?
 
     #if GUARD_E2E
@@ -241,6 +272,7 @@ final class GuardModel: ObservableObject {
                     self.revalidationTask = nil
                     let shouldLaunch = self.launchAfterValidation; self.launchAfterValidation = false
                     self.scheduleCheck()
+                    self.deepLinkInbox.flush()
                     if shouldLaunch, !self.launchPending, !self.claudeRunning { self.attemptLaunch() }
                     return
                 } catch {
@@ -476,6 +508,7 @@ final class GuardModel: ObservableObject {
         inspector.onVerified = { [weak self] profile in
             guard let self, self.operation == token else { return }
             self.lastVerifiedProfile = profile
+            self.deepLinkInbox.flush()
             #if GUARD_E2E
             self.e2eOnVerified?(profile)
             #endif
@@ -494,6 +527,7 @@ final class GuardModel: ObservableObject {
             }
         }
         try child.run()
+        childBundleURL = bundleURL
         process = child; activePath = bundleURL.path; claudeRunning = true
         inspector.start()
         appendLog("Локальная копия Claude запущена: \(timezone) · \(language)")
@@ -512,6 +546,7 @@ final class GuardModel: ObservableObject {
     }
     func restart() {
         guard !restarting, let onRestart else { return }
+        deepLinkInbox.clear()
         restarting = true
         onRestart()
     }
@@ -519,6 +554,8 @@ final class GuardModel: ObservableObject {
         restarting = false; detail = message; appendLog(message)
     }
     private func block(_ reason: String, manual: Bool = false, latch: Bool = false) {
+        deepLinkInbox.clear()
+        childBundleURL = nil
         password = ""
         if latch { policy.latch(reason) }
         requiresRestart = policy.requiresRestart
@@ -796,6 +833,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
     private var restartedProcess: Process?
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls { model.deepLinkInbox.accept(url.absoluteString) }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         model.onRestart = { [weak self] in self?.restartApplication() }
