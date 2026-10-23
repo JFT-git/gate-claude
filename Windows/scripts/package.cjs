@@ -87,6 +87,10 @@ async function main() {
   for (const result of results) {
     await fs.copyFile(path.join(root, 'README.md'), path.join(result, 'README.ru.md'));
     await fs.copyFile(path.join(project, 'LICENSE'), path.join(result, 'GUARD-LICENSE.txt'));
+    const documentation = path.join(result, 'Documentation');
+    await fs.mkdir(documentation, { recursive: true });
+    for (const file of ['README.md', 'SECURITY.md', 'CHANGELOG.md']) await fs.copyFile(path.join(project, file), path.join(documentation, file));
+    await fs.cp(path.join(project, 'docs'), path.join(documentation, 'docs'), { recursive: true });
     if (platform === 'win32') {
       await fs.copyFile(path.join(root, 'scripts', 'Block-OriginalClaude.ps1'), path.join(result, 'Block-OriginalClaude.ps1'));
       await fs.copyFile(path.join(root, 'native', 'OriginalClaudeFence.cs'), path.join(result, 'OriginalClaudeFence.cs'));

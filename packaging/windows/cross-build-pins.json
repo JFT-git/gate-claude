@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "engineBaseline": "6d5ede249b9992ae8222839fbd5b704d579275fb",
+  "note": "Existing native binaries reused without engine changes. NetworkFence was cross-compiled with Roslyn 4.11.0 and .NET Framework 4.8 references. Windows execution of the 0.6.8/0.6.9 elevation path remains NOT RUN.",
+  "sha256": {
+    "GuardHost.exe": "b97edf75506f5cf8e2ca31107f4a5769476fb53bb2ffea351ed661c28fd6561f",
+    "CodeHost.exe": "b0850ceeef0a718165b814856002727ced2495d8e51f560b7fbb3d13975d9f9a",
+    "NetworkFence.exe": "972dfcc1ed9e9927d247be903787af6bc61641de52e3ecaa56645ceb79ea0815",
+    "code-tools-policy.json": "a4920680e7ca240670f030bcb5ebf0c08857d146a7bdfd53bc20890e010ed598",
+    "CodeTools/GateCodeTools-Git-2.56.0.zip": "44fccabcd109f7c5248683026dbbf1a8fc08c33e79857c96ce08e33b603e276f",
+    "CodeTools/GateCodeTools-PowerShell-7.6.7.zip": "2b66d460b84cbc6975564dc5e3556b1f555918387e0325b30c7336b7c99a60a0"
+  }
+}

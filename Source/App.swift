@@ -523,13 +523,14 @@ private struct Surface<Content: View>: View {
     var body: some View {
         content.padding(20).frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.white.opacity(0.045))
-            .clipShape(RoundedRectangle(cornerRadius: 18))
-            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.07)))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.12)))
     }
 }
 
 struct GuardView: View {
     @ObservedObject var model: GuardModel
+    @StateObject private var presentation = GuardPresentation()
     private var statusColor: Color { model.allowed ? .mint : (model.busy ? .cyan : .orange) }
     var body: some View {
         ScrollView {
@@ -543,7 +544,7 @@ struct GuardView: View {
                         Text("Проверка IP перед запуском Claude").font(.system(size: 13)).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Text("v0.3.3").font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
+                    Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.4")).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
                 }
                 Surface {
                     VStack(alignment: .leading, spacing: 14) {
@@ -566,6 +567,32 @@ struct GuardView: View {
                         if let next = model.nextCheck {
                             Text("Следующая проверка в \(next.formatted(date: .omitted, time: .standard))")
                                 .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                        }
+                        HStack(spacing: 8) {
+                            Button { presentation.lastAction = "Запуск: запрос отправлен"; model.check(andLaunch: true) } label: {
+                                Label("Запустить", systemImage: "play")
+                            }.buttonStyle(GuardActionStyle(primary: !model.claudeRunning && !model.busy && !model.requiresRestart))
+                                .disabled(model.busy || model.claudeRunning || model.requiresRestart || model.restarting)
+                                .keyboardShortcut(.defaultAction)
+                                .help("Проверить IP и запустить копию Claude")
+                            Button { presentation.lastAction = "Остановка: команда отправлена"; model.stop() } label: {
+                                Label("Остановить", systemImage: "stop")
+                            }.buttonStyle(GuardActionStyle(primary: (model.claudeRunning || model.busy) && !model.requiresRestart))
+                                .disabled((!model.monitoring && !model.busy && !model.claudeRunning) || model.restarting)
+                                .keyboardShortcut(".", modifiers: .command)
+                                .help("Закрыть шлюз и остановить собственную копию Claude")
+                            Button { presentation.lastAction = "Перезапуск: ожидаем новое окно"; model.restart() } label: {
+                                Label("Перезапустить", systemImage: "arrow.clockwise")
+                            }.buttonStyle(GuardActionStyle(primary: model.requiresRestart))
+                                .disabled(model.restarting)
+                                .help("Заново открыть Guard и закрыть текущую сессию. Пароль прокси потребуется ввести снова.")
+                        }
+                        Text("Последнее действие: \(presentation.lastAction)").font(.system(size: 12)).foregroundStyle(.secondary)
+                            .accessibilityLabel("Последнее действие: \(presentation.lastAction)")
+                        HStack {
+                            Label("Системная служба не используется", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Журнал") { model.showLog = true; model.showDiagnostics() }.keyboardShortcut("l", modifiers: .command)
                         }
                     }
                 }
@@ -638,30 +665,15 @@ struct GuardView: View {
                             Spacer()
                             Button("Выбрать…") { model.selectClaude() }.disabled(model.monitoring || model.busy || model.requiresRestart)
                         }
-                        HStack(spacing: 10) {
-                            Button { model.check(andLaunch: true) } label: {
-                                Label("Проверить и запустить", systemImage: "play.fill").frame(maxWidth: .infinity)
-                            }.buttonStyle(.borderedProminent).tint(.indigo).controlSize(.large)
-                                .disabled(model.busy || model.claudeRunning || model.requiresRestart)
-                            Button("Только проверка") { model.check(andLaunch: false) }
-                                .controlSize(.large).disabled(model.busy || model.requiresRestart)
-                            Button { model.stop() } label: { Image(systemName: "stop.fill").padding(.vertical, 5) }
-                                .help("Закрыть шлюз и остановить запущенный Claude")
-                                .disabled(!model.monitoring && !model.busy && !model.claudeRunning)
-                        }
+                        Button("Только проверка IP") { presentation.lastAction = "Проверка IP: запрос отправлен"; model.check(andLaunch: false) }
+                            .disabled(model.busy || model.requiresRestart || model.restarting)
                         HStack {
                             Link("Скачать официальный Claude Desktop ↗", destination: URL(string: "https://claude.com/download")!)
                                 .font(.system(size: 11)).tint(.secondary)
                             Spacer()
                             Button("Трафик: \(model.traffic.count)") { model.showTraffic() }
                         }
-                        HStack {
-                            Button { model.restart() } label: { Label("Перезапустить Guard", systemImage: "arrow.clockwise") }
-                                .disabled(model.restarting)
-                                .help("Закрыть Claude и шлюз, затем открыть новый процесс Guard. Пароль прокси потребуется ввести заново.")
-                            Spacer()
-                            Button("Журнал завершений") { model.showDiagnostics() }
-                        }
+
                     }
                 }
                 VStack(alignment: .leading, spacing: 8) {
@@ -679,9 +691,10 @@ struct GuardView: View {
                 }.padding(.horizontal, 4)
             }.padding(28)
         }
-        .frame(minWidth: 620, idealWidth: 680, minHeight: 720, idealHeight: 850)
-        .background(Color(red: 0.055, green: 0.065, blue: 0.095))
+        .frame(minWidth: 620, idealWidth: 720, minHeight: 620, idealHeight: 900)
+        .background(Color(red: 0.059, green: 0.094, blue: 0.090))
         .preferredColorScheme(.dark)
+        .onChange(of: model.phase) { phase in presentation.lastAction = phase + " · " + Date().formatted(date: .omitted, time: .standard) }
     }
 
     private func field(_ title: String, placeholder: String, value: Binding<String>) -> some View {

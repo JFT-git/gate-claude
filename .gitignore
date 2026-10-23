@@ -32,3 +32,7 @@ Runtime-*/
 Thumbs.db
 __pycache__/
 *.pyc
+
+# Generated release artifacts and validation output
+release/
+/release-*/
