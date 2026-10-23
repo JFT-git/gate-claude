@@ -32,7 +32,7 @@ async function fixture(t) {
     module, exports: module.exports, __dirname: path.dirname(file), Buffer, process: { platform: 'win32' },
     require(name) {
       if (name === 'node:net') return net;
-      if (name === './windows.cjs') return { ...originalRequire(name), powershell(script, timeout) { launches.push({ script, timeout }); return launch; } };
+      if (name === './fence-launch.cjs') return { ...originalRequire(name), requestElevation(request) { launches.push(request); return launch; } };
       return originalRequire(name);
     },
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, at: now + delay }); return id; },
@@ -58,7 +58,7 @@ async function fixture(t) {
       };
       socket.destroy = () => { if (!socket.destroyed) { socket.destroyed = true; queueMicrotask(() => socket.emit('close')); } };
       servers[0].emit('connection', socket);
-      const expected = /'--token','([a-f0-9]{64})'/.exec(launches[0].script)?.[1];
+      const expected = launches[0].token;
       assert.ok(expected);
       socket.emit('data', JSON.stringify({ type: 'hello', version: 1, token: token ?? expected }) + '\n');
       return socket;
@@ -82,10 +82,10 @@ async function fixture(t) {
   return h;
 }
 
-unit('human UAC waiting does not consume the broker deadline or time out PowerShell', async t => {
+unit('human UAC waiting does not consume the broker deadline or repeat native elevation', async t => {
   const h = await fixture(t); let outcome = 'pending';
   const pending = h.begin(); pending.then(() => { outcome = 'installed'; }, () => { outcome = 'failed'; });
-  await h.untilLaunch(); assert.equal(h.launches[0].timeout, 0);
+  await h.untilLaunch(); assert.equal(h.launches[0].helper, process.execPath);
   await h.advance(180000);
   assert.equal(outcome, 'pending'); assert.equal(h.NetworkFence.approvalPending, true);
   assert.equal(h.servers[0].closed, false);

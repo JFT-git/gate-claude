@@ -23,7 +23,7 @@ const { DeepLinkInbox, messages: linkMessages } = require('./deep-link.cjs');
 const DESTINATIONS = Object.freeze(['claude.ai', 'api.anthropic.com']);
 
 class GuardController extends EventEmitter {
-  constructor(root, resources) {
+  constructor(root, resources, options = {}) {
     super(); this.codeCleanups = new WeakMap(); this.codeStatePreparations = new WeakMap();
     this.destinationPolicies = new Map(); this.destinationRequests = new Map(); this.probeFailures = new Map();
     this.deepLinks = new DeepLinkInbox({
@@ -32,6 +32,7 @@ class GuardController extends EventEmitter {
       deliver: url => this.channel.command('ProxyGuard.openDeepLink', { url }),
       notice: kind => this.log(linkMessages[kind], ['refused', 'failed', 'expired'].includes(kind) ? 'warning' : 'event')
     });
+    this.fenceOwnerWindow = options.ownerWindow;
     this.root = root; this.resources = resources; this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
     try { this.events = JSON.parse(fs.readFileSync(path.join(root, 'diagnostics.json'), 'utf8')).slice(-80); } catch {}
   }
@@ -196,6 +197,7 @@ class GuardController extends EventEmitter {
       let fence;
       try { fence = await NetworkFence.prepare(this.runtime, port, {
         helperPath: path.join(this.resources, 'NetworkFence.exe'),
+        ownerWindow: this.fenceOwnerWindow?.(),
         onStage: stage => {
           if (active() && this.state !== 'rechecking') {
             if (stage === 'approval') this.status('Подтвердите системный запрос Windows. До подтверждения защиты Claude не запускается.');
