@@ -206,21 +206,108 @@ function mappedIPv4(address) {
   try { return new URL('http://[' + address.split('%', 1)[0] + ']/').hostname.startsWith('[::ffff:'); }
   catch { return true; }
 }
+// Snapshot pins per dial so an asynchronous lookup cannot switch exits midway.
+let pinnedLocalAddresses = null;
+function setPinnedLocalAddresses(pin) {
+  if (pin !== null && (!pin || [4, 6].some(f => pin['v' + f] != null &&
+      (net.isIP(pin['v' + f]) !== f || mappedIPv4(pin['v' + f]))))) throw familyRefusal();
+  pinnedLocalAddresses = pin === null ? null : { ...pin, dnsServers: pin.dnsServers?.slice() };
+}
+function localRefusal() { return Object.assign(Error('Локальный адрес закреплённого выхода недоступен. Соединение закрыто.'), { targetRefused: true }); }
+function dnsName(packet, start) {
+  let offset = start, end, labels = [], seen = new Set();
+  for (;;) {
+    if (offset >= packet.length || seen.has(offset)) throw Error('Некорректный ответ DNS.');
+    seen.add(offset);
+    const length = packet[offset++];
+    if ((length & 0xc0) === 0xc0) {
+      if (offset >= packet.length) throw Error('Некорректный ответ DNS.');
+      end ??= offset + 1; offset = ((length & 63) << 8) | packet[offset]; continue;
+    }
+    if (length & 0xc0 || offset + length > packet.length) throw Error('Некорректный ответ DNS.');
+    if (!length) return { name: labels.join('.').toLowerCase(), end: end ?? offset };
+    labels.push(packet.subarray(offset, offset + length).toString('ascii')); offset += length;
+    if (labels.join('.').length > 253) throw Error('Некорректный ответ DNS.');
+  }
+}
+function dnsAnswer(packet, id, host, family) {
+  if (packet.length < 12 || packet.readUInt16BE(0) !== id) return null;
+  const flags = packet.readUInt16BE(2), type = family === 4 ? 1 : 28;
+  if ((flags & 0xfa0f) !== 0x8000 || packet.readUInt16BE(4) !== 1) throw Error('DNS не подтвердил адрес.');
+  const question = dnsName(packet, 12); let offset = question.end;
+  if (question.name !== host.toLowerCase().replace(/\.$/, '') || packet.readUInt16BE(offset) !== type || packet.readUInt16BE(offset + 2) !== 1) throw Error('Неверный вопрос DNS.');
+  offset += 4;
+  const records = [];
+  for (let n = 0; n < packet.readUInt16BE(6); n++) {
+    const owner = dnsName(packet, offset); offset = owner.end;
+    const kind = packet.readUInt16BE(offset), klass = packet.readUInt16BE(offset + 2), length = packet.readUInt16BE(offset + 8); offset += 10;
+    if (offset + length > packet.length) throw Error('Некорректный ответ DNS.');
+    records.push({ owner: owner.name, kind, klass, offset, length }); offset += length;
+  }
+  const names = new Set([question.name]);
+  for (let n = 0; n < records.length; n++) for (const r of records) if (r.klass === 1 && r.kind === 5 && names.has(r.owner)) {
+    const alias = dnsName(packet, r.offset); if (alias.end !== r.offset + r.length) throw Error('Некорректный CNAME.'); names.add(alias.name);
+  }
+  for (const r of records) if (names.has(r.owner) && r.klass === 1 && r.kind === type && r.length === (family === 4 ? 4 : 16)) {
+    const bytes = packet.subarray(r.offset, r.offset + r.length);
+    const address = family === 4 ? [...bytes].join('.') : Array.from({ length: 8 }, (_, i) => bytes.readUInt16BE(i * 2).toString(16)).join(':');
+    if (mappedIPv4(address)) throw familyRefusal();
+    return address;
+  }
+  throw Error('DNS не вернул адрес нужного семейства.');
+}
+async function boundLookup(host, family, pin) {
+  const labels = host.replace(/\.$/, '').split('.');
+  if (!labels.length || labels.some(x => !x.length || x.length > 63 || !/^[a-z0-9_-]+$/i.test(x)) || host.length > 254) throw Error('Неверное имя DNS.');
+  const servers = pin.dnsServers || dns.getServers(); let failure = localRefusal();
+  for (let attempt = 0; attempt < 2; attempt++) for (const server of servers) {
+    try {
+      const match = /^\[([^\]]+)\](?::(\d+))?$/.exec(server) || /^(\d+\.\d+\.\d+\.\d+)(?::(\d+))?$/.exec(server);
+      const address = match ? match[1] : server, port = match?.[2] ? Number(match[2]) : 53, transport = net.isIP(address);
+      if (!transport || !pin['v' + transport] || mappedIPv4(address)) continue;
+      return await new Promise((resolve, reject) => {
+        const socket = require('node:dgram').createSocket(transport === 4 ? 'udp4' : 'udp6');
+        const id = randomBytes(2).readUInt16BE(), header = Buffer.alloc(12); header.writeUInt16BE(id); header.writeUInt16BE(0x100, 2); header.writeUInt16BE(1, 4);
+        const tail = Buffer.from([0, 0, family === 4 ? 1 : 28, 0, 1]);
+        const query = Buffer.concat([header, ...labels.map(x => Buffer.concat([Buffer.from([x.length]), Buffer.from(x)])), tail]);
+        let done = false;
+        const finish = (error, value) => { if (done) return; done = true; clearTimeout(timer); try { socket.close(); } catch {} error ? reject(error) : resolve(value); };
+        const timer = setTimeout(() => finish(Error('Тайм-аут DNS закреплённого выхода.')), 3000);
+        socket.on('error', error => finish(error));
+        socket.on('message', packet => { try { const value = dnsAnswer(packet, id, host, family); if (value) finish(null, value); } catch (error) { finish(error); } });
+        socket.bind({ address: pin['v' + transport] }, () => {
+          socket.connect(port, address, () => socket.send(query, error => { if (error) finish(error); }));
+        });
+      });
+    } catch (error) { failure = error; }
+  }
+  throw failure;
+}
 function familyRefusal() { return Object.assign(Error('Семейство IP назначения не совпадает с закреплённым маршрутом.'), { targetRefused: true }); }
 async function connectCurrentNetwork(host, port, onSocket = () => {}, family = 0) {
   if (![0, 4, 6].includes(family)) throw familyRefusal();
   const literal = net.isIP(host);
   if (mappedIPv4(host) || (family && literal && literal !== family)) throw familyRefusal();
+  const pin = pinnedLocalAddresses;
+  if (pin) {
+    family = family || literal || (pin.v4 ? 4 : 6);
+    if (!pin['v' + family]) throw localRefusal();
+  }
   const options = { host, port };
+  if (pin) options.localAddress = pin['v' + family];
   if (family) {
     options.family = family; options.autoSelectFamily = false;
     // Check the actual answer as well as the requested DNS family. In particular,
     // an IPv4-mapped AAAA answer must not open an unmonitored IPv4 connection.
-    options.lookup = (name, lookupOptions, callback) => dns.lookup(name, { ...lookupOptions, family, all: false }, (error, address, answerFamily) => {
+    options.lookup = (name, lookupOptions, callback) => {
+      const checked = (error, address, answerFamily) => {
       if (error) callback(error);
       else if (net.isIP(address) !== family || answerFamily !== family || mappedIPv4(address)) callback(familyRefusal());
       else callback(null, address, answerFamily);
-    });
+      };
+      if (pin) boundLookup(name, family, pin).then(address => checked(null, address, family), checked);
+      else dns.lookup(name, { ...lookupOptions, family, all: false }, checked);
+    };
   }
   const socket = net.createConnection(options); onSocket(socket);
   socket.setTimeout(8000, () => socket.destroy(Error('Тайм-аут подключения через текущую сеть.')));
@@ -429,4 +516,4 @@ async function connectTunnel(port, host, targetPort = 443, checkToken = '', onSo
   socket.setTimeout(0); return socket;
 }
 
-module.exports = { SOCKSRelay, NetworkRelay, connectSOCKS, connectHTTP, connectCurrentNetwork, connectTunnel, SocketReader, authority };
+module.exports = { setPinnedLocalAddresses, SOCKSRelay, NetworkRelay, connectSOCKS, connectHTTP, connectCurrentNetwork, connectTunnel, SocketReader, authority };

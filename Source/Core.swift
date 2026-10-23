@@ -21,6 +21,13 @@ struct ProxySettings: Equatable {
               let port = UInt16(port), port > 0 else {
             throw GuardError.message("Введите хост без socks5:// и порт от 1 до 65535.")
         }
+        // Multicast DNS names resolve outside any pinned route and reveal the proxy
+        // name on the local network; literal addresses or ordinary DNS names only.
+        let lowered = host.lowercased()
+        guard !lowered.hasSuffix(".local"), !lowered.hasSuffix(".local."),
+              !lowered.hasSuffix(".lan"), !lowered.hasSuffix(".internal") else {
+            throw GuardError.message("Имя прокси в зоне .local/.lan/.internal не поддерживается: оно разрешается через mDNS мимо закреплённого маршрута. Укажите числовой адрес или обычное DNS-имя.")
+        }
         guard username.utf8.count <= 255, password.utf8.count <= 255 else {
             throw GuardError.message("Логин и пароль SOCKS5 должны быть не длиннее 255 байт.")
         }
@@ -164,12 +171,18 @@ final class SOCKSRelay: @unchecked Sendable {
     }()
     enum Mode { case probeOnly, open, blocked }
     enum PinFamily { case v4, v6 }
+    /// Kill switch for current-network sessions: upstream sockets are bound to the
+    /// pinned local address of the approved egress interface. When the interface or
+    /// VPN disappears, the address is gone and new connections fail before any packet
+    /// leaves. A missing address for a required family refuses that family.
+    struct LocalPin: Equatable { let v4: String?; let v6: String? }
     private let queue = DispatchQueue(label: "local.proxyguard.relay")
     private let settings: ProxySettings?
     private var listener: NWListener?
     private var tunnels: [UUID: RelayTunnel] = [:]
     private var mode: Mode = .probeOnly
     private var pinnedFamily: PinFamily?
+    private var pinnedLocal: LocalPin?
     private var startup: CheckedContinuation<UInt16, Error>?
     private var alive = true
     private var faultReported = false
@@ -209,7 +222,7 @@ final class SOCKSRelay: @unchecked Sendable {
                             connection.cancel(); return
                         }
                         let id = UUID()
-                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily, checkToken: self.checkToken)
+                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily, pinnedLocal: self.pinnedLocal, checkToken: self.checkToken)
                         tunnel.isAllowed = { [weak self] host, port, control in
                             guard let self, self.alive else { return false }
                             switch self.mode {
@@ -247,6 +260,11 @@ final class SOCKSRelay: @unchecked Sendable {
         queue.sync { pinnedFamily = family }
     }
 
+    /// nil disables the egress kill switch (SOCKS sessions manage their own upstream).
+    func setPinnedLocalAddresses(_ pin: LocalPin?) {
+        queue.sync { pinnedLocal = pin }
+    }
+
     func unlock() -> Bool {
         queue.sync {
             guard alive, mode == .probeOnly, !faultReported else { return false }
@@ -266,7 +284,7 @@ final class SOCKSRelay: @unchecked Sendable {
 
     func stop() {
         queue.sync {
-            alive = false; mode = .blocked; pinnedFamily = nil
+            alive = false; mode = .blocked; pinnedFamily = nil; pinnedLocal = nil
             for tunnel in Array(tunnels.values) { tunnel.close() }
             listener?.cancel(); listener = nil
         }
@@ -289,6 +307,7 @@ private final class RelayTunnel {
     private let settings: ProxySettings?
     private let queue: DispatchQueue
     var pinnedFamily: SOCKSRelay.PinFamily?
+    private let pinnedLocal: SOCKSRelay.LocalPin?
     private var closed = false
     private var established = false
     private var header = Data()
@@ -303,10 +322,20 @@ private final class RelayTunnel {
     var onUpstreamFault: (() -> Void)?
     var onProbeConnected: (() -> Void)?
 
-    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?, checkToken: String) {
+    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?, pinnedLocal: SOCKSRelay.LocalPin?, checkToken: String) {
         self.checkToken = checkToken
         self.client = client; self.settings = settings; self.queue = queue
-        self.pinnedFamily = pinnedFamily
+        self.pinnedFamily = pinnedFamily; self.pinnedLocal = pinnedLocal
+    }
+
+    /// IPv4-mapped IPv6 must never open an unmonitored IPv4 connection.
+    static func isMappedIPv4(_ host: String) -> Bool {
+        var v6 = in6_addr()
+        guard inet_pton(AF_INET6, host, &v6) == 1 else { return false }
+        return withUnsafeBytes(of: &v6) { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            return bytes[0..<10].allSatisfy { $0 == 0 } && bytes[10] == 0xff && bytes[11] == 0xff
+        }
     }
 
     func start() {
@@ -409,7 +438,7 @@ private final class RelayTunnel {
             if inet_pton(AF_INET, destination, &v4) == 1 {
                 guard family == AF_INET else { close(); return }
             } else if inet_pton(AF_INET6, destination, &v6) == 1 {
-                guard family == AF_INET6 else { close(); return }
+                guard family == AF_INET6, !Self.isMappedIPv4(destination) else { close(); return }
             } else {
                 var hints = addrinfo()
                 hints.ai_family = family
@@ -427,9 +456,23 @@ private final class RelayTunnel {
                     close(); return
                 }
                 host = String(cString: literal)
+                guard !Self.isMappedIPv4(host) else { close(); return }
             }
         }
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        let parameters = NWParameters.tcp
+        if let pin = pinnedLocal {
+            // Kill switch: bind the upstream socket to the pinned address of the
+            // approved egress interface. If that interface or VPN is gone, the bind
+            // fails and no packet can leave through a fallback route.
+            var v4check = in_addr()
+            let isV4 = inet_pton(AF_INET, host, &v4check) == 1
+            var parsedV4 = in_addr(); var parsedV6 = in6_addr()
+            guard let local = isV4 ? pin.v4 : pin.v6,
+                  (isV4 ? inet_pton(AF_INET, local, &parsedV4) : inet_pton(AF_INET6, local, &parsedV6)) == 1,
+                  isV4 || !Self.isMappedIPv4(local) else { close(); return }
+            parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(local), port: .any)
+        }
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: parameters)
         upstream = connection
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, !self.closed else { return }
@@ -555,4 +598,95 @@ private final class RelayTunnel {
     }
 
     private func failUpstream() { guard !closed else { return }; close(); onUpstreamFault?() }
+}
+
+/// Resolves the local addresses of the interface that owns the default route.
+/// Current-network sessions pin upstream sockets to these addresses so a lost
+/// interface or VPN makes new connections fail before any packet leaves.
+enum EgressPin {
+    static func current() throws -> SOCKSRelay.LocalPin {
+        let snapshot = NetworkSnapshot.current()
+        func pick(_ interface: String, family: Int32) -> String? {
+            for entry in snapshot {
+                let split = entry.split(separator: "|", maxSplits: 1)
+                guard split.count == 2, split[0] == interface else { continue }
+                let address = String(split[1])
+                if family == AF_INET {
+                    var v4 = in_addr()
+                    guard inet_pton(AF_INET, address, &v4) == 1, !address.hasPrefix("169.254.") else { continue }
+                    return address
+                }
+                var v6 = in6_addr()
+                guard inet_pton(AF_INET6, address, &v6) == 1,
+                      !address.lowercased().hasPrefix("fe80"),
+                      !RelayTunnel.isMappedIPv4(address) else { continue }
+                return address
+            }
+            return nil
+        }
+        let v4Interface = try defaultInterface(inet6: false)
+        guard let v4 = pick(v4Interface, family: AF_INET) else {
+            throw GuardError.message("Не удалось закрепить локальный адрес исходящего интерфейса. Доступ закрыт.")
+        }
+        // An absent IPv6 default route is not an error: the family stays refused.
+        let v6 = (try? defaultInterface(inet6: true)).flatMap { pick($0, family: AF_INET6) }
+        return SOCKSRelay.LocalPin(v4: v4, v6: v6)
+    }
+
+    private static func defaultInterface(inet6: Bool) throws -> String {
+        var arguments = ["-n", "get"]
+        if inet6 { arguments.append("-inet6") }
+        arguments.append("default")
+        let output = try run("/sbin/route", arguments)
+        for line in output.components(separatedBy: .newlines) {
+            let parts = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            if parts.count == 2, parts[0] == "interface", !parts[1].isEmpty, parts[1].count <= 32,
+               parts[1].range(of: "^[a-z0-9]+$", options: .regularExpression) != nil { return parts[1] }
+        }
+        throw GuardError.message("Маршрут по умолчанию не содержит интерфейса. Доступ закрыт.")
+    }
+
+    private static func run(_ path: String, _ arguments: [String]) throws -> String {
+        let failure = GuardError.message("Не удалось определить маршрут по умолчанию. Доступ закрыт.")
+        let process = Process(), pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardOutput = pipe; process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch { throw failure }
+        pipe.fileHandleForWriting.closeFile()
+        let fd = pipe.fileHandleForReading.fileDescriptor
+        defer { pipe.fileHandleForReading.closeFile() }
+        guard fcntl(fd, F_SETFL, O_NONBLOCK) != -1 else {
+            kill(process.processIdentifier, SIGKILL); process.waitUntilExit(); throw failure
+        }
+        let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+        var output = Data(), buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = read(fd, &buffer, buffer.count)
+            if count > 0 {
+                guard output.count + count <= 16384 else {
+                    kill(process.processIdentifier, SIGKILL); process.waitUntilExit(); throw failure
+                }
+                output.append(contentsOf: buffer.prefix(count))
+            } else if count == 0 { break }
+            else if errno != EAGAIN && errno != EINTR {
+                kill(process.processIdentifier, SIGKILL); process.waitUntilExit(); throw failure
+            }
+            if DispatchTime.now().uptimeNanoseconds >= deadline {
+                kill(process.processIdentifier, SIGKILL); process.waitUntilExit(); throw failure
+            }
+            if count < 0 { usleep(5_000) }
+        }
+        while process.isRunning {
+            if DispatchTime.now().uptimeNanoseconds >= deadline {
+                kill(process.processIdentifier, SIGKILL); process.waitUntilExit(); throw failure
+            }
+            usleep(5_000)
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0, let text = String(data: output, encoding: .utf8),
+              !text.contains("\0") else { throw failure }
+        return text
+    }
 }

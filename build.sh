@@ -11,9 +11,12 @@ for ARCH in arm64 x86_64; do
     -framework SwiftUI -framework AppKit -framework Network \
     Source/*.swift -o ".build/Guard-$ARCH"
   xcrun clang -O2 -target "$ARCH-apple-macosx13.0" -isysroot "$SDK" Source/GuardHost.c -o ".build/Host-$ARCH"
+  xcrun clang -O2 -target "$ARCH-apple-macosx13.0" -isysroot "$SDK" Source/GuardDrop.c -o ".build/Drop-$ARCH"
 done
 lipo -create .build/Host-arm64 .build/Host-x86_64 -output "$APP/Contents/MacOS/GuardHost"
 codesign --force --sign - --identifier local.proxyguard.claude.host "$APP/Contents/MacOS/GuardHost"
+lipo -create .build/Drop-arm64 .build/Drop-x86_64 -output "$APP/Contents/MacOS/GuardDrop"
+codesign --force --sign - --identifier local.proxyguard.claude.drop "$APP/Contents/MacOS/GuardDrop"
 lipo -create .build/Guard-arm64 .build/Guard-x86_64 -output "$APP/Contents/MacOS/ClaudeProxyGuard"
 cp Resources/RuntimeBootstrap.cjs "$APP/Contents/Resources/RuntimeBootstrap.cjs"
 cp Info.plist "$APP/Contents/Info.plist"

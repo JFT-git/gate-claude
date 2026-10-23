@@ -15,7 +15,7 @@ const input = { host: '127.0.0.1', port: 1080, claudePath: 'fixture', interval: 
 const pause = () => new Promise(resolve => setTimeout(resolve, 10));
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gate-controller-'));
-  const controller = new GuardController(root, root); controller.routeFingerprint = async () => '';
+  const controller = new GuardController(root, root); controller.routeFingerprint = async () => ''; controller.localEgressAddresses = async () => ({ v4: '127.0.0.1', v6: null });
   const direct = Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) });
   controller.networkProxy = direct; controller.networkProxyConfiguration = async () => direct;
   controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: '203.0.113.7', country_code: 'NL' });
@@ -112,4 +112,56 @@ test('stop during initial request cannot pin an IP or reopen resources after can
   controller.stop(); resolve({ success: true, country_code: 'NL', ip: '203.0.113.7' }); await starting;
   assert.equal(controller.state, 'blocked'); assert.equal(controller.policy.pinned, null); assert.equal(controller.policy.blocked, true);
   assert.equal(controller.relay, null); assert.equal(controller.host, null);
+});
+
+test('local pin discovery runs on network establishment only', async t => {
+  for (const mode of ['network', 'socks5']) {
+    const controller = await fixture(t); let calls = 0;
+    controller.localEgressAddresses = async () => { calls++; throw Error('fixture pin unavailable'); };
+    initial = async () => { throw Error('fixture stops bootstrap'); };
+    await controller.start({ ...input, mode });
+    assert.equal(calls, mode === 'network' ? 1 : 0);
+  }
+});
+test('successful revalidation refreshes the local pin and stop resets it', async t => {
+  const controller = await fixture(t); let calls = 0, resumed = 0;
+  controller.settings = { mode: 'network', interval: 30 }; controller.state = 'rechecking'; controller.route = '';
+  controller.policy.pin({ country_code: 'NL', ip: '203.0.113.7' });
+  controller.relay = { port: 1234, pause() {}, resume() { resumed++; }, close() {} };
+  controller.checkCurrentIP = async () => '203.0.113.7'; controller.queryDestinations = async () => true;
+  controller.localEgressAddresses = async () => { calls++; return { v4: null, v6: '::1' }; };
+  await controller.poll(controller.epoch);
+  assert.equal(calls, 1); assert.equal(resumed, 1);
+  const relay = require('../src/relay.cjs');
+  await assert.rejects(relay.connectCurrentNetwork('127.0.0.1', 1, undefined, 4), /Локальный адрес/);
+  controller.stop();
+  // An unpinned dial must reach socket creation rather than fail at the pin gate.
+  const net = require('node:net'), original = net.createConnection;
+  net.createConnection = () => { throw Error('pin reset confirmed'); };
+  try { await assert.rejects(relay.connectCurrentNetwork('127.0.0.1', 1, undefined, 4), /pin reset confirmed/); }
+  finally { net.createConnection = original; }
+});
+test('interface watcher pauses synchronously before asynchronous revalidation', async t => {
+  const controller = await fixture(t), original = global.setInterval; let watcher, release;
+  global.setInterval = callback => { watcher = callback; return original(() => {}, 60000); };
+  controller.routeFingerprint = () => new Promise(resolve => { release = resolve; });
+  const starting = controller.start(input);
+  while (!watcher) await pause();
+  global.setInterval = original;
+  const events = [];
+  controller.relay = { pause() { events.push('pause'); }, close() {} };
+  controller.fingerprint = 'changed';
+  controller.revalidate = async () => { events.push('revalidate'); await new Promise(() => {}); };
+  watcher(); assert.deepEqual(events, ['pause', 'revalidate']);
+  controller.stop(); release(''); await starting;
+});
+test('PowerShell pin discovery validates output and fails closed on execution error', async t => {
+  const controller = await fixture(t), windows = require('../src/windows.cjs'), original = windows.powershell; let script;
+  t.after(() => { windows.powershell = original; });
+  windows.powershell = async value => { script = value; return '{"v4":"127.0.0.1","v6":null}'; };
+  // Use the actual method instead of the fixture override.
+  assert.deepEqual(await GuardController.prototype.localEgressAddresses.call(controller), { v4: '127.0.0.1', v6: null });
+  assert.match(script, /Get-NetRoute/); assert.match(script, /169\.254/); assert.match(script, /WellKnown/);
+  windows.powershell = async () => { throw Error('fixture'); };
+  await assert.rejects(GuardController.prototype.localEgressAddresses.call(controller), /локальные адреса выхода Windows/);
 });

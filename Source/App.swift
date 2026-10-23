@@ -13,6 +13,11 @@ final class GuardModel: ObservableObject {
     @Published var claudePath = "/Applications/Claude.app"
     @Published var interval = 5
     @Published var watchPublicIP = true
+    @Published var networkBarrier = true
+    @Published var barrierActive = false
+    @Published var barrierSummary = "Состояние барьера ещё не проверено"
+    var barrierArmed = false
+    private var barrierEnvURL: URL?
     @Published var timezone = "Europe/Amsterdam"
     @Published var language = "en-US"
     @Published var inspectPages = true
@@ -100,6 +105,7 @@ final class GuardModel: ObservableObject {
     var e2eSandboxURL: URL?
     var e2eStderrURL: URL?
     var e2eExtraArguments: [String] = []
+    var e2eBarrierProbe: NetworkBarrier.Probe?
     var e2eOnVerified: ((VerifiedProfile) -> Void)?
     var e2eInspector: ClaudeInspector? { inspector }
     var e2eRelayPort: UInt16? { relayPort }
@@ -109,6 +115,66 @@ final class GuardModel: ObservableObject {
     func e2eNetworkChanged() { networkChanged("Изменение тестовой сети") }
     func e2ePowerChanged(sleeping: Bool) { powerChanged(sleeping: sleeping) }
     #endif
+
+    /// Tests never enter the privileged chain unless they explicitly pin a probe.
+    private var barrierRequired: Bool {
+        #if GUARD_E2E
+        if e2eRuntimeRoot != nil && e2eBarrierProbe == nil { return false }
+        #endif
+        return networkBarrier
+    }
+    func currentBarrierProbe() -> NetworkBarrier.Probe {
+        #if GUARD_E2E
+        if let e2eBarrierProbe { return e2eBarrierProbe }
+        return .broken("тестовый режим без барьера")
+        #else
+        return NetworkBarrier.probe()
+        #endif
+    }
+    func refreshBarrierStatus() {
+        let probe = currentBarrierProbe()
+        barrierActive = probe.active
+        if !networkBarrier {
+            barrierSummary = "Барьер выключен. Native и MCP-компоненты Claude смогут обходить шлюз."
+        } else {
+            barrierSummary = probe.summary
+        }
+    }
+    func installBarrier() {
+        guard !busy, !monitoring else { return }
+        appendLog("Запрошена установка системного сетевого барьера…")
+        Task {
+            do {
+                try await Task.detached { try NetworkBarrier.install() }.value
+                self.appendLog("Системный сетевой барьер установлен и активен.")
+            } catch {
+                self.appendLog("Установка барьера не удалась: \(error.localizedDescription)")
+            }
+            self.refreshBarrierStatus()
+        }
+    }
+    /// One-time offer during session start. Refusal fails the session closed.
+    private func offerBarrierInstall(_ probe: NetworkBarrier.Probe) async -> Bool {
+        #if GUARD_E2E
+        if e2eRuntimeRoot != nil { return false }
+        #endif
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Установить системный сетевой барьер?"
+        alert.informativeText = "Без барьера нативные компоненты Claude (MCP, Cowork, расширения) могут отправлять запросы мимо шлюза. Установка добавляет правило packet filter и одноразово требует пароль администратора. " + probe.summary
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Установить и продолжить")
+        alert.addButton(withTitle: "Отмена").keyEquivalent = "\u{1b}"
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        do {
+            try await Task.detached { try NetworkBarrier.install() }.value
+            appendLog("Системный сетевой барьер установлен и активен.")
+            return true
+        } catch {
+            appendLog("Установка барьера не удалась: \(error.localizedDescription)")
+            return false
+        }
+    }
 
 
     init(diagnosticsURL: URL? = nil) {
@@ -120,7 +186,10 @@ final class GuardModel: ObservableObject {
         username = d.string(forKey: "proxyUsername") ?? username; claudePath = d.string(forKey: "claudePath") ?? claudePath
         let saved = d.integer(forKey: "checkIntervalV2")
         if [2, 5, 10, 30].contains(saved) { interval = saved }
-        if d.object(forKey: "watchPublicIP") != nil { watchPublicIP = d.bool(forKey: "watchPublicIP") }
+        // Periodic IP control is mandatory: a session without it cannot detect a
+        // silently changed exit. Ignore any previously stored opt-out.
+        watchPublicIP = true
+        if d.object(forKey: "networkBarrierV1") != nil { networkBarrier = d.bool(forKey: "networkBarrierV1") }
         if let value = d.string(forKey: "profileTimezone"), LaunchProfile.timezones.contains(value) { timezone = value }
         if let value = d.string(forKey: "profileLanguage"), LaunchProfile.languages.contains(value) { language = value }
 
@@ -134,6 +203,7 @@ final class GuardModel: ObservableObject {
                 }
             })
         }
+        refreshBarrierStatus()
     }
 
     func saveSettings() {
@@ -144,6 +214,7 @@ final class GuardModel: ObservableObject {
         d.set(useProxy, forKey: "useProxy"); d.set(host, forKey: "proxyHost"); d.set(port, forKey: "proxyPort")
         d.set(username, forKey: "proxyUsername"); d.set(claudePath, forKey: "claudePath")
         d.set(interval, forKey: "checkIntervalV2"); d.set(watchPublicIP, forKey: "watchPublicIP")
+        d.set(networkBarrier, forKey: "networkBarrierV1")
         d.set(timezone, forKey: "profileTimezone"); d.set(language, forKey: "profileLanguage")
         d.set(inspectPages, forKey: "inspectPages"); d.set(captureBodies, forKey: "captureBodies")
     }
@@ -168,6 +239,24 @@ final class GuardModel: ObservableObject {
             defer { if launch { password = "" } }
             do {
                 try LaunchProfile(timezone: timezone, language: language).validate()
+                // PG-01: without the packet-filter barrier native Claude components
+                // (MCP, Cowork, helpers) could bypass the relay entirely. A session
+                // starts only with the barrier active or explicitly switched off.
+                barrierArmed = false
+                if barrierRequired {
+                    var probe = currentBarrierProbe()
+                    barrierActive = probe.active; barrierSummary = probe.summary
+                    if !probe.active, await offerBarrierInstall(probe) {
+                        guard operation == token else { return }
+                        probe = currentBarrierProbe()
+                        barrierActive = probe.active; barrierSummary = probe.summary
+                    }
+                    guard probe.active else {
+                        throw GuardError.message("Сетевой барьер не активен, запуск отменён. Установите барьер или осознанно выключите его в настройках.")
+                    }
+                    barrierArmed = true
+                    appendLog("Сетевой барьер подтверждён: процессы Claude ограничены локальным шлюзом.")
+                }
                 let networkMode = !useProxy
                 let snapshot = networkMode ? try await captureSystemProxy() : nil
                 guard operation == token else { return }
@@ -177,6 +266,13 @@ final class GuardModel: ObservableObject {
                 if !networkMode {
                     let config = try ProxySettings.validated(host: host, port: port, username: username, password: password)
                     relay = SOCKSRelay(settings: config)
+                } else if let socks = snapshot?.socks {
+                    // A pinned system SOCKS proxy becomes the session upstream; without
+                    // this the traffic would bypass the very proxy the system advertises.
+                    appendLog("Используем системный SOCKS-прокси \(socks.host):\(socks.port).")
+                    relay = SOCKSRelay(settings: ProxySettings(host: socks.host, port: UInt16(socks.port), username: "", password: ""))
+                } else if snapshot?.http != nil || snapshot?.https != nil {
+                    throw GuardError.message("Системный HTTP-прокси нельзя применить в режиме «Текущая сеть»: запросы ушли бы мимо него. Выберите SOCKS5-прокси в Guard или задайте системный SOCKS-прокси.")
                 } else { relay = SOCKSRelay(currentNetwork: true) }
                 relay.onFault = { [weak self] in
                     guard let self, self.operation == token else { return }
@@ -206,6 +302,7 @@ final class GuardModel: ObservableObject {
                     try policy.verify(actual)
                 }
                 relay.setPinnedFamily(policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
+                if networkMode { relay.setPinnedLocalAddresses(try EgressPin.current()) }
                 try await verifyDestinations(operation: token)
                 guard operation == token else { return }
                 try await confirmSystemProxy(operation: token)
@@ -246,6 +343,11 @@ final class GuardModel: ObservableObject {
                 let revision = self.networkRevision
                 do {
                     let wasSuspended = self.policy.suspended
+                    // A removed packet-filter barrier reopens direct egress for the
+                    // whole Claude tree; treat it like a route change.
+                    if self.barrierArmed, !self.currentBarrierProbe().active {
+                        throw GuardError.message("Сетевой барьер отключён во время сессии.")
+                    }
                     let actual = try await self.currentIPCheck(self.relayPort)
                     guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
                     // A response started before the most recent route event cannot reopen the gate.
@@ -260,6 +362,7 @@ final class GuardModel: ObservableObject {
                     guard revision == self.networkRevision else { continue }
                     try self.policy.verify(actual)
                     self.relay?.setPinnedFamily(self.policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
+                    if !self.useProxy { self.relay?.setPinnedLocalAddresses(try EgressPin.current()) }
                     if wasSuspended, let relay = self.relay, !relay.unlock() {
                         throw GuardError.message("Шлюз ожидает успешного контрольного подключения.")
                     }
@@ -279,6 +382,9 @@ final class GuardModel: ObservableObject {
                     return
                 } catch {
                     guard !Task.isCancelled, self.operation == token else { return }
+                    // Close the gate before any further awaiting: a failing probe must
+                    // never leave the relay open while settings are being inspected.
+                    self.relay?.pause()
                     if self.policy.requiresRestart { self.block(error.localizedDescription, latch: true); return }
                     // A failed IP/destination probe must not hide a confirmed proxy change.
                     do { try await self.confirmSystemProxy(operation: token) }
@@ -475,7 +581,25 @@ final class GuardModel: ObservableObject {
             environment["NO_PROXY"] = ""; environment["no_proxy"] = ""
         }
         environment["PROXY_GUARD_CONFIG"] = String(data: try JSONSerialization.data(withJSONObject: config), encoding: .utf8)
-        child.environment = profile.environment(environment)
+        let fullEnvironment = profile.environment(environment)
+        // PG-01: with the barrier armed the prepared environment travels through a
+        // private 0600 file because sudo scrubs the inherited environment.
+        var useBarrierChain = barrierArmed
+        #if GUARD_E2E
+        if e2eRuntimeRoot != nil { useBarrierChain = false }
+        #endif
+        if useBarrierChain {
+            guard NetworkBarrier.probe().active else {
+                throw GuardError.message("Сетевой барьер отключён перед запуском Claude. Запуск отменён.")
+            }
+            let envURL = prepared.profileURL.deletingLastPathComponent()
+                .appendingPathComponent("guard-env-" + UUID().uuidString.lowercased())
+            try writeBarrierEnvironment(fullEnvironment, to: envURL)
+            barrierEnvURL = envURL
+            child.environment = ["GUARD_ENV_FILE": envURL.path]
+        } else {
+            child.environment = fullEnvironment
+        }
         child.standardError = FileHandle.nullDevice
         #if GUARD_E2E
         if let e2eStderrURL {
@@ -490,7 +614,12 @@ final class GuardModel: ObservableObject {
         helper = e2eHelperURL ?? helper; arguments += e2eExtraArguments
         #endif
         guard FileManager.default.isExecutableFile(atPath: helper.path) else { throw GuardError.message("В сборке отсутствует GuardHost.") }
-        child.executableURL = helper; child.arguments = arguments
+        if useBarrierChain {
+            child.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            child.arguments = ["-n", NetworkBarrier.helperPath, helper.path] + arguments
+        } else {
+            child.executableURL = helper; child.arguments = arguments
+        }
         #if GUARD_E2E
         if let e2eSandboxURL {
             child.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
@@ -535,7 +664,29 @@ final class GuardModel: ObservableObject {
         appendLog("Локальная копия Claude запущена: \(timezone) · \(language)")
     }
 
+    private func writeBarrierEnvironment(_ environment: [String: String], to url: URL) throws {
+        for (key, value) in environment {
+            guard key.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil,
+                  !value.contains("\n"), !value.contains("\r") else {
+                throw GuardError.message("Переменная окружения «\(key)» небезопасна для запуска через барьер.")
+            }
+        }
+        let payload = environment.keys.sorted().map { "\($0)=\(environment[$0] ?? "")" }.joined(separator: "\n") + "\n"
+        guard payload.utf8.count <= 65536 else { throw GuardError.message("Окружение сессии слишком велико для барьера.") }
+        clearBarrierEnvironment()
+        guard FileManager.default.createFile(atPath: url.path, contents: Data(payload.utf8),
+                                             attributes: [.posixPermissions: 0o600]) else {
+            throw GuardError.message("Не удалось записать окружение сессии для барьера.")
+        }
+    }
+    private func clearBarrierEnvironment() {
+        guard let url = barrierEnvURL else { return }
+        barrierEnvURL = nil
+        try? FileManager.default.removeItem(at: url)
+    }
+
     private func claudeExited(_ child: Process) {
+        clearBarrierEnvironment()
         let status = child.terminationStatus
         let signalled = child.terminationReason == .uncaughtSignal
         let reason = signalled ? "Claude завершился по сигналу \(status). Причина сохранена в журнале." : "Claude завершился с кодом \(status)."
@@ -563,6 +714,7 @@ final class GuardModel: ObservableObject {
         deepLinkInbox.clear()
         childBundleURL = nil
         password = ""
+        clearBarrierEnvironment(); barrierArmed = false
         if latch { policy.latch(reason) }
         requiresRestart = policy.requiresRestart
         operation = UUID()
@@ -782,8 +934,29 @@ struct GuardView: View {
                                 Text("Каждые 2 с").tag(2); Text("Каждые 5 с").tag(5); Text("Каждые 10 с").tag(10); Text("Каждые 30 с").tag(30)
                             }.labelsHidden().frame(width: 150)
                         }
-                        Toggle("Проверять публичный IP через ipify", isOn: $model.watchPublicIP).font(.system(size: 12))
+                        Text("Публичный IP проверяется через ipify постоянно: без периодического контроля смена выхода может остаться незамеченной.").font(.system(size: 12))
                         Text("Изменение сети или ошибка проверки приостанавливает шлюз. Прежний подтверждённый IP возобновляет сессию; другой IP блокирует её до перезапуска Guard.")
+                            .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
+                    }.disabled(model.monitoring || model.busy || model.requiresRestart)
+                }
+                Surface {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Системный сетевой барьер").font(.system(size: 15, weight: .semibold))
+                            Spacer()
+                            Toggle("", isOn: $model.networkBarrier).labelsHidden().toggleStyle(.switch)
+                                .accessibilityLabel("Системный сетевой барьер")
+                        }
+                        Text(model.barrierSummary).font(.system(size: 12))
+                            .foregroundStyle(model.networkBarrier && model.barrierActive ? GuardPalette.accent : GuardPalette.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 12) {
+                            Button("Проверить состояние") { model.refreshBarrierStatus() }
+                            if model.networkBarrier && !model.barrierActive {
+                                Button("Установить или восстановить…") { model.installBarrier() }
+                            }
+                        }.font(.system(size: 12))
+                        Text("Барьер packet filter пропускает процессы Claude только к локальному шлюзу: любой другой исходящий трафик всей группы процессов (native, MCP, Cowork) блокируется ядром, включая момент смены IP. Установка одноразово требует пароль администратора; выключенный барьер оставляет обходной риск.")
                             .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     }.disabled(model.monitoring || model.busy || model.requiresRestart)
                 }
@@ -831,9 +1004,9 @@ struct GuardView: View {
                     }
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    Label("Упрощённая защита — без системного kill switch", systemImage: "info.circle")
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(GuardPalette.warning)
-                    Text("Начальная страна: ipwho.is; повторный IP: ipify. Подтверждённый новый IP завершает сессию. Ошибка проверки, смена маршрута или сон приостанавливают трафик; прежний подтверждённый IP восстанавливает доступ без перезапуска Claude. Публичный IP нельзя проверить локально за NAT. Системной сетевой изоляции нет: native, MCP и Cowork могут обходить прокси; CDP видит только доступные веб-контексты.")
+                    Label(model.networkBarrier && model.barrierActive ? "Системный kill switch активен" : "Упрощённая защита — системный барьер не активен", systemImage: model.networkBarrier && model.barrierActive ? "checkmark.shield" : "info.circle")
+                        .font(.system(size: 12, weight: .medium)).foregroundStyle(model.networkBarrier && model.barrierActive ? GuardPalette.accent : GuardPalette.warning)
+                    Text("Начальная страна: ipwho.is; повторный IP: ipify. Подтверждённый новый IP завершает сессию. Ошибка проверки, смена маршрута или сон приостанавливают трафик; прежний подтверждённый IP восстанавливает доступ без перезапуска Claude. Публичный IP нельзя проверить локально за NAT. Активный барьер ограничивает весь процесс Claude локальным шлюзом; без него native, MCP и Cowork могут обходить прокси; CDP видит только доступные веб-контексты.")
                         .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     DisclosureGroup("Журнал проверок", isExpanded: $model.showLog) {
                         VStack(alignment: .leading, spacing: 6) {

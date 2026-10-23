@@ -143,6 +143,7 @@ async function fixture(t) {
   c.tools = { toolRoots: ['C:\\Guard\\CodeTools\\Git-' + 'e'.repeat(64), 'C:\\Guard\\CodeTools\\PowerShell-' + 'f'.repeat(64)],
     environment: { PATH: 'C:\\Guard\\CodeTools\\Git-' + 'e'.repeat(64) + '\\cmd;C:\\Guard\\CodeTools\\PowerShell-' + 'f'.repeat(64), GIT_CONFIG_NOSYSTEM: '1' } };
   context = c; c.controller = new GuardController(root, root); c.controller.routeFingerprint = async () => '';
+  c.controller.localEgressAddresses = async () => ({ v4: '127.0.0.1', v6: null });
   c.proxyDescriptor = Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) });
   c.controller.networkProxyConfiguration = async () => c.proxyDescriptor;
   c.controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: hostname === 'claude.ai' ? '203.0.113.20' : '203.0.113.21', country_code: 'NL' });

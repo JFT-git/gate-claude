@@ -192,6 +192,27 @@ import Darwin
         expect(!proxyModel.allowed && !proxyModel.monitoring && proxyModel.e2eRelayPort == nil, "confirmed proxy change closes the session relay")
         proxyModel.stop(); proxyModel.check(andLaunch: false)
         expect(proxyModel.requiresRestart && !proxyModel.allowed, "manual stop cannot clear the proxy-change latch")
+
+        // PG-01: without an active packet-filter barrier the session must fail closed.
+        let barrierModel = GuardModel(diagnosticsURL: root.appendingPathComponent("barrier-diagnostics.jsonl"))
+        barrierModel.e2eRuntimeRoot = root; barrierModel.useProxy = false
+        barrierModel.e2eSystemProxyCapture = { try SystemProxy.parse("<dictionary> {\n}") }
+        barrierModel.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "NL", date: Date()) }
+        barrierModel.e2ePublicCheck = { _ in "203.0.113.7" }
+        barrierModel.e2eBarrierProbe = .missing
+        defer { barrierModel.shutdown() }
+        barrierModel.check(andLaunch: false)
+        expect(await wait { !barrierModel.busy }, "barrier gate finishes without hanging")
+        expect(!barrierModel.allowed && !barrierModel.monitoring && barrierModel.e2eRelayPort == nil,
+               "missing network barrier blocks the session before any relay opens")
+        expect(barrierModel.detail.contains("Сетевой барьер не активен"), "barrier refusal explains the missing installation")
+        barrierModel.e2eBarrierProbe = .active
+        barrierModel.check(andLaunch: false)
+        expect(await wait { barrierModel.allowed && barrierModel.barrierArmed }, "active barrier admits the session and arms the launch chain")
+        barrierModel.e2eBarrierProbe = .broken("тестовое отключение")
+        barrierModel.e2eVerifyNow()
+        expect(await wait { !barrierModel.allowed && barrierModel.e2eSuspended },
+               "losing the barrier mid-session suspends traffic like a route change")
         print("RECOVERY TESTS: \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }

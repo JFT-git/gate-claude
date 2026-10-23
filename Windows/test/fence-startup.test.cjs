@@ -38,6 +38,7 @@ class Fence extends EventEmitter {
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gate-fence-startup-'));
   const controller = new GuardController(root, root); controller.routeFingerprint = async () => '';
+  controller.localEgressAddresses = async () => ({ v4: '127.0.0.1', v6: null });
   controller.networkProxyConfiguration = async () => Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) });
   controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: '203.0.113.7', country_code: 'NL' });
   relayInstances = []; launches = 0;

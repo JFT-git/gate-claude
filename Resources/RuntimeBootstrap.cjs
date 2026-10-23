@@ -50,8 +50,152 @@ function expose(wc) {
     targetInfo: { targetId: String(wc.id), type: wc.getType() === 'webview' ? 'page' : 'page', title: '', url: wc.getURL() } } });
 }
 const sessionGates = new WeakMap();
+// --- Native network hardening (PG-05/06) ---------------------------------
+// The kernel packet filter (when armed) is the real boundary; these hooks add
+// fail-closed depth inside the main process for QUIC/UDP/DNS and direct Node
+// egress. Loopback stays available so local MCP/IPC keeps working.
+function installNetworkHardening() {
+  const net = require('node:net'), tls = require('node:tls'), dgram = require('node:dgram');
+  const dns = require('node:dns'), http = require('node:http'), https = require('node:https'), http2 = require('node:http2');
+  const denied = name => { const error = Error('Guard blocked network escape: ' + name); error.code = 'ERR_GUARD_NETWORK_DENIED'; return error; };
+  const deny = name => function () { throw denied(name); };
+  function hook(object, key, value) {
+    if (!object || typeof object[key] !== 'function') return;
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (descriptor && !descriptor.configurable) {
+      if (object[key] !== value) throw Error('Guard cannot protect ' + key);
+      return;
+    }
+    Object.defineProperty(object, key, { enumerable: descriptor?.enumerable ?? true, configurable: false, get: () => value, set() {} });
+  }
+  function block(object, names, label) { for (const name of names) hook(object, name, deny(label + '.' + name)); }
+  const literalLoopback = value => /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(String(value)) || String(value) === '::1';
+  const originalConnect = net.Socket.prototype.connect;
+  hook(net.Socket.prototype, 'connect', function (...args) {
+    const target = args[0];
+    if (target && typeof target === 'object' && target.path) return originalConnect.apply(this, args); // unix socket: local
+    if (typeof target === 'string' && target.startsWith('/')) return originalConnect.apply(this, args);
+    const host = target && typeof target === 'object' ? target.host : (typeof args[0] === 'number' ? args[1] : undefined);
+    if (!host || literalLoopback(host)) return originalConnect.apply(this, args);
+    throw denied('net.Socket.connect');
+  });
+  const pipeConnection = function (...args) { return new net.Socket().connect(...args); };
+  hook(net, 'connect', pipeConnection); hook(net, 'createConnection', pipeConnection);
+  const originalListen = net.Server.prototype.listen;
+  hook(net.Server.prototype, 'listen', function (...args) {
+    const target = args[0];
+    if (target && typeof target === 'object' && target.path) return originalListen.apply(this, args);
+    if (typeof target === 'string') return originalListen.apply(this, args);
+    const host = target && typeof target === 'object' ? target.host : (typeof args[1] === 'string' ? args[1] : undefined);
+    if (!host || literalLoopback(host)) return originalListen.apply(this, args);
+    throw denied('net.Server.listen');
+  });
+  const originalTls = tls.connect;
+  hook(tls, 'connect', function (...args) {
+    const target = args[0];
+    if (target && typeof target === 'object' && target.socket) return originalTls.apply(this, args); // wraps a gated socket
+    const host = target && typeof target === 'object' ? target.host : (typeof args[0] === 'number' ? args[1] : typeof target === 'string' ? target : undefined);
+    if (!host || literalLoopback(host)) return originalTls.apply(this, args);
+    throw denied('tls.connect');
+  });
+  block(dgram, ['createSocket'], 'dgram');
+  block(dgram.Socket?.prototype, ['send', 'connect', 'bind', 'addMembership', 'addSourceSpecificMembership'], 'dgram.Socket');
+  const dnsMethods = object => Object.getOwnPropertyNames(object || {}).filter(name => /^(?:lookup|resolve|reverse)/.test(name));
+  for (const object of [dns, dns.promises, dns.Resolver?.prototype, dns.promises?.Resolver?.prototype]) block(object, dnsMethods(object), 'dns');
+  const httpGuard = (original, label) => function (...args) {
+    const target = args[0];
+    let host;
+    try {
+      if (typeof target === 'string' || target instanceof URL) host = new URL(target).hostname;
+      else host = target?.hostname ?? (typeof target?.host === 'string' ? target.host.split(':')[0] : undefined);
+    } catch { throw denied(label); }
+    if (host === undefined || literalLoopback(host)) return original.apply(this, args);
+    throw denied(label);
+  };
+  hook(http, 'request', httpGuard(http.request, 'http.request')); hook(http, 'get', httpGuard(http.get, 'http.get'));
+  hook(https, 'request', httpGuard(https.request, 'https.request')); hook(https, 'get', httpGuard(https.get, 'https.get'));
+  const originalHttp2 = http2.connect;
+  hook(http2, 'connect', function (authority) {
+    let host;
+    try { host = new URL(String(authority)).hostname; } catch { throw denied('http2.connect'); }
+    if (literalLoopback(host)) return originalHttp2.apply(this, arguments);
+    throw denied('http2.connect');
+  });
+  const originalFetch = globalThis.fetch;
+  if (typeof originalFetch === 'function') {
+    hook(globalThis, 'fetch', function (input) {
+      let host;
+      try { host = new URL(typeof input === 'string' ? input : input.url).hostname; } catch { return Promise.reject(denied('fetch')); }
+      if (literalLoopback(host)) return originalFetch.apply(this, arguments);
+      return Promise.reject(denied('fetch'));
+    });
+  }
+  for (const name of ['WebSocket', 'EventSource']) {
+    const original = globalThis[name];
+    if (typeof original !== 'function') continue;
+    hook(globalThis, name, function (url) {
+      let host;
+      try { host = new URL(String(url)).hostname; } catch { throw denied(name); }
+      if (!literalLoopback(host)) throw denied(name);
+      return Reflect.construct(original, arguments);
+    });
+  }
+  const proxySettingsMatch = options => options && options.mode === 'fixed_servers' &&
+    options.proxyRules === cfg.proxyURL && options.proxyBypassRules === '<-loopback>' && !options.pacScript;
+  const protectedSessions = new WeakSet();
+  function protectSession(s) {
+    if (!s || protectedSessions.has(s)) return;
+    protectedSessions.add(s);
+    const setProxy = s.setProxy;
+    hook(s, 'setProxy', function (options) {
+      if (!cfg.proxyURL || !proxySettingsMatch(options)) return Promise.reject(denied('session.setProxy'));
+      return setProxy.call(this, options);
+    });
+    block(s, ['resolveHost'], 'session');
+  }
+  app.on('session-created', protectSession);
+  installNetworkHardening.protectSession = protectSession;
+  const commandLine = app.commandLine;
+  const switches = {
+    'force-webrtc-ip-handling-policy': 'disable_non_proxied_udp', 'disable-quic': '', 'dns-prefetch-disable': '',
+    // Destination names are resolved by the relay; Chromium only connects to its
+    // literal loopback address. Speculative/background hostname lookups must fail.
+    'host-resolver-rules': 'MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'
+  };
+  if (cfg.proxyURL) { switches['proxy-server'] = cfg.proxyURL; switches['proxy-bypass-list'] = '<-loopback>'; }
+  const dangerousSwitches = new Set(['no-proxy-server', 'proxy-auto-detect', 'proxy-pac-url', 'enable-quic']);
+  const appendSwitch = commandLine.appendSwitch;
+  for (const [name, value] of Object.entries(switches)) appendSwitch.call(commandLine, name, value);
+  hook(commandLine, 'appendSwitch', function (name, value = '') {
+    const key = String(name).replace(/^--/, '').toLowerCase();
+    if (dangerousSwitches.has(key) || (Object.hasOwn(switches, key) && String(value) !== switches[key])) throw denied('commandLine.appendSwitch');
+    return appendSwitch.call(this, name, value);
+  });
+  const removeSwitch = commandLine.removeSwitch;
+  hook(commandLine, 'removeSwitch', function (name) {
+    if (Object.hasOwn(switches, String(name).replace(/^--/, '').toLowerCase())) throw denied('commandLine.removeSwitch');
+    return removeSwitch.call(this, name);
+  });
+  const appendArgument = commandLine.appendArgument;
+  hook(commandLine, 'appendArgument', function (argument) {
+    if (String(argument).startsWith('--')) throw denied('commandLine.appendArgument');
+    return appendArgument.call(this, argument);
+  });
+  try { block(electron.net, ['resolveHost'], 'electron.net'); } catch {}
+  installNetworkHardening.lockWebRTC = wc => {
+    if (typeof wc.setWebRTCIPHandlingPolicy !== 'function') return;
+    const policy = wc.setWebRTCIPHandlingPolicy;
+    policy.call(wc, 'disable_non_proxied_udp');
+    hook(wc, 'setWebRTCIPHandlingPolicy', function (value) {
+      if (value !== 'disable_non_proxied_udp') throw denied('webContents.setWebRTCIPHandlingPolicy');
+      return policy.call(this, value);
+    });
+  };
+}
+installNetworkHardening();
 function configureSession(s) {
   if (sessionGates.has(s)) return sessionGates.get(s);
+  installNetworkHardening.protectSession?.(s);
   const gate = cfg.proxyURL ? s.setProxy({ mode: 'fixed_servers', proxyRules: cfg.proxyURL, proxyBypassRules: '<-loopback>' }) : Promise.resolve();
   sessionGates.set(s, gate); gate.catch(fatal); return gate;
 }
@@ -106,7 +250,7 @@ function attach(wc) {
   }
   expose(wc);
 }
-app.on('web-contents-created', (_event, wc) => { try { attach(wc); } catch (error) { fatal(error); } });
+app.on('web-contents-created', (_event, wc) => { try { installNetworkHardening.lockWebRTC?.(wc); attach(wc); } catch (error) { fatal(error); } });
 async function command(m) {
   let result;
   if (!m.sessionId) {
