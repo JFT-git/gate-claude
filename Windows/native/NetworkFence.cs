@@ -47,7 +47,8 @@ internal static class NetworkFence {
                 // NOCLOSEPROCESS | NOASYNC | FLAG_NO_UI: errors are reported
                 // below; the real secure-desktop consent prompt is not hidden.
                 mask=0x00000540,window=owner,verb="runas",file=self,
-                parameters="--pipe "+args[4]+" --token "+args[6],directory=Path.GetDirectoryName(self),show=1 };
+                // Hide only the broker's console, never the Windows consent UI.
+                parameters="--pipe "+args[4]+" --token "+args[6],directory=Path.GetDirectoryName(self),show=0 };
             bool comReady=false;
             try {
                 if(CoInitializeEx(IntPtr.Zero,0x6)<0) throw new Win32Exception(31);

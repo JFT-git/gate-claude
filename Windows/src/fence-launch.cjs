@@ -33,8 +33,8 @@ async function requestElevation({ helper, pipeName, token, ownerWindow }) {
   const owner = ownerHandle(ownerWindow);
   let output;
   try {
-    // Only this ordinary-user requester is hidden. Its native ShellExecuteEx
-    // binds the real Windows consent UI to Guard and uses SW_SHOWNORMAL.
+    // Console windows stay hidden. Native ShellExecuteEx binds the separate
+    // Windows secure-desktop consent UI to Guard's real window handle.
     // No PowerShell, shell command, elevation fallback or runtime launch here.
     const result = await run(helper, ['--request-elevation', '--owner', owner, '--pipe', pipeName, '--token', token],
       { windowsHide: true, timeout: 0, maxBuffer: 4096 });
