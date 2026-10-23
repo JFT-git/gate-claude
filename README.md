@@ -1,5 +1,7 @@
 # gate-claude
 
+**Для службы информационной безопасности:** [архитектура, права, сеть, хранение данных, ограничения и результаты проверок](README-ИБ.md).
+
 Независимый Claude Proxy Guard: **macOS 0.3.3** и **Windows x64 0.6.7**.
 
 Готовые сборки: [GitHub Releases](https://github.com/JFT-git/gate-claude/releases). Исходники распространяются по MIT; Claude в комплект не входит.
