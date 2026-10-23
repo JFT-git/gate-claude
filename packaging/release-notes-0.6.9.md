@@ -9,11 +9,11 @@
 
 **Постоянной службы/API нет.** UI показывает это явно; контракт шести состояний подготовлен. Текущий NetworkFence — UAC-брокер каждой сессии. Однократная установка с последующими сессиями без повышения требует отдельного backend и подключения движка.
 
-Готовые артефакты: Windows x64 portable ZIP; macOS 13+ universal ZIP и DMG; SHA-256 и manifest. Windows Setup.exe в этот черновик не включён: Inno Setup здесь недоступен, рецепт подготовлен. Windows ARM64/Linux не поддерживаются.
+Готовые артефакты: Windows x64 portable ZIP; macOS 13+ universal ZIP и DMG; SHA-256 и manifest. Windows Setup.exe в этот релиз-кандидат не включён: Inno Setup здесь недоступен, рецепт подготовлен. Windows ARM64/Linux не поддерживаются.
 
 Проверено на macOS arm64: 471/485 общих тестов, 0 ошибок, 14 Windows-native пропущены; 20 UI-сценариев настоящего Electron renderer с тестовым IPC; macOS локальный suite и отрисовка SwiftUI с тестовой моделью; universal-сборка обеих архитектур. Windows ASAR сверяется с исходным commit, native/CodeTools — с хешами. Проверки fixture не означают работу реального Claude или установленной службы.
 
-**NOT RUN:** Windows runtime, чистый UAC, настоящий Claude/Code, Windows installer install/uninstall, macOS Intel execution, Narrator/VoiceOver. Это предварительный черновик, не новая подтверждённая стабильная версия. Предыдущие Windows-проверки в зачёт этой сборки не включены.
+**NOT RUN:** Windows runtime, чистый UAC, настоящий Claude/Code, Windows installer install/uninstall, macOS Intel execution, Narrator/VoiceOver. Это предварительный релиз-кандидат, не новая подтверждённая стабильная версия. Предыдущие Windows-проверки в зачёт этой сборки не включены.
 
 Подпись Windows Authenticode отсутствует; macOS только ad-hoc, без Developer ID и notarization. Проверки IP периодические; абсолютная защита каждого соединения не заявляется. На macOS нет системного сетевого запрета. Полные границы и данные — в SECURITY.md.
 

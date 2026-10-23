@@ -38,14 +38,16 @@
     "localTestSuite": "PASS",
     "passAssertions": 86,
     "swiftUIViewRender": "PASS_TEST_MODEL_ONLY",
-    "intelExecution": "NOT_RUN"
+    "intelExecution": "NOT_RUN",
+    "dmgIntegrity": "PASS"
   },
   "windows": {
     "nativeRuntime": "NOT_RUN",
     "installedClaude": "NOT_RUN",
     "UACCleanMachine": "NOT_RUN",
     "installerCompile": "NOT_RUN_INNO_UNAVAILABLE",
-    "installerInstallUninstall": "NOT_RUN"
+    "installerInstallUninstall": "NOT_RUN",
+    "crossBuiltPackage": "PASS_SOURCE_MATCH_36_FILES_NATIVE_CODETOOLS_HASH_MATCH"
   },
   "service": {
     "backend": "ABSENT",
