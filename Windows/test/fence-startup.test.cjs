@@ -91,3 +91,15 @@ test('a late rejected fence installation cannot clear the cancellation latch or 
   await assert.rejects(c.start(input), /перезапуска/);
   assert.equal(prepares, 1); assert.equal(launches, 0); assert.equal(relayInstances[0].closed, true);
 });
+
+test('the trusted Guard window handle is forwarded to the fence and a missing owner stops before elevation', async t => {
+  const c = await fixture(t), owner = Buffer.from('3412000000000000', 'hex'); let calls = 0;
+  c.fenceOwnerWindow = () => owner;
+  prepare = async (_runtime, _port, options) => { calls++; assert.equal(options.ownerWindow, owner); throw Error('fixture refuses consent'); };
+  await c.start(input);
+  assert.equal(calls, 1); assert.equal(c.state, 'blocked'); assert.equal(launches, 0);
+  const other = await fixture(t);
+  other.fenceOwnerWindow = () => { throw Error('Guard owner unavailable'); };
+  await other.start(input);
+  assert.equal(calls, 1); assert.equal(other.state, 'blocked'); assert.equal(other.fencePending, false); assert.equal(launches, 0);
+});

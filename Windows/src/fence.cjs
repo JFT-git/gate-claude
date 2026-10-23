@@ -4,7 +4,7 @@ const path = require('node:path');
 const net = require('node:net');
 const { EventEmitter, once } = require('node:events');
 const { randomBytes } = require('node:crypto');
-const { powershell, psQuote } = require('./windows.cjs');
+const { requestElevation, elevationFailure } = require('./fence-launch.cjs');
 
 const COVERAGE = 'private-runtime-executables';
 const MAX_EXECUTABLES = 512;
@@ -140,15 +140,15 @@ class NetworkFence extends EventEmitter {
       if (approvalOwner) throw Error('Сначала ответьте на предыдущий запрос Windows. Повторное подтверждение пока не запрошено.');
       approvalOwner = instance;
       server.listen(pipe); await once(server, 'listening');
-      const script = "$p=Start-Process -FilePath " + psQuote(path.resolve(helper)) + " -Verb RunAs -ArgumentList @('--pipe'," + psQuote(name) + ",'--token'," + psQuote(token) + ") -WindowStyle Hidden -PassThru; $p.Id";
-      // ShellExecute waits for a human on the secure desktop. Its wait is not
-      // broker installation time, and killing PowerShell does not cancel UAC.
-      const launch = options.launch || (value => powershell(value, 0));
+      const requestElevationOptions = { helper: path.resolve(helper), pipeName: name, token, ownerWindow: options.ownerWindow };
+      // The native requester waits for a human on the secure desktop. Its wait
+      // is not broker installation time; killing a requester cannot cancel UAC.
+      const launch = options.launch || requestElevation;
       stage('approval'); launchStarted = true;
-      Promise.resolve().then(() => launch(script)).then(() => {
+      Promise.resolve().then(() => launch(requestElevationOptions)).then(() => {
         if (!authenticated) armDeadline('Повышенный процесс Windows не подключился к Guard. Claude не запущен.');
-      }, () => {
-        if (!settled) instance.emit('prepare-error', Error('Подтверждение Windows отменено или запуск защиты отклонён. Claude не запущен.'));
+      }, error => {
+        if (!settled) instance.emit('prepare-error', elevationFailure(error));
       }).finally(() => {
         if (approvalOwner === instance) approvalOwner = null;
         stage('approval-ended');

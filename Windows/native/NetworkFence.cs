@@ -18,6 +18,50 @@ using System.Threading;
 // External child executables and RPC/service-based networking are outside its
 // scope; callers must not describe it as complete inherited network isolation.
 internal static class NetworkFence {
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct ShellExecuteInfo {
+        public uint size,mask; public IntPtr window;
+        public string verb,file,parameters,directory; public int show;
+        public IntPtr instance,idList; public string className;
+        public IntPtr classKey; public uint hotKey; public IntPtr icon,process;
+    }
+    [DllImport("shell32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    [return:MarshalAs(UnmanagedType.Bool)] static extern bool ShellExecuteEx(ref ShellExecuteInfo info);
+    [DllImport("user32.dll")] [return:MarshalAs(UnmanagedType.Bool)] static extern bool IsWindow(IntPtr window);
+    [DllImport("ole32.dll")] static extern int CoInitializeEx(IntPtr reserved,uint flags);
+    [DllImport("ole32.dll")] static extern void CoUninitialize();
+
+    // This branch runs with Guard's ordinary token. It requests consent only
+    // for this exact broker image; it cannot launch a supplied image/command.
+    // Windows owns the consent UI. Claude is never started from this branch.
+    static int RequestElevation(string[] args) {
+        int code=87; bool launched=false;
+        try {
+            if(IntPtr.Size!=8 || args.Length!=7 || args[1]!="--owner" || args[3]!="--pipe" || args[5]!="--token" ||
+                !Regex.IsMatch(args[2],@"\A[0-9a-f]{1,16}\z") || !Regex.IsMatch(args[4],@"\Agate-network-fence-[a-f0-9]{32}\z") || !Regex.IsMatch(args[6],@"\A[a-f0-9]{64}\z")) throw new Win32Exception(87);
+            ulong raw=Convert.ToUInt64(args[2],16);
+            if(raw>Int64.MaxValue) throw new Win32Exception(87);
+            IntPtr owner=new IntPtr((long)raw);
+            if(owner!=IntPtr.Zero && !IsWindow(owner)) throw new Win32Exception(1400);
+            string self=System.Reflection.Assembly.GetExecutingAssembly().Location;
+            var info=new ShellExecuteInfo { size=(uint)Marshal.SizeOf(typeof(ShellExecuteInfo)),
+                // NOCLOSEPROCESS | NOASYNC | FLAG_NO_UI: errors are reported
+                // below; the real secure-desktop consent prompt is not hidden.
+                mask=0x00000540,window=owner,verb="runas",file=self,
+                // Hide only the broker's console, never the Windows consent UI.
+                parameters="--pipe "+args[4]+" --token "+args[6],directory=Path.GetDirectoryName(self),show=0 };
+            bool comReady=false;
+            try {
+                if(CoInitializeEx(IntPtr.Zero,0x6)<0) throw new Win32Exception(31);
+                comReady=true;
+                if(!ShellExecuteEx(ref info)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                if(info.process==IntPtr.Zero) throw new Win32Exception(31);
+                launched=true;code=0;
+            } finally { if(info.process!=IntPtr.Zero) CloseHandle(info.process); if(comReady)CoUninitialize(); }
+        } catch(Win32Exception error) { code=error.NativeErrorCode; if(code<=0 || code>65535)code=31; }
+        catch { code=31; }
+        Console.WriteLine("{\"version\":1,\"launched\":"+(launched?"true":"false")+",\"code\":"+code+"}");
+        return 0;
+    }
     const uint NotFound = 0x80320003, AlreadyExists = 0x80320009;
     const string Owner = "gate-claude-network-fence-v1";
     static IntPtr SecurityDescriptor=IntPtr.Zero;
@@ -214,7 +258,8 @@ internal static class NetworkFence {
         while((c=reader.Read())!=-1) { if(c=='\n') return text.ToString().TrimEnd('\r'); if(text.Length>=262144) throw new InvalidDataException(); text.Append((char)c); }
         return text.Length==0 ? null : text.ToString();
     }
-    public static int Main(string[] args) {
+    [STAThread] public static int Main(string[] args) {
+        if(args.Length>0 && args[0]=="--request-elevation") return RequestElevation(args);
         IntPtr engine=IntPtr.Zero,mutex=IntPtr.Zero; bool ownsMutex=false;
         CodeFenceSession codeSession=null;
         try {

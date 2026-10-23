@@ -42,7 +42,13 @@ else {
     });
   }
   app.whenReady().then(async () => {
-    controller = new GuardController(root, resources);
+    controller = new GuardController(root, resources, {
+      ownerWindow: () => {
+        if (!window || window.isDestroyed()) throw Error('Окно Guard недоступно для системного запроса Windows.');
+        window.show(); window.focus();
+        return window.getNativeWindowHandle();
+      }
+    });
     const checkProtocol = async () => {
       protocolState = await ensureGuardProtocolRegistration(app, { smokeTest: process.argv.includes('--smoke-test') });
       send('protocol', protocolState); return protocolState;
