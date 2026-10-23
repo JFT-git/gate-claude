@@ -62,22 +62,63 @@ test('unknown, mixed, duplicate or incomplete maps are refused rather than falli
   for (const text of ['http=host:80;https=host:81;http=host:82', 'https=host:80;HTTPS=host:80', 'ftp=host:80', 'http=host:80;socks=', 'http=host:80;', ';http=host:80', 'http=host:80;other:81', 'http=host:80=bad', 'http=host:80;https=bad:0']) assert.throws(() => parseProxyServer(text), safeError());
 });
 
-test('missing or disabled static proxy stays direct while disabled values remain fingerprinted', () => {
+test('missing or disabled static proxy stays direct without fingerprinting unused server values', () => {
   const absent = parseRegistryOutput(registry()), disabled = parseRegistryOutput(registry([['ProxyEnable', 'REG_DWORD', '0x0']]));
   const invalidDisabled = parseRegistryOutput(registry([['ProxyEnable', 'REG_DWORD', '0x0'], ['ProxyServer', 'REG_SZ', secret + '@invalid']]));
   const binaryDisabled = parseRegistryOutput(registry([['ProxyServer', 'REG_BINARY', '010203']]));
   for (const value of [absent, disabled, invalidDisabled, binaryDisabled]) assert.equal(value.kind, 'direct');
-  assert.notEqual(absent.fingerprint, disabled.fingerprint); assert.notEqual(disabled.fingerprint, invalidDisabled.fingerprint);
+  for (const value of [disabled, invalidDisabled, binaryDisabled]) assert.equal(value.fingerprint, absent.fingerprint);
   assert.equal(JSON.stringify(invalidDisabled).includes(secret), false);
 });
 
-test('configuration fingerprints are stable and change for endpoint or disabled-control changes', () => {
+test('configuration fingerprints are stable and change only with the validated route', () => {
   const first = parseRegistryOutput(enabled('127.0.0.1:9697'));
   assert.equal(first.fingerprint, parseRegistryOutput(enabled('127.0.0.1:9697')).fingerprint);
   assert.notEqual(first.fingerprint, parseRegistryOutput(enabled('127.0.0.1:9698')).fingerprint);
   const disabled = server => parseRegistryOutput(registry([['ProxyEnable', 'REG_DWORD', '0x0'], ['ProxyServer', 'REG_SZ', server]]));
-  assert.notEqual(disabled('host:80').fingerprint, disabled('host:81').fingerprint);
-  assert.notEqual(parseRegistryOutput(registry()).fingerprint, parseRegistryOutput(registry([['AutoConfigURL', 'REG_SZ', '']])).fingerprint);
+  assert.equal(disabled('host:80').fingerprint, disabled('host:81').fingerprint);
+  assert.equal(parseRegistryOutput(registry()).fingerprint, parseRegistryOutput(registry([['AutoConfigURL', 'REG_SZ', '']])).fingerprint);
+});
+
+test('equivalent map ordering, DNS case and formatting keep the captured proxy identity', () => {
+  const expected = parseRegistryOutput(enabled('Proxy.Example:8080'));
+  for (const server of [
+    'proxy.example:8080', ' PROXY.EXAMPLE:8080 ',
+    'http=proxy.example:8080;https=Proxy.Example:8080;socks=unused.example:1080',
+    'socks=unused.example:1080;HTTPS=PROXY.EXAMPLE:8080; http = proxy.example:8080',
+    'https=proxy.example:8080;http=different-unused.example:3128'
+  ]) {
+    const current = parseRegistryOutput(enabled(server));
+    assert.deepEqual(current, expected); assert.equal(Object.isFrozen(current), true);
+  }
+  const paddedState = registry([['ProxyEnable', 'REG_DWORD', '0x00000001'], ['ProxyServer', 'REG_SZ', 'proxy.example:8080'], ['AutoConfigURL', 'REG_SZ', '']]);
+  assert.deepEqual(parseRegistryOutput(paddedState), expected);
+});
+
+test('effective direct, protocol, host and port changes produce distinct identities', () => {
+  const configurations = [registry(), enabled('proxy.example:8080'), enabled('socks=proxy.example:8080'), enabled('other.example:8080'), enabled('proxy.example:8081')];
+  const identities = configurations.map(value => parseRegistryOutput(value).fingerprint);
+  assert.equal(new Set(identities).size, configurations.length);
+  assert.notEqual(parseRegistryOutput(enabled('proxy.example:8080')).fingerprint,
+    parseRegistryOutput(registry([['ProxyEnable', 'REG_DWORD', '0x0'], ['ProxyServer', 'REG_SZ', 'proxy.example:8080']])).fingerprint);
+});
+
+test('literal IPv6 spelling is normalized without merging DNS or different address families', () => {
+  const compressed = parseRegistryOutput(enabled('[2001:db8::1]:8080'));
+  const expanded = parseRegistryOutput(enabled('[2001:0DB8:0:0:0:0:0:1]:8080'));
+  assert.equal(compressed.fingerprint, expanded.fingerprint);
+  for (const [first, second] of [['proxy.example:8080', 'proxy.example.:8080'], ['localhost:8080', '127.0.0.1:8080'], ['127.0.0.1:8080', '[::ffff:127.0.0.1]:8080']]) {
+    assert.notEqual(parseRegistryOutput(enabled(first)).fingerprint, parseRegistryOutput(enabled(second)).fingerprint);
+  }
+});
+
+test('semantic identity never masks unsupported PAC or an invalid unselected proxy entry', () => {
+  const baseline = parseRegistryOutput(enabled('proxy.example:8080'));
+  const pac = registry([['ProxyEnable', 'REG_DWORD', '0x1'], ['ProxyServer', 'REG_SZ', 'proxy.example:8080'], ['AutoConfigURL', 'REG_SZ', 'https://private.invalid/proxy.pac']]);
+  assert.throws(() => parseRegistryOutput(pac), safeError('UNSUPPORTED_PAC'));
+  assert.throws(() => parseRegistryOutput(enabled('https=proxy.example:8080;http=bad:0')), safeError('INVALID_SETTINGS'));
+  assert.throws(() => parseRegistryOutput(enabled('https=proxy.example:8080;http=user:' + secret + '@bad:80')), safeError('INVALID_SETTINGS'));
+  assert.equal(baseline.host, 'proxy.example'); assert.equal(baseline.port, 8080); assert.equal(Object.isFrozen(baseline), true);
 });
 
 test('enabled static proxy requires one valid REG_SZ server and boolean REG_DWORD state', () => {
