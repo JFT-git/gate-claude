@@ -9,7 +9,7 @@ xcrun swiftc -swift-version 5 -target "$TEST_ARCH-apple-macosx13.0" -module-cach
 python3 Tests/run.py
 xcrun clang -O2 Source/GuardHost.c -o .build/GuardHostTest
 xcrun swiftc -swift-version 5 -target "$TEST_ARCH-apple-macosx13.0" -module-cache-path "$CACHE" -parse-as-library -framework Network \
-  Source/Core.swift Source/Policy.swift Source/Inspector.swift Source/Diagnostics.swift Source/SystemProxy.swift Tests/InspectorTests.swift -o .build/InspectorTests
+  Source/Core.swift Source/Policy.swift Source/Inspector.swift Source/DeepLink.swift Source/Diagnostics.swift Source/SystemProxy.swift Tests/InspectorTests.swift -o .build/InspectorTests
 chmod +x Tests/MockClaude.py
 .build/InspectorTests "$PWD/.build/GuardHostTest" "$PWD/Tests/MockClaude.py"
 

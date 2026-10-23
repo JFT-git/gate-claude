@@ -68,6 +68,62 @@ import Darwin
             print("\(ok ? "PASS" : "FAIL") \(label)")
             if !ok { failures += 1 }
         }
+        let loginLink = "claude://claude.ai/magic-link#ticket:secret"
+        proxyTest("deep link valid original accepted") {
+            DeepLink.validateClaudeDeepLink(loginLink) == loginLink &&
+            DeepLink.validateClaudeDeepLink(loginLink.replacingOccurrences(of: "claude:", with: "CLAUDE:")) != nil
+        }
+        for (raw, label) in [
+            ("claude://evil.test/magic-link#a:b", "wrong host"),
+            ("claude://claude.ai/other#a:b", "wrong path"),
+            ("claude://claude.ai/magic-link#a:%zz", "bare percent"),
+            ("claude://claude.ai/magic-link#a:%1f", "encoded control"),
+            ("claude://claude.ai/magic-link#a:%7F", "encoded delete"),
+            ("claude://claude.ai/magic-link#a:b:c", "extra fragment part"),
+            ("claude://claude.ai/magic-link#a:", "empty fragment part"),
+            ("claude://claude.ai:443/magic-link#a:b", "port"),
+            ("claude://user:pass@claude.ai/magic-link#a:b", "credentials"),
+            ("claude://claude.ai/magic-link#a:bad value", "space"),
+            (loginLink + String(repeating: "x", count: 8192), "overlong")
+        ] {
+            proxyTest("deep link rejects \(label)") { DeepLink.validateClaudeDeepLink(raw) == nil }
+        }
+        proxyTest("deep link queues once then delivers within TTL") {
+            var ready = false, clock: TimeInterval = 0
+            var delivered: [String] = [], notices: [String] = []
+            let inbox = DeepLinkInbox(ready: { ready }, deliver: { delivered.append($0) },
+                                     notice: { notices.append($0) }, now: { clock })
+            let accepted = inbox.accept(loginLink)
+            let duplicate = inbox.accept(loginLink + "other")
+            clock = 29; ready = true; inbox.flush(); inbox.flush()
+            return accepted && !duplicate && delivered == [loginLink] &&
+                notices == [DeepLinkInbox.queued, DeepLinkInbox.refused, DeepLinkInbox.delivered]
+        }
+        proxyTest("deep link expiry consumes queued token") {
+            var clock: TimeInterval = 0
+            var delivered = false, notices: [String] = []
+            let inbox = DeepLinkInbox(ready: { false }, deliver: { _ in delivered = true },
+                                     notice: { notices.append($0) }, now: { clock })
+            inbox.accept(loginLink); clock = 30; inbox.flush(); inbox.flush()
+            return !delivered && notices == [DeepLinkInbox.queued, DeepLinkInbox.expired]
+        }
+        proxyTest("invalid and inactive deep links produce refusal") {
+            var notices: [String] = []
+            let inbox = DeepLinkInbox(active: { false }, ready: { true },
+                                     deliver: { _ in }, notice: { notices.append($0) })
+            return !inbox.accept("invalid") && !inbox.accept(loginLink) &&
+                notices == [DeepLinkInbox.refused, DeepLinkInbox.refused]
+        }
+        proxyTest("failed delivery consumes token and clear discards queue") {
+            var ready = true, attempts = 0
+            var notices: [String] = []
+            let inbox = DeepLinkInbox(ready: { ready }, deliver: { _ in
+                attempts += 1; throw NSError(domain: "test", code: 1)
+            }, notice: { notices.append($0) })
+            inbox.accept(loginLink); inbox.flush()
+            ready = false; inbox.accept(loginLink); inbox.clear(); ready = true; inbox.flush()
+            return attempts == 1 && notices == [DeepLinkInbox.failed, DeepLinkInbox.queued]
+        }
         func rejects(_ fixture: String) -> Bool {
             do { _ = try SystemProxy.parse(fixture); return false } catch { return true }
         }
