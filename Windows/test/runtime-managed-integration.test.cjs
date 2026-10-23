@@ -101,3 +101,19 @@ test('an unsupported scratch lifecycle module cannot create a protected runtime'
   const f = await runtimeFixture(t); f.rejectScratch(); await assert.rejects(f.prepare({ codeEnabled: true }), /Unsupported fixture scratch/); assert.equal(f.status.length, 0); assert.equal(fs.existsSync(f.guardRoot), false);
   assert.equal((await f.prepare()).codeEnabled, false);
 });
+
+test('runtime rejects a copied resources link without modifying its outside target', async t => {
+  const f = await runtimeFixture(t), resources = path.join(path.dirname(f.source), 'resources'), outside = path.join(f.root, 'Outside');
+  fs.renameSync(resources, outside);
+  fs.symlinkSync(outside, resources, process.platform === 'win32' ? 'junction' : 'dir');
+  const original = fs.readFileSync(path.join(outside, 'app.asar'));
+  await assert.rejects(f.prepare(), error => {
+    assert.match(error.message, /Runtime staging contains a symbolic link/);
+    assert.equal(error.message.includes(outside), false);
+    assert.equal(error.message.includes(f.source), false);
+    return true;
+  });
+  assert.deepEqual(fs.readFileSync(path.join(outside, 'app.asar')), original);
+  assert.deepEqual(fs.readdirSync(outside), ['app.asar']);
+  assert.equal(fs.readdirSync(f.guardRoot).some(name => /^(Preparing|Runtime)-/.test(name)), false);
+});

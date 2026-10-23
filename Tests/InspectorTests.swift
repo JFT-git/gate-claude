@@ -65,6 +65,18 @@ import Darwin
         let fragment = TrafficSanitizer.body("data: {\"access_token\":\"stream-secret\"}\nBearer abc.def.ghi")
         let safe = !fragment.contains("stream-secret") && !fragment.contains("abc.def.ghi")
         print("\(safe ? "PASS" : "FAIL") streamed text masks known secrets"); if !safe { failures += 1 }
+        let formSafe = TrafficSanitizer.body("password=x&access_token=y") == "password=[скрыто]&access_token=[скрыто]" &&
+            TrafficSanitizer.body("client%5Fsecret=x&api-key=y&message=hello") == "client%5Fsecret=[скрыто]&api-key=[скрыто]&message=hello"
+        let jsonSafe = !TrafficSanitizer.body(#"{"client_secret":"secret-g","api_key":"secret-h"}"#).contains("secret-")
+        let keysSafe = ["client-secret", "APIKEY", "api_key", "account-password", "db_passwd", "nested_secret", "sessionkey", "legacytoken"].allSatisfy { key in
+            TrafficSanitizer.secretKey(key) && !TrafficSanitizer.body("data: {\"\(key)\":\"secret-fragment\"}").contains("secret-fragment")
+        }
+        let headersSafe = ["Referer", "Origin", "Location", "From"].allSatisfy { key in
+            TrafficSanitizer.headers([key: "https://user:pass@example.test/path?token=secret#private"]) == key + ": https://example.test/path"
+        }
+        let sanitizerSafe = formSafe && jsonSafe && keysSafe && headersSafe
+        print("\(sanitizerSafe ? "PASS" : "FAIL") form, JSON, fragment secrets and URL headers are sanitized")
+        if !sanitizerSafe { failures += 1 }
         let audit = TrafficSanitizer.audit(headers: [:], body: "{\"message\":\"I live in Europe/Moscow\"}")
         if audit.isEmpty { print("PASS chat text is not mistaken for timezone metadata") } else { failures += 1 }
         let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("Guard-diagnostics-" + UUID().uuidString + ".jsonl")

@@ -5,14 +5,14 @@ function bounded(value) {
   return text.slice(0, LIMIT) + (text.length > LIMIT ? '\n[обрезано: лимит 32 768 символов]' : '');
 }
 function secretKey(key) {
-  return /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|password|secret|session_?key)$/i.test(key) || /token$/i.test(key);
+  return /^(authorization|proxy[_-]authorization|cookie|set[_-]cookie|x[_-]api[_-]key|api[_-]?key|client[_-]secret|session[_-]?key)$/i.test(key) || /token$/i.test(key) || /(?:^|[_-])(?:secret|password|passwd)$/i.test(key);
 }
 function safeURL(value) {
   try { const url = new URL(value); url.username = ''; url.password = ''; url.search = ''; url.hash = ''; return bounded(url.href); }
   catch { return '[URL]'; }
 }
 function headers(value = {}) {
-  return bounded(Object.keys(value).sort().map(key => key + ': ' + (secretKey(key) ? '[скрыто]' : value[key])).join('\n'));
+  return bounded(Object.keys(value).sort().map(key => key + ': ' + (secretKey(key) ? '[скрыто]' : /^(referer|origin|location|from)$/i.test(key) ? safeURL(value[key]) : value[key])).join('\n'));
 }
 function body(value) {
   const walk = object => {
@@ -23,7 +23,14 @@ function body(value) {
   const text = String(value || '');
   try { return bounded(JSON.stringify(walk(JSON.parse(text)), null, 2)); }
   catch {
-    return bounded(text.replace(/("(?:[^"\r\n]*token|password|secret|session_?key)"\s*:\s*")[^"\r\n]*(")/gi, '$1[скрыто]$2')
+    if (/^[^\s&=]+=[^\s&]*(?:&[^\s&=]+=[^\s&]*)*$/.test(text)) {
+      return bounded(text.split('&').map(pair => {
+        const index = pair.indexOf('='), key = pair.slice(0, index);
+        let decoded; try { decoded = decodeURIComponent(key.replace(/\+/g, ' ')); } catch { decoded = key; }
+        return secretKey(decoded) ? key + '=[скрыто]' : pair;
+      }).join('&'));
+    }
+    return bounded(text.replace(/("(?:[^"\r\n]*token|authorization|proxy[_-]authorization|cookie|set[_-]cookie|x[_-]api[_-]key|api[_-]?key|client[_-]secret|(?:[^"\r\n]*[_-])?(?:password|passwd|secret)|session[_-]?key)"\s*:\s*")[^"\r\n]*(")/gi, '$1[скрыто]$2')
       .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+/gi, '$1[скрыто]'));
   }
 }
