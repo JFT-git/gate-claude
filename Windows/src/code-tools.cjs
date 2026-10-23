@@ -4,6 +4,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { LIMITS, manifestSHA256, validateFiles, parsePortableZip, inflateEntryAsync } = require('./portable-zip.cjs');
 const { sha256 } = require('./async-bytes.cjs');
+const { createPreparationProgress } = require('./preparation-progress.cjs');
 // This is source provenance, not permission to execute a downloaded installer.
 // Release preparation repacks the verified, already extracted official trees.
 // Tree hashes cover canonical path/size/SHA256 records: the official Git SFX
@@ -73,7 +74,7 @@ async function systemPathEntries(environment, safe) {
   await safe.inspect(root, true); const system32 = path.join(root, 'System32'); await safe.inspect(system32, true);
   return [system32, root];
 }
-async function verifyTree(root, files, safe) {
+async function verifyTree(root, files, safe, onVerified) {
   const expectedFiles = new Map(files.map(file => [file.path, file])), expectedDirectories = new Set();
   for (const file of files) { const parts = file.path.split('/'); parts.pop(); while (parts.length) { expectedDirectories.add(parts.join('/')); parts.pop(); } }
   await safe.inspect(root, true); const seenFiles = new Set(), seenDirectories = new Set();
@@ -85,41 +86,56 @@ async function verifyTree(root, files, safe) {
         const expected = expectedFiles.get(entry); if (!expected) throw fail();
         const bytes = await safe.read(absolute, expected.size);
         if (bytes.length !== expected.size || await sha256(bytes) !== expected.sha256) throw fail(); seenFiles.add(entry);
+        // The terminal count also requires the complete directory inventory.
+        if (seenFiles.size < files.length) onVerified?.(seenFiles.size);
       }
     }
   }
   await visit(root, ''); if (seenFiles.size !== files.length || seenDirectories.size !== expectedDirectories.size) throw fail();
+  onVerified?.(files.length);
 }
 // `resources` is the trusted Guard package directory, never a download folder.
 // Its build-generated policy pins every sidecar byte and every extracted file.
 // `archives` contains absolute gitArchive/powerShellArchive paths selected by the
 // controller. This module performs no downloads, subprocesses, ACL or PATH edits.
-async function prepareCodeTools(guardRoot, resources, archives, testdeps = {}) {
+// Final options.onProgress observes preparation only; `ready` is not a network
+// authorization, and existing fixture dependencies keep their separate argument.
+async function prepareCodeTools(guardRoot, resources, archives, testdeps = {}, options = {}) {
   const safe = safeFilesystem(testdeps.fs), sourcePolicy = testdeps.sourcePolicy || SOURCE_POLICY;
+  const progress = createPreparationProgress(options);
   const randomBytes = testdeps.randomBytes || crypto.randomBytes; let staging;
   try {
     if ((testdeps.platform || process.platform) !== 'win32' || (testdeps.arch || process.arch) !== 'x64' || !exactKeys(archives, 'gitArchive,powerShellArchive')) throw fail();
     await safe.inspect(guardRoot, true); await safe.inspect(resources, true);
     const systemPaths = await systemPathEntries(testdeps.environment || process.env, safe);
+    progress.begin('tools', 'policy-verify', 1);
     const policyBytes = await safe.read(path.join(resources, 'code-tools-policy.json'), MAX_POLICY_BYTES), policy = validatePolicy(JSON.parse(policyBytes.toString('utf8')), sourcePolicy);
+    progress.complete();
     const parsed = [];
     // Authenticate and preflight both archives before creating any output.
     for (let index = 0; index < 2; index++) {
       const tool = policy.tools[index], archivePath = archives[index === 0 ? 'gitArchive' : 'powerShellArchive'];
       if (!samePath(archivePath, path.join(resources, 'CodeTools', tool.archiveName))) throw fail();
+      const toolId = index === 0 ? 'git' : 'powershell';
+      progress.begin(toolId, 'archive-read', 1);
       const archive = await safe.read(archivePath, tool.archiveSize);
+      progress.complete(); progress.begin(toolId, 'archive-verify', 1);
       if (archive.length !== tool.archiveSize || await sha256(archive) !== tool.archiveSHA256) throw fail();
+      progress.complete(); progress.begin(toolId, 'archive-index', tool.files.length);
       parsed.push(parsePortableZip(archive, tool.files));
+      progress.complete();
     }
     const toolsRoot = await safe.directory(path.join(guardRoot, 'CodeTools')), toolRoots = [];
     for (let index = 0; index < 2; index++) {
       const tool = policy.tools[index], target = path.join(toolsRoot, (index === 0 ? 'Git-' : 'PowerShell-') + tool.archiveSHA256);
+      const toolId = index === 0 ? 'git' : 'powershell', verified = count => progress.update(count);
       let exists = false; try { await safe.fs.lstat(target); exists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      if (exists) await verifyTree(target, tool.files, safe);
+      if (exists) { progress.begin(toolId, 'cache-verify', tool.files.length); await verifyTree(target, tool.files, safe, verified); }
       else {
         const nonce = randomBytes(16).toString('hex'); if (!/^[a-f0-9]{32}$/.test(nonce)) throw fail();
         const candidate = path.join(toolsRoot, 'Preparing-' + nonce); await safe.fs.mkdir(candidate, { mode: 0o700 }); staging = candidate; await safe.inspect(staging, true);
-        const createdDirectories = new Set([staging]);
+        const createdDirectories = new Set([staging]); let extracted = 0;
+        progress.begin(toolId, 'extract', tool.files.length);
         for (const entry of parsed[index].entries) {
           const parts = entry.path.split('/'), leaf = parts.pop(); let directory = staging;
           for (const part of parts) {
@@ -130,21 +146,27 @@ async function prepareCodeTools(guardRoot, resources, archives, testdeps = {}) {
           // avoiding repeated mkdir calls for thousands of shared prefixes.
           await safe.inspect(directory, true);
           const bytes = await inflateEntryAsync(entry); await safe.fs.writeFile(path.join(directory, leaf), bytes, { flag: 'wx', mode: 0o600 });
+          progress.update(++extracted);
         }
-        await verifyTree(staging, tool.files, safe);
+        progress.begin(toolId, 'staging-verify', tool.files.length);
+        await verifyTree(staging, tool.files, safe, verified);
         // A concurrent installer fails closed; it cannot replace an existing tree.
-        await safe.fs.rename(staging, target); staging = undefined; await verifyTree(target, tool.files, safe);
+        progress.begin(toolId, 'publish', tool.files.length);
+        await safe.fs.rename(staging, target); staging = undefined; progress.complete();
+        progress.begin(toolId, 'target-verify', tool.files.length);
+        await verifyTree(target, tool.files, safe, verified);
       }
       toolRoots.push(target);
     }
     const [gitRoot, powerShellRoot] = toolRoots, pathEntries = Object.freeze([path.join(gitRoot, 'cmd'), path.join(gitRoot, 'usr', 'bin'), powerShellRoot, ...systemPaths]);
     // MSYS Bash cannot initialize in the zero-capability AppContainer. Select
     // the CLI's supported PowerShell tool while keeping native Git available.
-    return { toolRoots: Object.freeze(toolRoots), gitRoot, powerShellRoot, policySHA256: await sha256(policyBytes),
+    const result = { toolRoots: Object.freeze(toolRoots), gitRoot, powerShellRoot, policySHA256: await sha256(policyBytes),
       gitExecutable: path.join(gitRoot, 'cmd', 'git.exe'), bashExecutable: path.join(gitRoot, 'bin', 'bash.exe'), powerShellExecutable: path.join(powerShellRoot, 'powershell.exe'),
       pathEntries,
       environment: Object.freeze({ PATH: pathEntries.join(';'), GIT_EXEC_PATH: path.join(gitRoot, 'ucrt64', 'libexec', 'git-core'), GIT_TEMPLATE_DIR: path.join(gitRoot, 'ucrt64', 'share', 'git-core', 'templates'), GIT_CONFIG_NOSYSTEM: '1',
         CLAUDE_CODE_USE_POWERSHELL_TOOL: '1', PSModulePath: path.join(powerShellRoot, 'Modules'), POWERSHELL_TELEMETRY_OPTOUT: '1', POWERSHELL_UPDATECHECK: 'Off' }) };
+    progress.begin('tools', 'ready', 2); progress.complete(); return result;
   } catch {
     if (staging) { try { await safe.fs.rm(staging, { recursive: true, force: true }); } catch {} }
     throw fail();

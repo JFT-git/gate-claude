@@ -48,6 +48,62 @@ test('current network session closes its live tunnel and latches on a new foreig
   await assert.rejects(connectTunnel(port, '127.0.0.1', echo.address().port));
   controller.stop(); await assert.rejects(controller.start({ mode: 'network' }));
 });
+test('a held proxy tunnel survives equivalent raw settings but real route changes close and latch without rerouting', { timeout: 10000 }, async t => {
+  const net = require('node:net'), { once } = require('node:events');
+  const { NetworkRelay, connectTunnel } = require('../src/relay.cjs');
+  const { parseRegistryOutput } = require('../src/system-proxy.cjs');
+  const settingsKey = 'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
+  const registry = (server, state = '0x1') => settingsKey + '\r\n    ProxyEnable    REG_DWORD    ' + state + '\r\n    ProxyServer    REG_SZ    ' + server + '\r\n';
+  async function upstream() {
+    const peers = new Set(), requests = []; let connections = 0;
+    const server = net.createServer(socket => {
+      connections++;
+      peers.add(socket); socket.on('error', () => {}); socket.once('close', () => peers.delete(socket));
+      let header = Buffer.alloc(0);
+      const receive = chunk => {
+        header = Buffer.concat([header, chunk]); const end = header.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        socket.off('data', receive); requests.push(header.subarray(0, end).toString('latin1'));
+        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (header.length > end + 4) socket.write(header.subarray(end + 4));
+        socket.pipe(socket);
+      };
+      socket.on('data', receive);
+    });
+    t.after(async () => { for (const socket of peers) socket.destroy(); if (server.listening) await new Promise(resolve => server.close(resolve)); });
+    server.listen(0, '127.0.0.1'); await once(server, 'listening');
+    return { port: server.address().port, requests, get connections() { return connections; } };
+  }
+  for (const change of ['host', 'port']) {
+    const controller = await fixture(t), first = await upstream(), unused = await upstream();
+    let raw = registry('127.0.0.1:' + first.port);
+    const captured = parseRegistryOutput(raw);
+    controller.networkProxy = captured; controller.networkProxyConfiguration = async () => parseRegistryOutput(raw);
+    current = async () => ({ ip: '203.0.113.7' }); controller.policy.pin({ country_code: 'NL', ip: '203.0.113.7' });
+    const relay = new NetworkRelay({ upstream: captured }); controller.relay = relay;
+    await relay.start(); relay.pinIPFamily(4); relay.unlock();
+    controller.state = 'running'; controller.settings = { mode: 'network', interval: 30 }; controller.route = '';
+    await controller.queryDestinations(controller.epoch, relay.port, relay.checkToken, true);
+    const socket = await connectTunnel(relay.port, 'held.invalid', 443); socket.resume();
+    t.after(() => socket.destroy());
+    const echo = async text => { const answer = once(socket, 'data'); socket.write(text); assert.equal((await answer)[0].toString(), text); };
+    await echo('before-equivalent-' + change);
+    raw = registry('socks=unused.invalid:1080;HTTPS=127.0.0.1:' + first.port + '; http = 127.0.0.1:' + first.port, '0x00000001');
+    await controller.poll(controller.epoch); clearTimeout(controller.pollTimer);
+    assert.equal(controller.state, 'running'); assert.equal(controller.policy.blocked, false);
+    assert.equal(socket.destroyed, false); assert.equal(relay.closed, false); assert.deepEqual(relay.upstream, captured);
+    await echo('after-equivalent-' + change);
+    const closed = once(socket, 'close');
+    raw = registry(change === 'host' ? 'localhost:' + first.port : '127.0.0.1:' + unused.port);
+    await controller.poll(controller.epoch); await closed;
+    assert.equal(controller.state, 'blocked'); assert.equal(controller.policy.blocked, true); assert.equal(relay.closed, true);
+    assert.equal(controller.relay, null); assert.deepEqual(relay.upstream, captured); assert.equal(Object.isFrozen(relay.upstream), true);
+    assert.equal(first.connections, 1); assert.equal(first.requests.length, 1); assert.match(first.requests[0], /^CONNECT held\.invalid:443 HTTP\/1\.1\r\n/);
+    assert.equal(unused.connections, 0); assert.equal(unused.requests.length, 0);
+    await assert.rejects(connectTunnel(relay.port, 'held.invalid', 443));
+    await assert.rejects(controller.start({ mode: 'network' }), /перезапуска/);
+  }
+});
 test('stop during initial request cannot pin an IP or reopen resources after cancellation', async t => {
   const controller = await fixture(t); let resolve;
   initial = () => new Promise(done => { resolve = done; }); current = async () => ({ ip: '203.0.113.7' });

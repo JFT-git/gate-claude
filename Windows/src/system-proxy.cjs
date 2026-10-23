@@ -55,9 +55,6 @@ function parseProxyServer(value) {
 }
 
 function descriptor(controls) {
-  // Only the digest escapes. This includes disabled values so a configuration
-  // change invalidates a sample without disclosing registry strings or PAC URLs.
-  const fingerprint = createHash('sha256').update(JSON.stringify(NAMES.map(name => [name, controls[name] || null]))).digest('hex');
   const pac = controls.AutoConfigURL;
   if (pac && (pac.type !== 'REG_SZ' || pac.value.trim() !== '')) throw new SystemProxyError('UNSUPPORTED_PAC');
   const enabled = controls.ProxyEnable;
@@ -68,10 +65,17 @@ function descriptor(controls) {
     if (number !== 0 && number !== 1) throw new SystemProxyError();
     useProxy = number === 1;
   }
-  if (!useProxy) return Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint });
-  const server = controls.ProxyServer;
-  if (!server || server.type !== 'REG_SZ') throw new SystemProxyError();
-  return Object.freeze({ ...parseProxyServer(server.value), fingerprint });
+  let route = { kind: 'direct', host: '', port: 0 };
+  if (useProxy) {
+    const server = controls.ProxyServer;
+    if (!server || server.type !== 'REG_SZ') throw new SystemProxyError();
+    route = parseProxyServer(server.value);
+  }
+  // Compare the validated transport inputs captured by the relay, not unused
+  // registry values or formatting. Never resolve DNS or merge address families.
+  const host = net.isIPv6(route.host) ? new URL('http://[' + route.host + ']').hostname.slice(1, -1) : route.host;
+  const fingerprint = createHash('sha256').update(JSON.stringify({ kind: route.kind, host, port: route.port })).digest('hex');
+  return Object.freeze({ ...route, fingerprint });
 }
 
 function parseRegistryOutput(stdout) {
