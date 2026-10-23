@@ -29,12 +29,14 @@ function refreshControls() {
   for (const id of ['host','port','username','password']) $(id).disabled = !c.settings || !socks;
   $('host').required = socks; $('port').required = socks; $('claudePath').readOnly = $('claudeSource').value !== 'manual';
   $('export').disabled = records.size === 0 || pending.has('export');
+  $('restartConfirmYes').disabled = !c.restart;
   for (const [id, key] of [['protocolSettings','protocolSettings'],['protocolCheck','protocolCheck'],['codeWorkspace','workspace'],['serviceRefresh','service']]) { $(id).disabled = !ready || pending.has(key); $(id).setAttribute('aria-busy', String(pending.has(key))); }
   for (const button of document.querySelectorAll('[data-service]')) button.disabled = pending.has('service') || VM.service(serviceSnapshot).busy;
   $('serviceActivity').hidden = !pending.has('service') && !VM.service(serviceSnapshot).busy;
 }
 function showState(value) {
   if (!value || !['idle','checking','starting','running','rechecking','blocked'].includes(value.state)) return;
+  if (['idle','blocked'].includes(value.state) && value.state !== state.state) hideRestartConfirm();
   const previous = state; state = value; document.body.dataset.state = value.state;
   $('state').textContent = ({ idle: 'Готов к запуску', checking: 'Проверка подключения', starting: 'Запуск и проверка Claude', running: 'Claude под защитой Guard', rechecking: 'Трафик приостановлен', blocked: 'Сессия закрыта' })[value.state];
   $('message').textContent = value.message || 'Выберите подключение и запустите проверку.'; $('lamp').className = 'lamp ' + value.state;
@@ -84,10 +86,15 @@ function showService(value) {
   $('serviceActivity').hidden = !pending.has('service') && !presentation.busy;
 }
 async function refreshService() {
-  const value = await perform('service', 'Проверка службы', () => window.guard.serviceStatus(), result => result?.available ? VM.service(result).label : 'API службы не подключён');
-  if (value && !value.error) showService(value);
-  else { $('serviceState').textContent = 'Состояние не подтверждено'; $('serviceMessage').textContent = 'Ответ API службы не получен. Установка и управление недоступны.'; $('serviceActions').hidden = true; }
-  $('serviceRefresh').disabled = false;
+  if (pending.has('service')) return;
+  pending.add('service'); refreshControls();
+  try {
+    const value = await window.guard.serviceStatus();
+    if (value && !value.error) showService(value);
+    else { $('serviceState').textContent = 'Служба не используется'; $('serviceState').dataset.state = 'unavailable'; $('serviceMessage').textContent = VM.service(null).message; $('serviceActions').hidden = true; }
+  } catch {
+    $('serviceState').textContent = 'Служба не используется'; $('serviceState').dataset.state = 'unavailable'; $('serviceMessage').textContent = VM.service(null).message; $('serviceActions').hidden = true;
+  } finally { pending.delete('service'); refreshControls(); }
 }
 function log(value) {
   $('logsEmpty')?.remove(); const entry = node('div', '', 'log ' + value.kind), time = node('time', new Date(value.date).toLocaleString());
@@ -130,7 +137,21 @@ $('settings').addEventListener('submit',async event=>{
   },result=>result?.state==='running'?'сессия подтверждена':'запрос принят контроллером');
 });
 $('stop').addEventListener('click',()=>{if(VM.controls(state,[...pending],ready).stop) void perform('stop','Остановка',async()=>{const result=await window.guard.stop();if(result?.state)showState(result);return result;},'команда отправлена');});
-$('restart').addEventListener('click',()=>{if(VM.controls(state,[...pending],ready).restart) void perform('restart','Перезапуск Guard',()=>window.guard.restart(),'ожидаем новое окно');});
+function hideRestartConfirm(){
+  if($('restartConfirm').hidden)return;
+  if($('restartConfirm').contains(document.activeElement))$('restart').focus();
+  $('restartConfirm').hidden=true;
+}
+function performRestart(){if(!VM.controls(state,[...pending],ready).restart){hideRestartConfirm();return;}hideRestartConfirm();void perform('restart','Перезапуск Guard',()=>window.guard.restart(),'ожидаем новое окно');}
+$('restart').addEventListener('click',()=>{
+  if(!VM.controls(state,[...pending],ready).restart)return;
+  const sessionActive=['checking','starting','running','rechecking'].includes(state?.state);
+  if(sessionActive){$('restartConfirm').hidden=false;$('restartConfirmYes').focus();return;}
+  performRestart();
+});
+$('restartConfirmYes').addEventListener('click',performRestart);
+$('restartConfirmNo').addEventListener('click',()=>{hideRestartConfirm();});
+$('restartConfirm').addEventListener('keydown',event=>{if(event.key==='Escape')hideRestartConfirm();});
 $('choose').addEventListener('click',()=>{if(!VM.controls(state,[...pending],ready).settings)return;void perform('choose','Выбор Claude',async()=>{
   const result=await window.guard.choose();if(!result?.error&&result){discoveryGeneration++;finding=false;$('claudeSource').value='manual';$('claudePath').value=result;$('claudeStatus').textContent='Путь выбран вручную';document.body.dataset.discoveryDone='true';}return result;
 },result=>result?'путь выбран':'выбор отменён');});

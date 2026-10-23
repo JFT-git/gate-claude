@@ -29,6 +29,7 @@ final class GuardModel: ObservableObject {
     @Published var requiresRestart = false
     @Published var claudeRunning = false
     @Published var restarting = false
+    @Published var operationFailure: String?
     @Published var previousStop: String?
     @Published var nextCheck: Date?
     @Published var log: [String] = []
@@ -155,6 +156,7 @@ final class GuardModel: ObservableObject {
 
     func check(andLaunch launch: Bool) {
         guard !busy, !requiresRestart, !(launch && claudeRunning) else { return }
+        operationFailure = nil
         saveSettings()
         if monitoring { verifyPinnedIP(andLaunch: launch); return }
         report = nil; traffic.removeAll(); lastVerifiedProfile = nil; profileStatus = "Профиль страницы ещё не проверен"
@@ -542,18 +544,22 @@ final class GuardModel: ObservableObject {
     }
 
     func stop() {
+        operationFailure = nil
         block(requiresRestart ? (policy.lockedReason ?? "Перезапустите Guard.") : "Сессия остановлена пользователем.", manual: true)
     }
     func restart() {
         guard !restarting, let onRestart else { return }
+        operationFailure = nil
         deepLinkInbox.clear()
         restarting = true
         onRestart()
     }
     func restartFailed(_ message: String) {
         restarting = false; detail = message; appendLog(message)
+        operationFailure = "Перезапуск: не удалось — " + message
     }
     private func block(_ reason: String, manual: Bool = false, latch: Bool = false) {
+        let failedLaunch = busy || launchPending || launchAfterValidation
         deepLinkInbox.clear()
         childBundleURL = nil
         password = ""
@@ -573,6 +579,7 @@ final class GuardModel: ObservableObject {
         phase = requiresRestart ? "Заблокировано до перезапуска Guard" : (manual ? "Остановлено" : "Доступ закрыт")
         detail = reason
         if !manual {
+            if failedLaunch { operationFailure = "Запуск: не удалось — " + reason }
             previousStop = GuardDiagnostics.sanitize(reason)
             diagnostics.record("blocked", reason)
         }
@@ -641,35 +648,53 @@ private struct Surface<Content: View>: View {
     @ViewBuilder let content: Content
     var body: some View {
         content.padding(20).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.white.opacity(0.045))
+            .background(GuardPalette.surface)
             .clipShape(RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.12)))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(GuardPalette.border))
     }
+}
+
+@MainActor
+private func confirmRestartDialog() -> Bool {
+    NSApp.activate(ignoringOtherApps: true)
+    let alert = NSAlert()
+    alert.messageText = "Перезапустить Guard?"
+    alert.informativeText = "Текущая сессия Claude будет закрыта, а пароль прокси потребуется ввести снова."
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Перезапустить").hasDestructiveAction = true
+    alert.addButton(withTitle: "Отмена").keyEquivalent = "\u{1b}"
+    return alert.runModal() == .alertFirstButtonReturn
 }
 
 struct GuardView: View {
     @ObservedObject var model: GuardModel
     @StateObject private var presentation = GuardPresentation()
-    private var statusColor: Color { model.allowed ? .mint : (model.busy ? .cyan : .orange) }
+    private var statusColor: Color {
+        if model.requiresRestart { return GuardPalette.danger }
+        if model.allowed { return GuardPalette.accent }
+        if model.busy || model.monitoring { return GuardPalette.warning }
+        return GuardPalette.secondary
+    }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(spacing: 14) {
                     Image(systemName: "network.badge.shield.half.filled")
-                        .font(.system(size: 32, weight: .medium)).foregroundStyle(.mint)
-                        .frame(width: 58, height: 58).background(.mint.opacity(0.12), in: RoundedRectangle(cornerRadius: 17))
+                        .font(.system(size: 32, weight: .medium)).foregroundStyle(GuardPalette.accent)
+                        .frame(width: 58, height: 58).background(GuardPalette.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 17))
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Claude Proxy Guard").font(.system(size: 25, weight: .semibold, design: .rounded))
-                        Text("Проверка IP перед запуском Claude").font(.system(size: 13)).foregroundStyle(.secondary)
+                        Text("Проверка IP перед запуском Claude").font(.system(size: 13)).foregroundStyle(GuardPalette.secondary)
                     }
                     Spacer()
-                    Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.4")).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
+                    Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.4")).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
                 }
                 Surface {
                     VStack(alignment: .leading, spacing: 14) {
                         HStack(spacing: 9) {
                             Circle().fill(statusColor).frame(width: 8, height: 8)
                             Text(model.phase).font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(model.requiresRestart ? GuardPalette.danger : GuardPalette.text)
                                 .accessibilityAddTraits(.updatesFrequently)
                             Spacer()
                             if model.busy { ProgressView().controlSize(.small) }
@@ -677,17 +702,23 @@ struct GuardView: View {
                         if let report = model.report {
                             HStack(alignment: .firstTextBaseline, spacing: 16) {
                                 Text(report.ip).font(.system(size: 25, weight: .medium, design: .monospaced)).textSelection(.enabled)
-                                Text("\(report.country) · \(report.countryCode)").font(.system(size: 13)).foregroundStyle(.secondary)
+                                Text("\(report.country) · \(report.countryCode)").font(.system(size: 13)).foregroundStyle(GuardPalette.secondary)
                             }
-                        } else { Text("Внешний IP ещё не проверен").font(.system(size: 23, weight: .medium)).foregroundStyle(.secondary) }
-                        Text(model.detail).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        } else { Text("Внешний IP ещё не проверен").font(.system(size: 15, weight: .medium)).foregroundStyle(GuardPalette.secondary) }
+                        Text(model.detail).font(.system(size: 12)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                             .accessibilityAddTraits(.updatesFrequently)
+                        if model.requiresRestart {
+                            Label("Нажмите «Перезапустить Guard» — пароль прокси нужно будет ввести снова.", systemImage: "exclamationmark.triangle.fill")
+                                .font(.system(size: 13, weight: .semibold)).foregroundStyle(GuardPalette.danger)
+                                .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                                .background(GuardPalette.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                        }
                         if let previous = model.previousStop, !model.monitoring {
-                            Text("Последняя причина завершения: \(previous)").font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            Text("Последняя причина завершения: \(previous)").font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                         }
                         if let next = model.nextCheck {
                             Text("Следующая проверка в \(next.formatted(date: .omitted, time: .standard))")
-                                .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                                .font(.system(size: 11, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
                         }
                         HStack(spacing: 8) {
                             Button { presentation.lastAction = "Запуск: запрос отправлен"; model.check(andLaunch: true) } label: {
@@ -702,17 +733,18 @@ struct GuardView: View {
                                 .disabled((!model.monitoring && !model.busy && !model.claudeRunning) || model.restarting)
                                 .keyboardShortcut(".", modifiers: .command)
                                 .help("Закрыть шлюз и остановить собственную копию Claude")
-                            Button { presentation.lastAction = "Перезапуск: ожидаем новое окно"; model.restart() } label: {
+                            Button { requestRestart() } label: {
                                 Label("Перезапустить Guard", systemImage: "arrow.clockwise")
                             }.buttonStyle(GuardActionStyle(primary: model.requiresRestart))
                                 .disabled(model.restarting)
                                 .help("Заново открыть Guard и закрыть текущую сессию. Пароль прокси потребуется ввести снова.")
                         }
-                        Text("Последнее действие: \(presentation.lastAction)").font(.system(size: 12)).foregroundStyle(.secondary)
+                        Text("Последнее действие: \(presentation.lastAction)").font(.system(size: 12))
+                            .foregroundStyle(presentation.lastAction == model.operationFailure ? GuardPalette.danger : GuardPalette.secondary)
                             .accessibilityLabel("Последнее действие: \(presentation.lastAction)")
                             .accessibilityAddTraits(.updatesFrequently)
                         HStack {
-                            Label("Системная служба не используется", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(.secondary)
+                            Label("Системная служба не используется", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(GuardPalette.secondary)
                             Spacer()
                             Button("Показать файл журнала") { model.showLog = true; model.showDiagnostics() }.keyboardShortcut("l", modifiers: .command)
                         }
@@ -733,15 +765,15 @@ struct GuardView: View {
                             HStack(alignment: .top, spacing: 12) {
                                 field("Логин, если нужен", placeholder: "Необязательно", value: $model.username)
                                 VStack(alignment: .leading, spacing: 6) {
-                                    Text("Пароль").font(.system(size: 11)).foregroundStyle(.secondary)
+                                    Text("Пароль").font(.system(size: 11)).foregroundStyle(GuardPalette.secondary)
                                     SecureField("Необязательно", text: $model.password).textFieldStyle(.roundedBorder).accessibilityLabel("Пароль")
                                 }
                             }
                             Text("Пароль остаётся только в памяти и не сохраняется на диск.")
-                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary)
                         } else {
                             Text("Проверяем IP текущего маршрута. VPN нужно включить отдельно. Приложение не меняет системные настройки сети.")
-                                .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                .font(.system(size: 12)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                         }
                         HStack {
                             Text("Внешний IP").font(.system(size: 12))
@@ -752,7 +784,7 @@ struct GuardView: View {
                         }
                         Toggle("Проверять публичный IP через ipify", isOn: $model.watchPublicIP).font(.system(size: 12))
                         Text("Изменение сети или ошибка проверки приостанавливает шлюз. Прежний подтверждённый IP возобновляет сессию; другой IP блокирует её до перезапуска Guard.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     }.disabled(model.monitoring || model.busy || model.requiresRestart)
                 }
                 Surface {
@@ -770,20 +802,20 @@ struct GuardView: View {
                         Toggle("Показывать содержимое запросов и ответов", isOn: $model.captureBodies)
                             .font(.system(size: 12)).disabled(!model.inspectPages)
                         Text("Применяется к Claude. Настройки macOS не меняются. Диагностика работает через закрытый pipe, без сертификатов и сетевого порта.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     }.disabled(model.monitoring || model.busy || model.requiresRestart)
-                    Text(model.profileStatus).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).padding(.top, 8)
+                    Text(model.profileStatus).font(.system(size: 11, design: .monospaced)).foregroundStyle(GuardPalette.secondary).padding(.top, 8)
                 }
                 Surface {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Text("Claude Desktop").font(.system(size: 15, weight: .semibold))
                             Spacer()
-                            if model.claudeRunning { Label("Запущен", systemImage: "checkmark.circle.fill").foregroundStyle(.mint).font(.system(size: 11)) }
+                            if model.claudeRunning { Label("Запущен", systemImage: "checkmark.circle.fill").foregroundStyle(GuardPalette.accent).font(.system(size: 11)) }
                         }
-                        Text(model.runtimeStatus).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Text(model.runtimeStatus).font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                         HStack {
-                            Text(model.claudePath).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            Text(model.claudePath).font(.system(size: 11, design: .monospaced)).foregroundStyle(GuardPalette.secondary).lineLimit(1).truncationMode(.middle)
                             Spacer()
                             Button("Выбрать…") { model.selectClaude() }.disabled(model.monitoring || model.busy || model.requiresRestart)
                         }
@@ -800,28 +832,50 @@ struct GuardView: View {
                 }
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Упрощённая защита — без системного kill switch", systemImage: "info.circle")
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                        .font(.system(size: 12, weight: .medium)).foregroundStyle(GuardPalette.warning)
                     Text("Начальная страна: ipwho.is; повторный IP: ipify. Подтверждённый новый IP завершает сессию. Ошибка проверки, смена маршрута или сон приостанавливают трафик; прежний подтверждённый IP восстанавливает доступ без перезапуска Claude. Публичный IP нельзя проверить локально за NAT. Системной сетевой изоляции нет: native, MCP и Cowork могут обходить прокси; CDP видит только доступные веб-контексты.")
-                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     DisclosureGroup("Журнал проверок", isExpanded: $model.showLog) {
                         VStack(alignment: .leading, spacing: 6) {
                             if model.log.isEmpty { Text("Проверок пока нет") }
                             ForEach(Array(model.log.enumerated()), id: \.offset) { _, line in Text(line).textSelection(.enabled) }
-                        }.font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                        }.font(.system(size: 10, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
                     }.font(.system(size: 11)).padding(.top, 5)
                 }.padding(.horizontal, 4)
             }.padding(28)
         }
         .frame(minWidth: 620, idealWidth: 720, minHeight: 620, idealHeight: 900)
-        .background(Color(red: 0.059, green: 0.094, blue: 0.090))
-        .preferredColorScheme(.dark)
-        .onChange(of: model.phase) { phase in presentation.lastAction = phase + " · " + Date().formatted(date: .omitted, time: .standard) }
+        .background(GuardPalette.background)
+        .foregroundStyle(GuardPalette.text)
+        .tint(GuardPalette.accent)
+        .onChange(of: model.phase) { phase in presentation.lastAction = model.operationFailure ?? (phase + " · " + Date().formatted(date: .omitted, time: .standard)) }
+        .onReceive(model.$operationFailure) { failure in
+            if let failure { presentation.lastAction = failure; Self.announce(failure) }
+        }
+        .onChange(of: model.requiresRestart) { blocked in
+            if blocked && model.operationFailure == nil { Self.announce("Сессия закрыта. \(model.phase). Требуется перезапуск Guard.") }
+        }
+    }
+
+    private func requestRestart() {
+        if model.monitoring || model.claudeRunning || model.busy {
+            guard confirmRestartDialog() else { return }
+        }
+        presentation.lastAction = "Перезапуск: ожидаем новое окно"
+        model.restart()
+    }
+
+    private static func announce(_ message: String) {
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first else { return }
+        NSAccessibility.post(element: window, notification: .announcementRequested,
+                             userInfo: [NSAccessibility.NotificationUserInfoKey.announcement: message,
+                                        NSAccessibility.NotificationUserInfoKey.priority: NSAccessibilityPriorityLevel.high.rawValue])
     }
 
     private func field(_ title: String, placeholder: String, value: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.system(size: 11)).foregroundStyle(.secondary)
+            Text(title).font(.system(size: 11)).foregroundStyle(GuardPalette.secondary)
             TextField(placeholder, text: value).textFieldStyle(.roundedBorder).accessibilityLabel(title)
         }
     }
@@ -863,18 +917,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let submenu = NSMenu(); root.submenu = submenu
         submenu.addItem(NSMenuItem(title: "О Claude Proxy Guard", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
         submenu.addItem(.separator())
+        submenu.addItem(NSMenuItem(title: "Скрыть Claude Proxy Guard", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
+        let hideOthers = NSMenuItem(title: "Скрыть остальные", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        submenu.addItem(hideOthers)
+        submenu.addItem(.separator())
         submenu.addItem(NSMenuItem(title: "Выйти из Claude Proxy Guard", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         let editRoot = NSMenuItem(); appMenu.addItem(editRoot)
         let edit = NSMenu(title: "Правка"); editRoot.submenu = edit
         for (title, selector, key) in [("Отменить", "undo:", "z"), ("Вырезать", "cut:", "x"), ("Копировать", "copy:", "c"), ("Вставить", "paste:", "v"), ("Выбрать всё", "selectAll:", "a")] {
             edit.addItem(NSMenuItem(title: title, action: Selector(selector), keyEquivalent: key))
         }
+        let windowRoot = NSMenuItem(); appMenu.addItem(windowRoot)
+        let windowMenu = NSMenu(title: "Окно"); windowRoot.submenu = windowMenu
+        windowMenu.addItem(NSMenuItem(title: "Свернуть", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        windowMenu.addItem(NSMenuItem(title: "Увеличить", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(NSMenuItem(title: "Закрыть", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(NSMenuItem(title: "Все окна — на передний план", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
+        NSApplication.shared.windowsMenu = windowMenu
         NSApplication.shared.mainMenu = appMenu
     }
 
     @objc func showWindow() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     @objc func stopGuard() { model.stop() }
-    @objc func restartGuard() { model.restart() }
+    @objc func restartGuard() {
+        guard !model.restarting else { return }
+        if model.monitoring || model.claudeRunning || model.busy {
+            guard confirmRestartDialog() else { return }
+        }
+        model.restart()
+    }
     private func restartApplication() {
         model.shutdown()
         do {

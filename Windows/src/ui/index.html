@@ -18,6 +18,7 @@
       <button id="restart" type="button" class="secondary" aria-label="Перезапустить Guard" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#restart"/></svg><span>Перезапустить</span></button>
     </div>
     <p id="actionReason" class="hint">Запуск проверяет подключение. Перезапуск заново открывает Guard и закрывает его сессию Claude.</p>
+    <div id="restartConfirm" class="notice confirm-row" role="group" aria-label="Подтверждение перезапуска" hidden><span id="restartConfirmText">Перезапуск закроет текущую сессию Claude, пароль прокси потребуется ввести снова.</span><button id="restartConfirmYes" type="button" class="primary" aria-describedby="restartConfirmText">Перезапустить</button><button id="restartConfirmNo" type="button" class="secondary">Отмена</button></div>
     <div id="activity" class="activity" role="progressbar" aria-label="Выполняется действие Guard" hidden><span class="spinner" aria-hidden="true"></span><span id="activityText">Дождитесь завершения действия.</span></div>
     <p id="lastOperation" class="operation-result" role="status">Последняя операция: действий ещё не было.</p>
   </section>

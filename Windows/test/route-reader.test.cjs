@@ -126,7 +126,7 @@ async function smoke(routeFailure) {
     async loadFile() {}
   }
   const mocks = {
-    electron: { app, BrowserWindow: Window, ipcMain: { handle() {} }, dialog: { showErrorBox() {} }, powerMonitor: { on() {} } },
+    electron: { app, BrowserWindow: Window, ipcMain: { handle() {} }, dialog: { showErrorBox() {} }, powerMonitor: { on() {} }, nativeTheme: { shouldUseDarkColors: true } },
     'node:fs': { writeFileSync: (_file, value) => { receipt = JSON.parse(value); } },
     './controller.cjs': { GuardController: Controller }, './discovery.cjs': {}, './runtime.cjs': {}, './policy.cjs': {},
     './sanitize.cjs': { diagnostic: value => value }, './deep-link.cjs': { takeDeepLinkFromArgv: () => ({ hadLink: false }) },
