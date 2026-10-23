@@ -9,6 +9,7 @@ const decompressZstd = typeof zlib.zstdDecompress === 'function' ? promisify(zli
 const { sha256: hash } = require('./async-bytes.cjs');
 const { parseArchive } = require('./asar.cjs');
 const { findManagedCliSDK, SDK_SHA256 } = require('./managed-cli-patch.cjs');
+const { createPreparationProgress } = require('./preparation-progress.cjs');
 const MAX_CLI_BYTES = 512 * 1024 * 1024;
 const SOURCE_POLICY = Object.freeze({ desktopVersion: '3.1623.0', codeVersion: '2.1.304', platform: 'win32-x64',
   compressedSize: 104965652, compressedSHA256: 'aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81',
@@ -27,11 +28,14 @@ async function inspectSource(archiveBytes, policy) {
       findManagedCliSDK(archive).sha256 !== policy.sdkSHA256 || await hash(archive.read(policy.mainFile)) !== policy.mainSHA256) throw fail();
 }
 function samePath(a, b) { return process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b); }
-async function prepareCodeFiles(runtime, sourcePath, guardRoot, resources, testdeps = {}, assets) {
+// Keep the observer separate from fixture dependencies and the exact asset
+// schema. `ready` means files/profile prepared; network authorization is later.
+async function prepareCodeFiles(runtime, sourcePath, guardRoot, resources, testdeps = {}, assets, options = {}) {
   const fs = testdeps.fs || rawFS, run = testdeps.runFile || runFile, decompress = testdeps.decompress || decompressZstd;
   // Dependency injection is for owned unit fixtures; production supplies no overrides.
   const policy = testdeps.sourcePolicy || SOURCE_POLICY, inspect = testdeps.inspectSource || inspectSource;
   const randomBytes = testdeps.randomBytes || crypto.randomBytes;
+  const progress = createPreparationProgress(options);
   let createdProfile = false, containerName, hostPath, staging;
   async function safePath(file, directory, maxSize = Infinity) {
     if (!path.isAbsolute(file)) throw fail();
@@ -60,9 +64,12 @@ async function prepareCodeFiles(runtime, sourcePath, guardRoot, resources, testd
     if (!path.isAbsolute(sourcePath) || path.basename(sourcePath).toLowerCase() !== 'claude.exe' || !path.isAbsolute(guardRoot) || !path.isAbsolute(resources) || !path.isAbsolute(runtime.executable)) throw fail();
     await safePath(sourcePath, false); await safePath(runtime.executable, false); await safePath(guardRoot, true);
     const sourceDirectory = path.dirname(sourcePath), archivePath = path.join(sourceDirectory, 'resources', 'app.asar');
+    progress.begin('claude-code', 'source-verify', 1);
     await inspect(await read(archivePath, 128 * 1024 * 1024), policy); // Reject unsupported releases before a large decompression or filesystem writes.
+    progress.complete(); progress.begin('claude-code', 'host-verify', 1);
     hostPath = await safePath(path.join(resources, 'CodeHost.exe'), false, 16 * 1024 * 1024);
     validatePE(await fs.readFile(hostPath));
+    progress.complete();
     // Store packages omit the optional vendor preseed. Release preparation may
     // supply the same pinned bytes beside CodeHost; startup never downloads or
     // reads a writable Profile copy. Only absence permits the sidecar fallback.
@@ -79,36 +86,49 @@ async function prepareCodeFiles(runtime, sourcePath, guardRoot, resources, testd
         compressedPath = path.join(resources, 'NativeCode', policy.platform + '.zst');
       }
     }
+    progress.begin('claude-code', 'asset-verify', 1);
     const compressed = await read(compressedPath, policy.compressedSize);
     if (compressed.length !== policy.compressedSize || await hash(compressed) !== policy.compressedSHA256) throw fail();
-    const executableBytes = validatePE(await decompress(compressed, { maxOutputLength: MAX_CLI_BYTES })), executableSHA256 = await hash(executableBytes);
+    progress.complete(); progress.begin('claude-code', 'decompress', 1);
+    const executableBytes = validatePE(await decompress(compressed, { maxOutputLength: MAX_CLI_BYTES }));
+    progress.complete(); progress.begin('claude-code', 'executable-verify', 1);
+    const executableSHA256 = await hash(executableBytes);
     if (executableBytes.length !== policy.executableSize || executableSHA256 !== policy.executableSHA256) throw fail();
+    progress.complete();
     const codeBin = await directory(path.join(guardRoot, 'CodeBin')), target = path.join(codeBin, executableSHA256), executable = path.join(target, 'claude.exe');
     const manifestPayload = { version: 1, desktopVersion: policy.desktopVersion, codeVersion: policy.codeVersion, compressedSHA256: policy.compressedSHA256, sdkSHA256: policy.sdkSHA256, mainSHA256: policy.mainSHA256, executableSHA256, executableSize: executableBytes.length };
     const manifest = { ...manifestPayload, manifestSHA256: await hash(Buffer.from(JSON.stringify(manifestPayload))) }, manifestBytes = Buffer.from(JSON.stringify(manifest));
     let exists = false;
     try { await fs.lstat(target); exists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (exists) {
+      progress.begin('claude-code', 'cache-verify', 2);
       await safePath(target, true);
       const names = await fs.readdir(target); if (names.length !== 2 || !names.includes('claude.exe') || !names.includes('guard-code-manifest.json')) throw fail();
       const saved = await read(path.join(target, 'guard-code-manifest.json'), 16384), actual = validatePE(await read(executable, MAX_CLI_BYTES));
       if (!saved.equals(manifestBytes) || actual.length !== executableBytes.length || await hash(actual) !== executableSHA256) throw fail();
+      progress.complete();
     } else {
+      progress.begin('claude-code', 'publish', 2);
       staging = path.join(codeBin, 'Preparing-' + randomBytes(16).toString('hex'));
       await fs.mkdir(staging, { recursive: false, mode: 0o700 }); await safePath(staging, true);
       await fs.writeFile(path.join(staging, 'claude.exe'), executableBytes, { flag: 'wx', mode: 0o600 });
+      progress.update(1);
       await fs.writeFile(path.join(staging, 'guard-code-manifest.json'), manifestBytes, { flag: 'wx', mode: 0o600 });
       await fs.rename(staging, target); staging = undefined;
+      progress.complete(); progress.begin('claude-code', 'target-verify', 1);
       await safePath(target, true); if (await hash(await read(executable, MAX_CLI_BYTES)) !== executableSHA256) throw fail();
+      progress.complete();
     }
     const stateRoot = await directory(path.join(guardRoot, 'CodeState')), workspaceRoot = await directory(path.join(stateRoot, 'Workspace'));
     containerName = 'gate-code-' + randomBytes(12).toString('hex');
     if (!/^gate-code-[a-f0-9]{24}$/.test(containerName)) throw fail();
     createdProfile = true;
+    progress.begin('claude-code', 'profile-create', 1);
     const result = await run(hostPath, ['--create-profile', containerName], { windowsHide: true, timeout: 15000, maxBuffer: 4096 });
     if (typeof result?.stdout !== 'string' || result.stdout.length > 2048) throw fail();
     const profile = JSON.parse(result.stdout.replace(/^\uFEFF/, '').trim()), containerSid = profile.sid;
     if (!/^S-1-15-2-(?:\d+-){6}\d+$/.test(containerSid || '')) throw fail();
+    progress.complete(); progress.begin('claude-code', 'ready', 1); progress.complete();
     return { hostPath, stateRoot, workspaceRoot, runtimeExecutable: runtime.executable, containerName, containerSid,
       approved: [{ path: executable, sha256: executableSHA256, requestedPath: path.join(guardRoot, 'Profile', 'claude-code', policy.codeVersion, policy.compressedSHA256.slice(0, 12), 'claude.exe') }],
       cleanupProfile: deleteProfile };

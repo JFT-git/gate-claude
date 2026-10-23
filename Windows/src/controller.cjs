@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
 const { SOCKSRelay, NetworkRelay } = require('./relay.cjs');
-const { initialIP, currentIP, queryDestinationIP } = require('./ip-check.cjs');
+const { initialIP, currentIP, queryDestinationIP, NetworkCheckError } = require('./ip-check.cjs');
 const { readSystemProxy } = require('./system-proxy.cjs');
 const { prepareRuntime } = require('./runtime.cjs');
 const { Channel } = require('./channel.cjs');
@@ -25,7 +25,7 @@ const DESTINATIONS = Object.freeze(['claude.ai', 'api.anthropic.com']);
 class GuardController extends EventEmitter {
   constructor(root, resources) {
     super(); this.codeCleanups = new WeakMap(); this.codeStatePreparations = new WeakMap();
-    this.destinationPolicies = new Map(); this.destinationRequests = new Map();
+    this.destinationPolicies = new Map(); this.destinationRequests = new Map(); this.probeFailures = new Map();
     this.deepLinks = new DeepLinkInbox({
       active: () => !this.policy?.blocked && !!this.policy?.pinned && ['starting', 'running', 'rechecking'].includes(this.state) && !!this.host && this.host.exitCode == null && !this.host.killed && !!this.channel && !this.channel.closed,
       ready: () => this.deepLinkReady === true && this.state !== 'rechecking' && !!this.channel?.socket,
@@ -47,12 +47,50 @@ class GuardController extends EventEmitter {
     } catch { /* A full/unavailable disk must not keep the runtime alive after a block. */ }
     this.emit('log', event);
   }
+  reportProbeFailure(source, error, elapsedMS) {
+    if (!['geo', 'public', 'claude.ai', 'api.anthropic.com', 'proxy'].includes(source)) return;
+    // Only diagnostics created by our checker cross this boundary. Never log a
+    // TLS/HTTP/registry error's message, cause, headers, payload or address.
+    const typed = typeof NetworkCheckError === 'function' && error instanceof NetworkCheckError;
+    const code = typed && /^(?:TIMEOUT|CONNECT|TLS|HTTP_STATUS|HEADERS|SIZE|BODY|ABORTED|RESPONSE|REQUEST|INVALID_ARGUMENT)$/.test(error.code) ? error.code : 'UNCONFIRMED';
+    const phase = typed && /^(?:arguments|connect|tls|request|headers|body|response)$/.test(error.phase) ? error.phase : 'check';
+    const http = typed && Number.isInteger(error.httpStatus) && error.httpStatus >= 100 && error.httpStatus <= 599 ? error.httpStatus : null;
+    const now = performance.now(), key = [source, code, phase, http].join(':');
+    if (this.probeFailures.has(key) && now - this.probeFailures.get(key) < 30000) return;
+    this.probeFailures.set(key, now);
+    while (this.probeFailures.size > 32) this.probeFailures.delete(this.probeFailures.keys().next().value);
+    const duration = Number.isFinite(elapsedMS) ? Math.max(0, Math.min(600000, Math.round(elapsedMS))) : 0;
+    this.log('Проверка сети: ' + source + ' · ' + code + ' · ' + phase + (http === null ? '' : ' · HTTP ' + http) + ' · ' + duration + ' мс.', 'warning');
+  }
+  preparationProgress(value) {
+    const tools = { 'claude-code': 'Claude Code', tools: 'Git и PowerShell', git: 'Git', powershell: 'PowerShell' };
+    const stages = {
+      'source-verify': 'Проверяем исходное приложение', 'host-verify': 'Проверяем запуск защиты',
+      'asset-verify': 'Проверяем комплект', decompress: 'Распаковываем комплект',
+      'executable-verify': 'Проверяем программу', 'cache-verify': 'Проверяем сохранённые файлы',
+      publish: 'Сохраняем проверенные файлы', 'target-verify': 'Проверяем установленные файлы',
+      'profile-create': 'Готовим изоляцию', ready: 'Файлы готовы',
+      'policy-verify': 'Проверяем список файлов', 'archive-read': 'Читаем комплект',
+      'archive-verify': 'Проверяем комплект', 'archive-index': 'Проверяем структуру комплекта',
+      extract: 'Подготавливаем файлы', 'staging-verify': 'Проверяем подготовленные файлы'
+    };
+    if (!value || !Object.hasOwn(tools, value.toolId) || !Object.hasOwn(stages, value.stage) ||
+        !Number.isSafeInteger(value.done) || !Number.isSafeInteger(value.total) || value.done < 0 ||
+        value.total < value.done || value.total > 100000 || !Number.isFinite(value.elapsedMS) || value.elapsedMS < 0) return;
+    const label = stages[value.stage] + ' · ' + tools[value.toolId];
+    const stage = value.toolId + ':' + value.stage;
+    if (this.preparationStage !== stage) {
+      this.preparationStage = stage;
+      this.log('Подготовка: ' + label + ' · ' + Math.min(86400000, Math.round(value.elapsedMS)) + ' мс.');
+    }
+    if (this.state !== 'rechecking') this.status(label + (value.total > 1 ? ' · ' + value.done + ' / ' + value.total : '') + '…');
+  }
   deliverDeepLink(url) { return this.deepLinks.accept(url); }
   async start(input) {
     this.policy.assertAvailable();
     if (this.state !== 'idle') throw Error('Guard уже работает.');
     const settings = validateSettings(input); this.settings = settings;
-    this.deepLinks.clear(); this.deepLinkReady = false;
+    this.deepLinks.clear(); this.deepLinkReady = false; this.probeFailures.clear(); this.preparationStage = null;
     const epoch = ++this.epoch, active = () => this.epoch === epoch && !this.policy.blocked && this.state !== 'idle';
     let code = null; this.codeFenceRequested = false; this.runtimePID = null;
     this.codePreparationPending = settings.codeEnabled === true; this.codePreparationEpoch = epoch;
@@ -122,17 +160,21 @@ class GuardController extends EventEmitter {
             } finally { if (this.codeAssetAbort === abort) this.codeAssetAbort = null; }
           }
           if (!active()) return;
-          code = await prepareCodeFiles(this.runtime, settings.claudePath, this.root, this.resources, undefined, { nativeAssetPath: asset.path });
+          const progress = { onProgress: value => { if (active()) this.preparationProgress(value); } };
+          code = await prepareCodeFiles(this.runtime, settings.claudePath, this.root, this.resources, undefined, { nativeAssetPath: asset.path }, progress);
           if (active()) {
             this.codePrepared = code;
             const tools = await prepareCodeTools(this.root, this.resources, {
               gitArchive: path.join(this.resources, 'CodeTools', CODE_TOOLS_POLICY.git.archiveName),
               powerShellArchive: path.join(this.resources, 'CodeTools', CODE_TOOLS_POLICY.powershell.archiveName)
-            });
+            }, undefined, progress);
             if (active()) {
               code.toolRoots = tools.toolRoots.slice();
               code.tools = Object.freeze({ environment: Object.freeze({ ...tools.environment }) });
+              if (this.state !== 'rechecking') this.status('Готовим права постоянной рабочей папки Claude Code…');
+              const stateStarted = performance.now();
               await this.prepareCodeState(code);
+              if (active()) this.log('Постоянная рабочая папка Claude Code подготовлена · ' + Math.round(performance.now() - stateStarted) + ' мс.');
             }
           }
           if (!active()) { await this.cleanupCodeProfile(code); return; }
@@ -365,10 +407,10 @@ class GuardController extends EventEmitter {
     const active = () => this.epoch === epoch && !this.policy.blocked && !!this.relay;
     if (!active()) return false;
     if (this.settings?.mode !== 'network') return true;
-    let current;
+    let current; const started = performance.now();
     try { current = await this.networkProxyConfiguration(); }
-    catch {
-      if (active()) this.pauseForRevalidation('Не удалось подтвердить настройки прокси Windows. Повторяем проверку.', false);
+    catch (error) {
+      if (active()) { this.reportProbeFailure('proxy', error, performance.now() - started); this.pauseForRevalidation('Не удалось подтвердить настройки прокси Windows. Повторяем проверку.', false); }
       return false;
     }
     if (!active()) return false;
@@ -384,9 +426,14 @@ class GuardController extends EventEmitter {
       if (this.epoch !== epoch) throw Error('Проверка отменена.');
     }
     if (this.epoch !== epoch) throw Error('Проверка отменена.');
+    const started = performance.now();
     const request = Promise.resolve().then(() => queryDestinationIP(port, token, hostname, net.isIP(this.policy.pinned || '')));
     this.destinationRequests.set(hostname, request);
     try { return await request; }
+    catch (error) {
+      if (this.epoch === epoch && !this.policy.blocked && this.relay) this.reportProbeFailure(hostname, error, performance.now() - started);
+      throw error;
+    }
     finally { if (this.destinationRequests.get(hostname) === request) this.destinationRequests.delete(hostname); }
   }
   async queryDestinations(epoch, port, token, pin = false) {
@@ -463,8 +510,13 @@ class GuardController extends EventEmitter {
       if (this.epoch !== epoch) throw Error('Проверка отменена.');
     }
     if (this.epoch !== epoch) throw Error('Проверка отменена.');
+    const started = performance.now();
     const request = Promise.resolve().then(() => check(port, token, require('node:net').isIP(this.policy.pinned || ''))); this.ipRequest = request;
     try { return await request; }
+    catch (error) {
+      if (this.epoch === epoch && !this.policy.blocked && this.relay) this.reportProbeFailure(check === initialIP ? 'geo' : 'public', error, performance.now() - started);
+      throw error;
+    }
     finally { if (this.ipRequest === request) this.ipRequest = null; }
   }
   schedulePoll(epoch, delay) {

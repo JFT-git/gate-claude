@@ -173,7 +173,10 @@ test('Code downloads only after pinning, prepares before WFP, and launches only 
   assert.ok(c.events.indexOf('fence-prepare') < c.events.lastIndexOf('current-ip'));
   assert.ok(c.events.lastIndexOf('current-ip') < c.events.indexOf('runtime-spawn'));
   assert.equal(c.ipChecks, 3); assert.equal(c.assetArguments[0], c.controller.root); assert.equal(c.assetArguments[1], c.relay.port);
-  assert.deepEqual(c.codeFileArguments.slice(4), [undefined, { nativeAssetPath: c.assetPath }]);
+  assert.deepEqual(c.codeFileArguments.slice(4, 6), [undefined, { nativeAssetPath: c.assetPath }]);
+  assert.equal(typeof c.codeFileArguments[6].onProgress, 'function');
+  assert.equal(c.toolArguments[3], undefined, 'Production must not supply test dependencies');
+  assert.equal(c.toolArguments[4], c.codeFileArguments[6], 'Code and tools share the current preparation observer');
   const config = JSON.parse(c.runtimeEnvironment.PROXY_GUARD_CONFIG);
   assert.deepEqual(config.code.tools, { environment: c.tools.environment });
   assert.equal(Object.isFrozen(c.code.tools), true); assert.equal(Object.isFrozen(c.code.tools.environment), true);
@@ -181,6 +184,15 @@ test('Code downloads only after pinning, prepares before WFP, and launches only 
   assert.equal(config.code.relayURL, 'http://127.0.0.1:12345'); assert.match(config.code.codeJobName, /^Global\\gate-code-job-[a-f0-9]{32}$/);
   assert.equal(c.fenceOptions.code.codeJobName, config.code.codeJobName); assert.equal(c.fenceOptions.code.relayExecutable, process.execPath);
   assert.ok(!Object.hasOwn(config.code, 'cleanupProfile')); assert.ok(!c.runtimeEnvironment.PROXY_GUARD_CONFIG.includes('cleanupProfile'));
+});
+test('late preparation observations cannot change a stopped session or imply that protection is ready', async t => {
+  const c = await fixture(t); await c.controller.start(input);
+  const report = c.codeFileArguments[6].onProgress;
+  c.controller.stop(); const previous = c.controller.snapshot(), count = c.controller.events.length;
+  report({ toolId: 'tools', stage: 'ready', done: 2, total: 2, elapsedMS: 500 });
+  assert.deepEqual(c.controller.snapshot(), previous);
+  assert.equal(c.controller.events.length, count);
+  assert.equal(c.hostSpawns, 1);
 });
 test('CodeGate is active only for the current runtime, matching fence proof, pinned IP and open relay', async t => {
   const c = await fixture(t); await c.controller.start(input); const controller = c.controller;
