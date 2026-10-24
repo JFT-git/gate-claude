@@ -27,6 +27,99 @@ enum RuntimePreparer {
         try task.run(); task.waitUntilExit(); return task.terminationStatus
     }
 
+    /// Stable local codesigning identity for runtime copies. Ad-hoc signatures
+    /// (`codesign --sign -`) produce a designated requirement of the bare cdhash,
+    /// so every rebuilt runtime became a DIFFERENT Keychain identity: the Chromium
+    /// Safe Storage cookie key created by the previous copy was no longer readable
+    /// and the profile's session was lost — a re-login after every rebuild. A
+    /// persistent self-signed identity keeps the requirement (identifier + leaf
+    /// certificate hash) constant, so Keychain access survives all future rebuilds.
+    static let signingIdentityName = "Claude Proxy Guard Local Runtime"
+
+    private static func capture(_ executable: String, _ arguments: [String]) -> (Int32, String) {
+        let task = Process(); let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: executable); task.arguments = arguments
+        task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return (-1, "") }
+        // Drain stdout BEFORE waiting: a child whose output exceeds the pipe
+        // buffer blocks on write and would never exit (deadlock, with the
+        // signing flock still held).
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        return (task.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// SHA-1 fingerprints of codesigning identities whose keychain label is
+    /// exactly `name`. find-identity -v prints one line per identity:
+    /// `  1) <40 hex> "<label>" (CSSMERR_TP_NOT_TRUSTED)`.
+    private static func identityFingerprints(matching name: String) -> [String] {
+        let (status, output) = capture("/usr/bin/security", ["find-identity", "-p", "codesigning", "-v"])
+        guard status == 0 else { return [] }
+        var result: [String] = []
+        for line in output.split(separator: "\n") {
+            guard line.contains("\"\(name)\""),
+                  let range = line.range(of: #"[0-9A-Fa-f]{40}"#, options: .regularExpression) else { continue }
+            result.append(String(line[range]).uppercased())
+        }
+        return result
+    }
+
+    private static func certificateFingerprint(certPEM: String) -> String? {
+        let (status, output) = capture("/usr/bin/openssl", ["x509", "-in", certPEM, "-noout", "-fingerprint", "-sha1"])
+        guard status == 0, let value = output.split(separator: "=").last else { return nil }
+        return value.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ":", with: "").uppercased()
+    }
+
+    /// Returns the SHA-1 fingerprint of the stable identity, creating it once in
+    /// the login keychain. nil falls back to ad-hoc signing (previous behavior).
+    /// Never throws: signing must not fail the prepare just because identity
+    /// creation was unavailable.
+    ///
+    /// The fingerprint — not the display name — is what gets passed to codesign:
+    /// a name lookup becomes permanently ambiguous if concurrent preparations
+    /// ever import two certificates with the same label, while a fingerprint
+    /// always selects exactly one certificate. Lookup/create/import runs under
+    /// an flock on the runtime root so concurrent preparations (even across app
+    /// instances) cannot duplicate the identity; if duplicates already exist,
+    /// the lowest fingerprint wins deterministically so every instance converges
+    /// on the same certificate.
+    static func ensureSigningIdentity(root: URL) -> String? {
+        #if GUARD_E2E
+        return nil // Tests keep the ad-hoc path and never touch the keychain.
+        #else
+        let name = signingIdentityName
+        let lockFD = open(root.appendingPathComponent("Signing.lock").path, O_CREAT | O_RDWR, 0o600)
+        guard lockFD >= 0 else { return nil }
+        defer { close(lockFD) } // closing releases the flock
+        guard flock(lockFD, LOCK_EX) == 0 else { return nil }
+        let existing = identityFingerprints(matching: name)
+        if !existing.isEmpty { return existing.sorted().first! }
+        let work = root.appendingPathComponent("Signing-" + UUID().uuidString.lowercased(), isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            defer { try? FileManager.default.removeItem(at: work) }
+            let password = UUID().uuidString.lowercased() + UUID().uuidString.lowercased()
+            guard try run("/usr/bin/openssl", ["req", "-x509", "-newkey", "rsa:2048",
+                                               "-keyout", work.appendingPathComponent("key.pem").path,
+                                               "-out", work.appendingPathComponent("cert.pem").path,
+                                               "-days", "3650", "-nodes", "-subj", "/CN=\(name)",
+                                               "-addext", "extendedKeyUsage=codeSigning",
+                                               "-addext", "basicConstraints=critical,CA:TRUE",
+                                               "-addext", "keyUsage=critical,digitalSignature,keyCertSign"]) == 0,
+                  try run("/usr/bin/openssl", ["pkcs12", "-export",
+                                               "-out", work.appendingPathComponent("id.p12").path,
+                                               "-inkey", work.appendingPathComponent("key.pem").path,
+                                               "-in", work.appendingPathComponent("cert.pem").path,
+                                               "-passout", "pass:" + password]) == 0,
+                  try run("/usr/bin/security", ["import", work.appendingPathComponent("id.p12").path,
+                                                "-P", password, "-T", "/usr/bin/codesign"]) == 0,
+                  let fingerprint = certificateFingerprint(certPEM: work.appendingPathComponent("cert.pem").path),
+                  identityFingerprints(matching: name).contains(fingerprint) else { return nil }
+            return fingerprint
+        } catch { return nil }
+        #endif
+    }
+
     static func prepareSync(source: URL, bootstrapURL: URL, cacheRoot: URL?) throws -> PreparedRuntime {
         let fm = FileManager.default
         guard let sourceBundle = Bundle(url: source), sourceBundle.bundleIdentifier == "com.anthropic.claudefordesktop",
@@ -72,7 +165,10 @@ enum RuntimePreparer {
         info["CFBundleIdentifier"] = identifier
         // Keep the original bundle filename/name so Electron can locate its helper executables.
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: infoURL, options: .atomic)
-        guard try run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", "--options", "0", copy.path]) == 0,
+        let identity = ensureSigningIdentity(root: root)
+        var signArguments = ["--force", "--deep", "--sign", identity ?? "-", "--options", "0"]
+        if identity != nil { signArguments.append("--timestamp=none") } // self-signed: no timestamp server
+        guard try run("/usr/bin/codesign", signArguments + [copy.path]) == 0,
               try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", copy.path]) == 0 else {
             throw GuardError.message("Не удалось подписать локальную копию Claude. Исходник не изменён.")
         }

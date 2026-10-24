@@ -3,6 +3,15 @@ import AppKit
 import Network
 import Darwin
 
+/// Bookkeeping for a gracefully draining runtime tree. The identity guards
+/// late completions: a stale cleanup must not clear a newer drain's state.
+private struct RuntimeDrain {
+    let id = UUID()
+    let process: Process
+    let group: Int32?
+    let path: String
+}
+
 @MainActor
 final class GuardModel: ObservableObject {
     @Published var useProxy = true
@@ -20,6 +29,10 @@ final class GuardModel: ObservableObject {
     private var barrierEnvURL: URL?
     private var barrierLaunched = false
     private var sessionNetworkMode = false
+    // While a previous runtime tree is still draining (graceful stop grace
+    // window), a fresh launch must wait for the cleanup to finish or it trips
+    // the profile singleton lock and races the straggler sweep.
+    private var runtimeDrain: RuntimeDrain?
     @Published var timezone = "Europe/Amsterdam"
     @Published var language = "en-US"
     @Published var inspectPages = true
@@ -361,9 +374,10 @@ final class GuardModel: ObservableObject {
                     let wasSuspended = self.policy.suspended
                     // A removed packet-filter barrier reopens direct egress for the
                     // whole Claude tree. The tree must not keep running uncontained:
-                    // kill it first, then treat the loss like a route change.
+                    // kill it immediately (no graceful window), then treat the loss
+                    // like a route change.
                     if self.barrierArmed, !self.currentBarrierProbe().active {
-                        self.stopOwnedClaude()
+                        self.stopOwnedClaude(graceful: false)
                         self.barrierLaunched = false
                         throw GuardError.message("Сетевой барьер отключён во время сессии. Claude остановлен.")
                     }
@@ -556,6 +570,21 @@ final class GuardModel: ObservableObject {
             defer { password = ""; if operation == token { launchPending = false; busy = revalidationTask != nil } }
             var checkingRoute = false
             do {
+                // A previous runtime may still be flushing its profile after a
+                // graceful stop; wait for the cleanup to actually finish before
+                // preparing a new copy, so neither the Chromium singleton lock
+                // nor the straggler sweep can hit the fresh launch. Bounded: a
+                // stuck teardown fails this attempt (and is force-killed by the
+                // teardown path) instead of overlapping the new launch.
+                var drainRounds = 0
+                while runtimeDrain != nil, drainRounds < 60, operation == token {
+                    drainRounds += 1
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                guard operation == token else { return }
+                guard runtimeDrain == nil else {
+                    throw GuardError.message("Предыдущая копия Claude ещё завершается. Повторите запуск через несколько секунд.")
+                }
                 let source = URL(fileURLWithPath: claudePath).standardizedFileURL.resolvingSymlinksInPath()
                 var bootstrap = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/RuntimeBootstrap.cjs")
                 var cacheRoot: URL?
@@ -753,6 +782,11 @@ final class GuardModel: ObservableObject {
         deepLinkInbox.clear()
         childBundleURL = nil
         password = ""
+        // A manual stop of a barrier-contained session may drain gracefully so
+        // Chromium can flush its profile; every security stop (route change,
+        // latch, barrier loss, crash) kills the tree immediately — while the
+        // barrier state is uncertain the tree must not get a window to run in.
+        let contained = barrierArmed
         clearBarrierEnvironment(); barrierArmed = false
         sessionNetworkMode = false
         if latch { policy.latch(reason) }
@@ -767,7 +801,7 @@ final class GuardModel: ObservableObject {
         networkWatcher?.stop(); networkWatcher = nil
         // Keep barrierLaunched until the tree is dead: stopOwnedClaude needs it to
         // choose the process-group kill path for the sudo-launched chain.
-        stopOwnedClaude()
+        stopOwnedClaude(graceful: manual && contained)
         barrierLaunched = false
         monitoring = false; allowed = false; busy = false
         if !requiresRestart { policy.manualStop() }
@@ -780,25 +814,79 @@ final class GuardModel: ObservableObject {
         }
         appendLog(reason)
     }
-    private func stopOwnedClaude() {
+    /// Force-terminates every GUI app whose executable lives under the runtime copy.
+    private func sweepRuntimeApps(path: String) {
+        for app in NSWorkspace.shared.runningApplications {
+            if let url = app.executableURL, url.standardizedFileURL.resolvingSymlinksInPath().path.hasPrefix(path + "/") { app.forceTerminate() }
+        }
+    }
+    /// Immediately kills a still-draining tree and finishes its cleanup. Used
+    /// when a security stop lands while an earlier graceful stop is draining:
+    /// once containment is in doubt the old tree loses the rest of its window.
+    private func escalateDrain(_ pending: RuntimeDrain) {
+        if let group = pending.group { kill(-group, SIGKILL) }
+        if pending.process.isRunning { kill(pending.process.processIdentifier, SIGKILL) }
+        sweepRuntimeApps(path: pending.path)
+        runtimeDrain = nil
+    }
+    private func stopOwnedClaude(graceful: Bool) {
+        if !graceful, let pending = runtimeDrain { escalateDrain(pending) }
         guard let path = activePath else { return }
         process?.terminationHandler = nil
         if let process, process.isRunning {
             let pid = process.processIdentifier
+            // Discover the runtime's process group BEFORE signalling anything:
+            // once the leader dies the parent relationship is gone. With the
+            // barrier the visible child is sudo and the runtime execs through
+            // GuardDrop and GuardHost into its own group led by sudo's only
+            // child; without it GuardHost itself leads an independent group.
+            var group: Int32?
             if barrierLaunched {
-                // The visible child is sudo; the runtime execs through GuardDrop and
-                // GuardHost into its own process group led by sudo's only child.
-                // Discover that group BEFORE signalling sudo — once sudo dies the
-                // parent relationship is gone — then signal the group so MCP and
-                // helper processes cannot linger.
-                let leader = childProcessGroup(of: pid)
+                group = childProcessGroup(of: pid)
+            } else if getpgid(pid) == pid {
+                group = pid // never signal our own group: only an independent one
+            }
+            if graceful {
+                // Chromium flushes cookies and localStorage asynchronously; an
+                // instant SIGKILL discards the freshly written session (the
+                // "log in every launch" symptom). Terminate politely first,
+                // give the tree a short grace window, then force-kill any
+                // survivor. Only used for contained sessions (manual stop with
+                // the barrier armed) — security stops kill immediately below.
+                if barrierLaunched { process.terminate() }
+                else if group != nil { kill(-pid, SIGTERM) }
+                else { process.terminate() }
+                let draining = process
+                let record = RuntimeDrain(process: draining, group: group, path: path)
+                runtimeDrain = record
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    for _ in 0..<30 where draining.isRunning { Thread.sleep(forTimeInterval: 0.1) }
+                    // Kill the group unconditionally: descendants must not escape
+                    // cleanup just because the tracked parent already exited.
+                    // kill on a dead group is a harmless ESRCH no-op.
+                    if let group { kill(-group, SIGKILL) }
+                    if draining.isRunning { kill(draining.processIdentifier, SIGKILL) }
+                    DispatchQueue.main.async { [weak self] in
+                        // Complete only if this drain still owns the record: a
+                        // security stop may have escalated it, and a newer stop
+                        // may have replaced it.
+                        guard let self, self.runtimeDrain?.id == record.id else { return }
+                        // A new launch may have started while draining; never
+                        // sweep a live session's runtime.
+                        if self.activePath == nil { self.sweepRuntimeApps(path: record.path) }
+                        self.runtimeDrain = nil
+                    }
+                }
+            } else {
+                // Security stop: the tree dies now. Containment may be gone or
+                // unproven, so no graceful window is afforded.
                 process.terminate()
-                if let leader { kill(-leader, SIGKILL) }
-            // GuardHost creates an independent process group; never signal our own group.
-            } else if getpgid(pid) == pid { kill(-pid, SIGKILL) } else { process.terminate() }
-        }
-        for app in NSWorkspace.shared.runningApplications {
-            if let url = app.executableURL, url.standardizedFileURL.resolvingSymlinksInPath().path.hasPrefix(path + "/") { app.forceTerminate() }
+                if let group { kill(-group, SIGKILL) }
+                if process.isRunning { kill(pid, SIGKILL) }
+                sweepRuntimeApps(path: path)
+            }
+        } else {
+            sweepRuntimeApps(path: path)
         }
         process = nil; activePath = nil; claudeRunning = false
     }
@@ -809,9 +897,10 @@ final class GuardModel: ObservableObject {
         task.arguments = ["-P", String(sudoPID)]
         task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
         do { try task.run() } catch { return nil }
+        // Drain stdout before waiting so a chatty child can never deadlock the pipe.
+        let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         task.waitUntilExit()
         guard task.terminationStatus == 0 else { return nil }
-        let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         guard let line = text.split(separator: "\n").first, let child = Int32(line), child > 1,
               getpgid(child) == child else { return nil }
         return child
@@ -843,7 +932,18 @@ final class GuardModel: ObservableObject {
             try encoder.encode(traffic).write(to: url, options: .atomic)
         } catch { appendLog("Не удалось экспортировать журнал: \(error.localizedDescription)") }
     }
-    func shutdown() { stop() }
+    func shutdown() {
+        stop()
+        // On app exit the background grace-killer dies with the process, so
+        // finish any graceful drain synchronously here: bounded wait, final
+        // kills, and the runtime-app sweep the queued callback cannot run.
+        // No runtime process may outlive Guard uncontained.
+        if let pending = runtimeDrain {
+            let deadline = Date().addingTimeInterval(2.5)
+            while pending.process.isRunning, Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+            escalateDrain(pending)
+        }
+    }
     func showDiagnostics() {
         diagnostics.record("event", "Журнал завершений открыт пользователем.")
         NSWorkspace.shared.activateFileViewerSelecting([diagnostics.url])
