@@ -48,6 +48,7 @@ enum NetworkBarrier {
     static func sudoersContent() -> String {
         "ALL ALL=(root) NOPASSWD: \(helperPath)\n" +
         "ALL ALL=(root) NOPASSWD: /sbin/pfctl -a claudeproxyguard -s rules\n" +
+        "ALL ALL=(root) NOPASSWD: /sbin/pfctl -s rules\n" +
         "ALL ALL=(root) NOPASSWD: /sbin/pfctl -s info\n"
     }
 
@@ -106,7 +107,15 @@ enum NetworkBarrier {
         ANCHOR="\(anchorPath)"
         [ -n "$HELPER_SRC" ] && [ -f "$HELPER_SRC" ] && [ -x "$HELPER_SRC" ] || { echo "helper source missing"; exit 1; }
         case "$HELPER_SRC" in *".."*) echo "bad helper source"; exit 1;; esac
-        ACTUAL="$(shasum -a 256 "$HELPER_SRC" | awk '{print $1}')"
+        # Stage through a root-owned private directory and hash the STAGED bytes:
+        # the bundle path is user-writable, so hashing the source and installing it
+        # later would leave a swap window. Whatever passes the hash check here is
+        # exactly what gets installed below.
+        STAGE="$(mktemp -d /tmp/cpguard-stage.XXXXXX)"
+        chmod 0700 "$STAGE"
+        trap 'rm -rf "$STAGE"' EXIT
+        cp "$HELPER_SRC" "$STAGE/helper"
+        ACTUAL="$(shasum -a 256 "$STAGE/helper" | awk '{print $1}')"
         [ "$ACTUAL" = "\(BarrierIntegrity.guardDropSHA256)" ] || { echo "helper hash mismatch"; exit 1; }
         if ! dscl . -read "/Groups/$GROUP" >/dev/null 2>&1; then
           GID=380
@@ -121,7 +130,7 @@ enum NetworkBarrier {
           dscl . -create "/Groups/$GROUP" RealName "Claude Proxy Guard network barrier"
           dscl . -create "/Groups/$GROUP" Password "*"
         fi
-        install -o root -g wheel -m 0755 "$HELPER_SRC" "$HELPER"
+        install -o root -g wheel -m 0755 "$STAGE/helper" "$HELPER"
         printf %s '\(base64(sudoersContent()))' | base64 -D > "$SUDOERS"
         chown root:wheel "$SUDOERS"; chmod 0440 "$SUDOERS"
         visudo -cf "$SUDOERS" >/dev/null
@@ -206,6 +215,12 @@ enum NetworkBarrier {
         }
         let pfProbe = run("/usr/bin/sudo", ["-n", "/sbin/pfctl", "-a", "claudeproxyguard", "-s", "rules"])
         guard pfProbe.status == 0, pfProbe.output.contains(blockLabel) else { return .broken("правила PF не загружены") }
+        // Rules inside a named anchor filter nothing unless the ACTIVE main
+        // ruleset invokes that anchor — verify the attachment too.
+        let mainProbe = run("/usr/bin/sudo", ["-n", "/sbin/pfctl", "-s", "rules"])
+        guard mainProbe.status == 0, mainProbe.output.contains("anchor \"claudeproxyguard\"") else {
+            return .broken("якорь PF не подключён к основному набору правил")
+        }
         return .active
     }
 

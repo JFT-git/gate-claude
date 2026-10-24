@@ -91,6 +91,12 @@ check('net-connect-string-port-loopback', () => { const s = net.connect('9', '12
 check('server-listen-external', () => assert.throws(() => net.createServer().listen({ host: '0.0.0.0', port: 0 }), /Guard blocked/));
 check('server-listen-no-host', () => assert.throws(() => net.createServer().listen(0), /Guard blocked/));
 check('server-listen-loopback', () => { const s = net.createServer(); s.listen(0, '127.0.0.1'); s.close(); });
+// Numeric strings are ports to Node, not unix paths: listen("0") would bind
+// every interface, and normalized-args arrays would skip the property checks.
+check('server-listen-numeric-string-no-host', () => assert.throws(() => net.createServer().listen('0'), /Guard blocked/));
+check('server-listen-numeric-string-loopback', () => { const s = net.createServer(); s.listen('0', '127.0.0.1'); s.close(); });
+check('net-connect-normalized-array-external', () => assert.throws(() => net.connect(net._normalizeArgs([{ host: '203.0.113.9', port: 443 }])), /Guard blocked/));
+check('net-connect-normalized-array-loopback', () => { const s = net.connect(net._normalizeArgs([{ host: '127.0.0.1', port: 9 }])); s.destroy(); });
 
 const tls = require('node:tls');
 check('tls-connect-external', () => assert.throws(() => tls.connect(443, '203.0.113.9'), /Guard blocked/));

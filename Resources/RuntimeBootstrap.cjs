@@ -72,7 +72,19 @@ function installNetworkHardening() {
   const literalLoopback = value => /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(String(value)) || String(value) === '::1';
   const originalConnect = net.Socket.prototype.connect;
   hook(net.Socket.prototype, 'connect', function (...args) {
-    const target = args[0];
+    let target = args[0];
+    if (Array.isArray(target)) {
+      // Node's _normalizeArgs turns every connect() form into
+      // [options, listener]; passing that array back in would skip the string
+      // and property checks below, so only validated object options may pass.
+      target = target[0];
+      if (!target || typeof target !== 'object') throw denied('net.Socket.connect');
+      if (target.path) return originalConnect.apply(this, args); // unix socket: local
+      // connect() without a host defaults to localhost; an explicit host must
+      // be a loopback literal.
+      if (!target.host || literalLoopback(target.host)) return originalConnect.apply(this, args);
+      throw denied('net.Socket.connect');
+    }
     if (typeof target === 'string') {
       if (target.startsWith('/')) return originalConnect.apply(this, args); // unix socket: local
       // Numeric-string port form: connect("443", "host").
@@ -82,6 +94,8 @@ function installNetworkHardening() {
     }
     if (target && typeof target === 'object') {
       if (target.path) return originalConnect.apply(this, args); // unix socket: local
+      // connect() without a host defaults to localhost; an explicit host must
+      // be a loopback literal.
       if (!target.host || literalLoopback(target.host)) return originalConnect.apply(this, args);
       throw denied('net.Socket.connect');
     }
@@ -94,7 +108,9 @@ function installNetworkHardening() {
   const originalListen = net.Server.prototype.listen;
   hook(net.Server.prototype, 'listen', function (...args) {
     const target = args[0];
-    if (typeof target === 'string') return originalListen.apply(this, args); // unix socket: local
+    if (typeof target === 'string' && !/^\d+$/.test(target)) return originalListen.apply(this, args); // unix socket: local
+    // A numeric string is a PORT to Node, not a path: listen("0") would bind
+    // every interface. Treat it exactly like the numeric form below.
     if (target && typeof target === 'object') {
       if (target.path) return originalListen.apply(this, args);
       if (literalLoopback(target.host)) return originalListen.apply(this, args);

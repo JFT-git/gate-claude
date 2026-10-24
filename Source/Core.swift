@@ -222,7 +222,7 @@ final class SOCKSRelay: @unchecked Sendable {
                             connection.cancel(); return
                         }
                         let id = UUID()
-                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily, pinnedLocal: self.pinnedLocal, checkToken: self.checkToken)
+                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily, pinnedLocal: self.pinnedLocal, checkToken: self.checkToken, captureGeneration: self.currentCaptureGeneration)
                         tunnel.isAllowed = { [weak self] host, port, control in
                             guard let self, self.alive else { return false }
                             switch self.mode {
@@ -238,7 +238,7 @@ final class SOCKSRelay: @unchecked Sendable {
                         }
                         tunnel.onUpstreamFault = { [weak self] in self?.upstreamFailed() }
                         tunnel.onProbeConnected = { [weak self] in self?.faultReported = false }
-                        tunnel.onLocalEndpoint = { [weak self] host in self?.noteEgressLocal(host) }
+                        tunnel.onLocalEndpoint = { [weak self] host, generation in self?.noteEgressLocal(host, generation: generation) }
                         self.tunnels[id] = tunnel
                         tunnel.start()
                     }
@@ -270,15 +270,24 @@ final class SOCKSRelay: @unchecked Sendable {
     // IP checks, not from the default route: split-route VPNs (0/1+128/1) make the
     // default route point at the physical interface while traffic really leaves
     // through the tunnel. Capturing the proven egress address pins the right one.
+    // Only authenticated control tunnels may teach the pin, and a capture made
+    // before the latest reset (old generation) is ignored, so an in-flight dial
+    // from the previous network cannot poison the new capture.
     private var capturedV4: String?
     private var capturedV6: String?
-    fileprivate func noteEgressLocal(_ host: String) {
+    private var captureGeneration: UInt64 = 0
+    fileprivate var currentCaptureGeneration: UInt64 { captureGeneration }
+    fileprivate func noteEgressLocal(_ host: String, generation: UInt64) {
+        guard generation == captureGeneration else { return }
         var v4 = in_addr(); var v6 = in6_addr()
         if inet_pton(AF_INET, host, &v4) == 1 {
             if !host.hasPrefix("127.") && !host.hasPrefix("169.254.") { capturedV4 = host }
         } else if inet_pton(AF_INET6, host, &v6) == 1 {
+            // ULA (fc00::/7) is accepted: IPv6-only VPNs legitimately use ULA
+            // tunnel source addresses. Loopback, link-local, unspecified and
+            // mapped IPv4 are still rejected.
             let lower = host.lowercased()
-            if lower != "::1" && !lower.hasPrefix("fe80") && !lower.hasPrefix("fc") && !lower.hasPrefix("fd")
+            if lower != "::1" && lower != "::" && !lower.hasPrefix("fe80")
                 && !RelayTunnel.isMappedIPv4(lower) { capturedV6 = host }
         }
     }
@@ -294,7 +303,7 @@ final class SOCKSRelay: @unchecked Sendable {
     var isDirect: Bool { settings == nil }
     /// Clears both the pin and the learned addresses (session stop and revalidation).
     func resetLocalPinning() {
-        queue.sync { pinnedLocal = nil; capturedV4 = nil; capturedV6 = nil }
+        queue.sync { pinnedLocal = nil; capturedV4 = nil; capturedV6 = nil; captureGeneration &+= 1 }
     }
 
     func unlock() -> Bool {
@@ -353,12 +362,14 @@ private final class RelayTunnel {
     var onClose: (() -> Void)?
     var onUpstreamFault: (() -> Void)?
     var onProbeConnected: (() -> Void)?
-    var onLocalEndpoint: ((String) -> Void)?
+    var onLocalEndpoint: ((String, UInt64) -> Void)?
+    private let captureGeneration: UInt64
 
-    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?, pinnedLocal: SOCKSRelay.LocalPin?, checkToken: String) {
+    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?, pinnedLocal: SOCKSRelay.LocalPin?, checkToken: String, captureGeneration: UInt64) {
         self.checkToken = checkToken
         self.client = client; self.settings = settings; self.queue = queue
         self.pinnedFamily = pinnedFamily; self.pinnedLocal = pinnedLocal
+        self.captureGeneration = captureGeneration
     }
 
     /// IPv4-mapped IPv6 must never open an unmonitored IPv4 connection.
@@ -513,7 +524,9 @@ private final class RelayTunnel {
             case .ready:
                 // Learn the proven egress address of this connection: it becomes the
                 // kill-switch pin, so the pin always reflects the real route taken.
-                if self.settings == nil, let local = connection.currentPath?.localEndpoint,
+                // Only authenticated control tunnels may teach the pin — application
+                // dials never influence which address gets pinned.
+                if self.settings == nil, self.isControl, let local = connection.currentPath?.localEndpoint,
                    case .hostPort(let localHost, _) = local {
                     switch localHost {
                     case .ipv4(let address):
@@ -521,13 +534,13 @@ private final class RelayTunnel {
                         _ = address.rawValue.withUnsafeBytes { ptr in
                             inet_ntop(AF_INET, ptr.baseAddress, &buffer, socklen_t(buffer.count))
                         }
-                        self.onLocalEndpoint?(String(cString: buffer))
+                        self.onLocalEndpoint?(String(cString: buffer), self.captureGeneration)
                     case .ipv6(let address):
                         var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
                         _ = address.rawValue.withUnsafeBytes { ptr in
                             inet_ntop(AF_INET6, ptr.baseAddress, &buffer, socklen_t(buffer.count))
                         }
-                        self.onLocalEndpoint?(String(cString: buffer))
+                        self.onLocalEndpoint?(String(cString: buffer), self.captureGeneration)
                     default: break
                     }
                 }

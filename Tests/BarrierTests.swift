@@ -30,6 +30,7 @@ struct BarrierTests {
         let sudoers = NetworkBarrier.sudoersContent()
         check("sudoers-helper", sudoers.contains("ALL ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/claudeproxyguard-drop"))
         check("sudoers-pfctl", sudoers.contains("ALL ALL=(root) NOPASSWD: /sbin/pfctl -a claudeproxyguard -s rules"))
+        check("sudoers-pf-main-rules", sudoers.contains("ALL ALL=(root) NOPASSWD: /sbin/pfctl -s rules"))
         check("sudoers-pf-info", sudoers.contains("ALL ALL=(root) NOPASSWD: /sbin/pfctl -s info"))
         check("sudoers-no-wildcards", !sudoers.contains("*") && sudoers.hasSuffix("\n"))
 
@@ -56,11 +57,12 @@ struct BarrierTests {
             bashSyntax(script, "install-script-syntax")
             check("install-script-helper-path", script.contains("HELPER=\"/Library/PrivilegedHelperTools/claudeproxyguard-drop\""))
             check("install-script-group", script.contains("GROUP=\"_cpguard\"") && script.contains("dscl . -create \"/Groups/$GROUP\""))
-            check("install-script-hash-pin", script.contains("shasum -a 256 \"$HELPER_SRC\"") && script.contains("helper hash mismatch"))
+            check("install-script-hash-pin", script.contains("shasum -a 256 \"$STAGE/helper\"") && script.contains("helper hash mismatch"))
             check("install-script-visudo", script.contains("visudo -cf"))
             check("install-script-pf-validate", script.contains("pfctl -nf"))
             check("install-script-pf-enable", script.contains("pfctl -ef /etc/pf.conf") && script.contains("Status: Enabled"))
-            check("install-script-helper-arg", script.contains("install -o root -g wheel -m 0755 \"$HELPER_SRC\" \"$HELPER\""))
+            check("install-script-staging", script.contains("mktemp -d /tmp/cpguard-stage.") && script.contains("trap 'rm -rf \"$STAGE\"' EXIT"))
+            check("install-script-helper-arg", script.contains("install -o root -g wheel -m 0755 \"$STAGE/helper\" \"$HELPER\""))
         } catch { check("install-script-generation", false) }
         bashSyntax(NetworkBarrier.uninstallScript(), "uninstall-script-syntax")
 

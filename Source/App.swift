@@ -360,13 +360,18 @@ final class GuardModel: ObservableObject {
                 do {
                     let wasSuspended = self.policy.suspended
                     // A removed packet-filter barrier reopens direct egress for the
-                    // whole Claude tree; treat it like a route change.
+                    // whole Claude tree. The tree must not keep running uncontained:
+                    // kill it first, then treat the loss like a route change.
                     if self.barrierArmed, !self.currentBarrierProbe().active {
-                        throw GuardError.message("Сетевой барьер отключён во время сессии.")
+                        self.stopOwnedClaude()
+                        self.barrierLaunched = false
+                        throw GuardError.message("Сетевой барьер отключён во время сессии. Claude остановлен.")
                     }
-                    // While the gate is paused, control probes rebind freely; app
-                    // traffic stays closed until the fresh proven pin is installed.
-                    if self.sessionNetworkMode { self.relay?.resetLocalPinning() }
+                    // While the gate is paused after a network event, control probes
+                    // rebind freely; app traffic stays closed until the fresh proven
+                    // pin is installed. Routine periodic checks keep the pin: the
+                    // probes themselves run bound, so no unbound egress window opens.
+                    if self.sessionNetworkMode, wasSuspended { self.relay?.resetLocalPinning() }
                     let actual = try await self.currentIPCheck(self.relayPort)
                     guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
                     // A response started before the most recent route event cannot reopen the gate.
@@ -381,7 +386,7 @@ final class GuardModel: ObservableObject {
                     guard revision == self.networkRevision else { continue }
                     try self.policy.verify(actual)
                     self.relay?.setPinnedFamily(self.policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
-                    if self.sessionNetworkMode, let relay = self.relay {
+                    if self.sessionNetworkMode, wasSuspended, let relay = self.relay {
                         // Re-pin from the addresses these very probes used, then open.
                         var captured = relay.capturedLocalAddresses()
                         #if GUARD_E2E
@@ -749,7 +754,7 @@ final class GuardModel: ObservableObject {
         childBundleURL = nil
         password = ""
         clearBarrierEnvironment(); barrierArmed = false
-        barrierLaunched = false; sessionNetworkMode = false
+        sessionNetworkMode = false
         if latch { policy.latch(reason) }
         requiresRestart = policy.requiresRestart
         operation = UUID()
@@ -760,7 +765,10 @@ final class GuardModel: ObservableObject {
         timer?.invalidate(); timer = nil; nextCheck = nil
         pathMonitor?.cancel(); pathMonitor = nil
         networkWatcher?.stop(); networkWatcher = nil
+        // Keep barrierLaunched until the tree is dead: stopOwnedClaude needs it to
+        // choose the process-group kill path for the sudo-launched chain.
         stopOwnedClaude()
+        barrierLaunched = false
         monitoring = false; allowed = false; busy = false
         if !requiresRestart { policy.manualStop() }
         phase = requiresRestart ? "Заблокировано до перезапуска Guard" : (manual ? "Остановлено" : "Доступ закрыт")
@@ -780,9 +788,12 @@ final class GuardModel: ObservableObject {
             if barrierLaunched {
                 // The visible child is sudo; the runtime execs through GuardDrop and
                 // GuardHost into its own process group led by sudo's only child.
-                // Signal THAT group so MCP and helper processes cannot linger.
+                // Discover that group BEFORE signalling sudo — once sudo dies the
+                // parent relationship is gone — then signal the group so MCP and
+                // helper processes cannot linger.
+                let leader = childProcessGroup(of: pid)
                 process.terminate()
-                if let leader = childProcessGroup(of: pid) { kill(-leader, SIGKILL) }
+                if let leader { kill(-leader, SIGKILL) }
             // GuardHost creates an independent process group; never signal our own group.
             } else if getpgid(pid) == pid { kill(-pid, SIGKILL) } else { process.terminate() }
         }
