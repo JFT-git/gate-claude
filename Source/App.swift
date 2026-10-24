@@ -905,7 +905,7 @@ struct GuardView: View {
                         Text("Проверка IP перед запуском Claude").font(.system(size: 13)).foregroundStyle(GuardPalette.secondary)
                     }
                     Spacer()
-                    Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.5")).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
+                    Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.6")).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
                 }
                 Surface {
                     VStack(alignment: .leading, spacing: 14) {
