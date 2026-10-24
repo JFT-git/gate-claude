@@ -110,6 +110,7 @@ import Darwin
         model.e2eRuntimeRoot = root // Prevent writing actual preferences.
         model.e2eSystemProxyCapture = { try SystemProxy.parse("<dictionary> {\n}") }
         model.useProxy = false; model.interval = 30; model.watchPublicIP = true
+        model.e2eCapturedPin = SOCKSRelay.LocalPin(v4: "192.0.2.10", v6: nil)
         model.timezone = "Europe/Amsterdam"; model.language = "en-US"
         model.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "NL", date: Date()) }
         var failProbe = false
@@ -199,6 +200,7 @@ import Darwin
         barrierModel.e2eSystemProxyCapture = { try SystemProxy.parse("<dictionary> {\n}") }
         barrierModel.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "NL", date: Date()) }
         barrierModel.e2ePublicCheck = { _ in "203.0.113.7" }
+        barrierModel.e2eCapturedPin = SOCKSRelay.LocalPin(v4: "192.0.2.10", v6: nil)
         barrierModel.e2eBarrierProbe = .missing
         defer { barrierModel.shutdown() }
         barrierModel.check(andLaunch: false)

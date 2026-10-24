@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const net = require('node:net');
 const dgram = require('node:dgram');
 const { once } = require('node:events');
-const { setPinnedLocalAddresses, connectCurrentNetwork, NetworkRelay, connectTunnel } = require('../src/relay.cjs');
+const { capturedEgressLocalAddresses, beginEgressCapture, setPinnedLocalAddresses, connectCurrentNetwork, NetworkRelay, connectTunnel } = require('../src/relay.cjs');
 function pin(t, value) { setPinnedLocalAddresses(value); t.after(() => setPinnedLocalAddresses(null)); }
 async function receiver(t) {
   const peers = new Set();
@@ -53,4 +53,11 @@ test('DNS timeout closes CONNECT without system lookup fallback', { timeout: 750
   const dns = require('node:dns'), original = dns.lookup; let fallbacks = 0;
   dns.lookup = () => { fallbacks++; throw Error('Unexpected system DNS'); }; t.after(() => { dns.lookup = original; });
   await assert.rejects(connectTunnel(relay.port, 'timeout.invalid', 443)); assert.equal(fallbacks, 0);
+});
+
+test('loopback control connections do not become egress pins', async t => {
+  const port = await receiver(t); pin(t, null); beginEgressCapture();
+  const socket = await connectCurrentNetwork('127.0.0.1', port, undefined, 4, true);
+  t.after(() => socket.destroy());
+  assert.deepEqual(capturedEgressLocalAddresses(), {});
 });

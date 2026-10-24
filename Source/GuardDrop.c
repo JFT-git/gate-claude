@@ -9,10 +9,11 @@
 // target must still be a regular executable owned by the invoking user and must not
 // be a setuid/setgid binary.
 //
-// Protocol: argv[1] is the absolute target path, remaining argv are its arguments.
-// The environment is scrubbed; GUARD_ENV_FILE (an absolute path without control
-// characters) is forwarded so the next stage can load the prepared session
-// environment from a user-owned file.
+// Protocol: argv may start with `--env-file <path>` (an absolute path without
+// control characters); the next argument is the absolute target path and the
+// remaining argv are its arguments. The environment is scrubbed; the env-file
+// path is forwarded as GUARD_ENV_FILE so the next stage can load the prepared
+// session environment from a user-owned file.
 #include <errno.h>
 #include <grp.h>
 #include <pwd.h>
@@ -52,7 +53,12 @@ static int clean_environment(struct passwd *pw, const char *env_file) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2 || argv[1][0] != '/' || strlen(argv[1]) >= MAXPATHLEN || strchr(argv[1], '\n')) return 64;
+    int target_index = 1;
+    const char *env_file = NULL;
+    if (argc > 2 && strcmp(argv[1], "--env-file") == 0) { env_file = argv[2]; target_index = 3; }
+    if (argc <= target_index || argv[target_index][0] != '/' || strlen(argv[target_index]) >= MAXPATHLEN
+        || strchr(argv[target_index], '\n')) return 64;
+    if (env_file && (env_file[0] != '/' || strlen(env_file) >= MAXPATHLEN || strchr(env_file, '\n'))) return 72;
 
     uid_t caller;
     const char *sudo_uid = getenv("SUDO_UID");
@@ -66,30 +72,29 @@ int main(int argc, char **argv) {
         return 71; // without root the barrier group cannot be applied: refuse
     }
 
-    const char *env_file = getenv("GUARD_ENV_FILE");
-    if (env_file && (env_file[0] != '/' || strlen(env_file) >= MAXPATHLEN || strchr(env_file, '\n'))) return 72;
-
     struct group *grp = getgrnam(BARRIER_GROUP);
     if (!grp) return 66;
     struct passwd *pw = getpwuid(caller);
     if (!pw || pw->pw_dir[0] != '/' || pw->pw_name[0] == '\0') return 67;
 
+    // Drop first: after this point every filesystem check runs with the caller's
+    // credentials, so the helper cannot probe paths the caller cannot see.
+    if (setgid(grp->gr_gid) < 0) return 70;
+    if (setgroups(1, &grp->gr_gid) < 0) return 70;
+    if (setuid(caller) < 0) return 70;
+    if (getuid() != caller || geteuid() != caller || getgid() != grp->gr_gid || getegid() != grp->gr_gid) return 70;
+
     char resolved[MAXPATHLEN];
-    if (!realpath(argv[1], resolved)) return 68;
+    if (!realpath(argv[target_index], resolved)) return 68;
     struct stat meta;
     if (stat(resolved, &meta) < 0) return 68;
     if (!S_ISREG(meta.st_mode) || !(meta.st_mode & S_IXUSR)) return 69;
     if (meta.st_uid != caller) return 69; // only the caller's own executables
     if (meta.st_mode & (S_ISUID | S_ISGID)) return 69;
 
-    if (setgid(grp->gr_gid) < 0) return 70;
-    if (setgroups(1, &grp->gr_gid) < 0) return 70;
-    if (setuid(caller) < 0) return 70;
-    if (getuid() != caller || geteuid() != caller || getgid() != grp->gr_gid || getegid() != grp->gr_gid) return 70;
-
     int rc = clean_environment(pw, env_file);
     if (rc) return rc;
 
-    execv(resolved, &argv[1]);
+    execv(resolved, &argv[target_index]);
     return 73;
 }

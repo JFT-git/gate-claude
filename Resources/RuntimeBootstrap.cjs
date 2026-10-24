@@ -73,9 +73,19 @@ function installNetworkHardening() {
   const originalConnect = net.Socket.prototype.connect;
   hook(net.Socket.prototype, 'connect', function (...args) {
     const target = args[0];
-    if (target && typeof target === 'object' && target.path) return originalConnect.apply(this, args); // unix socket: local
-    if (typeof target === 'string' && target.startsWith('/')) return originalConnect.apply(this, args);
-    const host = target && typeof target === 'object' ? target.host : (typeof args[0] === 'number' ? args[1] : undefined);
+    if (typeof target === 'string') {
+      if (target.startsWith('/')) return originalConnect.apply(this, args); // unix socket: local
+      // Numeric-string port form: connect("443", "host").
+      const host = typeof args[1] === 'string' ? args[1] : undefined;
+      if (/^\d+$/.test(target) && (!host || literalLoopback(host))) return originalConnect.apply(this, args);
+      throw denied('net.Socket.connect');
+    }
+    if (target && typeof target === 'object') {
+      if (target.path) return originalConnect.apply(this, args); // unix socket: local
+      if (!target.host || literalLoopback(target.host)) return originalConnect.apply(this, args);
+      throw denied('net.Socket.connect');
+    }
+    const host = typeof args[1] === 'string' ? args[1] : undefined;
     if (!host || literalLoopback(host)) return originalConnect.apply(this, args);
     throw denied('net.Socket.connect');
   });
@@ -84,24 +94,49 @@ function installNetworkHardening() {
   const originalListen = net.Server.prototype.listen;
   hook(net.Server.prototype, 'listen', function (...args) {
     const target = args[0];
-    if (target && typeof target === 'object' && target.path) return originalListen.apply(this, args);
-    if (typeof target === 'string') return originalListen.apply(this, args);
-    const host = target && typeof target === 'object' ? target.host : (typeof args[1] === 'string' ? args[1] : undefined);
-    if (!host || literalLoopback(host)) return originalListen.apply(this, args);
+    if (typeof target === 'string') return originalListen.apply(this, args); // unix socket: local
+    if (target && typeof target === 'object') {
+      if (target.path) return originalListen.apply(this, args);
+      if (literalLoopback(target.host)) return originalListen.apply(this, args);
+      throw denied('net.Server.listen');
+    }
+    // listen(port) without a host would bind every interface: require loopback.
+    const host = typeof args[1] === 'string' ? args[1] : undefined;
+    if (literalLoopback(host)) return originalListen.apply(this, args);
     throw denied('net.Server.listen');
   });
   const originalTls = tls.connect;
   hook(tls, 'connect', function (...args) {
     const target = args[0];
     if (target && typeof target === 'object' && target.socket) return originalTls.apply(this, args); // wraps a gated socket
+    if (typeof target === 'string' && /^\d+$/.test(target)) {
+      const host = typeof args[1] === 'string' ? args[1] : undefined;
+      if (!host || literalLoopback(host)) return originalTls.apply(this, args);
+      throw denied('tls.connect');
+    }
     const host = target && typeof target === 'object' ? target.host : (typeof args[0] === 'number' ? args[1] : typeof target === 'string' ? target : undefined);
     if (!host || literalLoopback(host)) return originalTls.apply(this, args);
     throw denied('tls.connect');
   });
   block(dgram, ['createSocket'], 'dgram');
   block(dgram.Socket?.prototype, ['send', 'connect', 'bind', 'addMembership', 'addSourceSpecificMembership'], 'dgram.Socket');
-  const dnsMethods = object => Object.getOwnPropertyNames(object || {}).filter(name => /^(?:lookup|resolve|reverse)/.test(name));
+  const dnsMethods = object => Object.getOwnPropertyNames(object || {}).filter(name => /^(?:resolve|reverse)/.test(name));
   for (const object of [dns, dns.promises, dns.Resolver?.prototype, dns.promises?.Resolver?.prototype]) block(object, dnsMethods(object), 'dns');
+  block(dns.Resolver?.prototype, ['lookup'], 'dns'); block(dns.promises?.Resolver?.prototype, ['lookup'], 'dns');
+  // Node resolves even literal listen/connect hosts through dns.lookup; loopback
+  // literals make no network query, so only those may pass.
+  const originalLookup = dns.lookup;
+  hook(dns, 'lookup', function (name, ...rest) {
+    if (literalLoopback(String(name))) return originalLookup.apply(this, [name, ...rest]);
+    throw denied('dns.lookup');
+  });
+  if (dns.promises && typeof dns.promises.lookup === 'function') {
+    const originalPromisesLookup = dns.promises.lookup;
+    hook(dns.promises, 'lookup', function (name, ...rest) {
+      if (literalLoopback(String(name))) return originalPromisesLookup.apply(this, [name, ...rest]);
+      throw denied('dns.promises.lookup');
+    });
+  }
   const httpGuard = (original, label) => function (...args) {
     const target = args[0];
     let host;

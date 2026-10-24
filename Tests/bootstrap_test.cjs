@@ -86,7 +86,11 @@ check('net-connect-hostname-denied', () => assert.throws(() => net.connect(443, 
 check('net-connect-loopback-allowed', () => { const s = net.connect(9, '127.0.0.1'); s.destroy(); });
 check('net-connect-unix-allowed', () => { const s = net.connect('/tmp/guard-nonexistent.sock'); s.destroy(); });
 check('net-hook-sticky', () => { net.Socket.prototype.connect = () => {}; assert.throws(() => net.connect(443, '203.0.113.9')); });
+check('net-connect-string-port-external', () => assert.throws(() => net.connect('443', '203.0.113.9'), /Guard blocked/));
+check('net-connect-string-port-loopback', () => { const s = net.connect('9', '127.0.0.1'); s.destroy(); });
 check('server-listen-external', () => assert.throws(() => net.createServer().listen({ host: '0.0.0.0', port: 0 }), /Guard blocked/));
+check('server-listen-no-host', () => assert.throws(() => net.createServer().listen(0), /Guard blocked/));
+check('server-listen-loopback', () => { const s = net.createServer(); s.listen(0, '127.0.0.1'); s.close(); });
 
 const tls = require('node:tls');
 check('tls-connect-external', () => assert.throws(() => tls.connect(443, '203.0.113.9'), /Guard blocked/));
@@ -96,6 +100,7 @@ check('dgram-denied', () => assert.throws(() => dgram.createSocket('udp4'), /Gua
 
 const dns = require('node:dns');
 check('dns-lookup-denied', () => assert.throws(() => dns.lookup('claude.ai', () => {}), /Guard blocked/));
+check('dns-lookup-loopback-literal', () => dns.lookup('127.0.0.1', (error, address) => { assert.ifError(error); assert.strictEqual(address, '127.0.0.1'); }));
 check('dns-resolve-denied', () => assert.throws(() => dns.resolve4('claude.ai', () => {}), /Guard blocked/));
 check('dns-promises-denied', () => assert.throws(() => dns.promises.lookup('claude.ai'), /Guard blocked/));
 check('dns-resolver-denied', () => assert.throws(() => new dns.Resolver().resolve4('claude.ai', () => {}), /Guard blocked/));

@@ -208,6 +208,11 @@ function mappedIPv4(address) {
 }
 // Snapshot pins per dial so an asynchronous lookup cannot switch exits midway.
 let pinnedLocalAddresses = null;
+let capturedLocalAddresses = {};
+let captureGeneration = 0;
+function capturedEgressLocalAddresses() { return { ...capturedLocalAddresses }; }
+// Separate from clearing a pin: old, in-flight dials cannot populate a new check.
+function beginEgressCapture() { capturedLocalAddresses = {}; captureGeneration++; }
 function setPinnedLocalAddresses(pin) {
   if (pin !== null && (!pin || [4, 6].some(f => pin['v' + f] != null &&
       (net.isIP(pin['v' + f]) !== f || mappedIPv4(pin['v' + f]))))) throw familyRefusal();
@@ -284,11 +289,11 @@ async function boundLookup(host, family, pin) {
   throw failure;
 }
 function familyRefusal() { return Object.assign(Error('Семейство IP назначения не совпадает с закреплённым маршрутом.'), { targetRefused: true }); }
-async function connectCurrentNetwork(host, port, onSocket = () => {}, family = 0) {
+async function connectCurrentNetwork(host, port, onSocket = () => {}, family = 0, capture = true) {
   if (![0, 4, 6].includes(family)) throw familyRefusal();
   const literal = net.isIP(host);
   if (mappedIPv4(host) || (family && literal && literal !== family)) throw familyRefusal();
-  const pin = pinnedLocalAddresses;
+  const pin = pinnedLocalAddresses, generation = captureGeneration;
   if (pin) {
     family = family || literal || (pin.v4 ? 4 : 6);
     if (!pin['v' + family]) throw localRefusal();
@@ -318,6 +323,11 @@ async function connectCurrentNetwork(host, port, onSocket = () => {}, family = 0
       const cleanup = () => socket.off('connect', connected).off('error', failed).off('close', closed);
       socket.once('connect', connected).once('error', failed).once('close', closed);
     });
+    const local = socket.localAddress, localFamily = net.isIP(local);
+    if (capture && generation === captureGeneration && localFamily && !mappedIPv4(local) &&
+        !local.startsWith('127.') && local !== '::1' && local !== '0.0.0.0' && local !== '::') {
+      capturedLocalAddresses['v' + localFamily] = local;
+    }
     socket.setTimeout(0); socket.pause(); return socket;
   } catch (error) { socket.destroy(); error.targetRefused = true; throw error; }
 }
@@ -343,7 +353,7 @@ class SOCKSRelay extends EventEmitter {
     socket.once('close', () => { this.sockets.delete(socket); this.controlSockets.delete(socket); }); socket.on('error', () => {}); return socket;
   }
   connectUpstream(host, port, onSocket, control = false) {
-    return this.mode === 'network' ? connectCurrentNetwork(host, port, onSocket, this.ipFamily || 0) : connectSOCKS(this.proxy, host, port, onSocket);
+    return this.mode === 'network' ? connectCurrentNetwork(host, port, onSocket, this.ipFamily || 0, control) : connectSOCKS(this.proxy, host, port, onSocket);
   }
   accept(client) {
     this.track(client); let bytes = Buffer.alloc(0), processing = false;
@@ -467,7 +477,7 @@ class NetworkRelay extends SOCKSRelay {
   get ipFamilyBound() { return this.#upstream.kind === 'direct' ? 'direct' : 'upstream-proxy'; }
   get ipFamily() { return this.#ipFamily; }
   connectUpstream(host, port, onSocket, control = false) {
-    if (this.#upstream.kind === 'direct') return connectCurrentNetwork(host, port, onSocket, this.#ipFamily);
+    if (this.#upstream.kind === 'direct') return connectCurrentNetwork(host, port, onSocket, this.#ipFamily, control);
     const literal = net.isIP(host);
     if (mappedIPv4(host) || (this.#ipFamily && literal && literal !== this.#ipFamily)) return Promise.reject(familyRefusal());
     return this.#upstream.kind === 'http' ? connectHTTP(this.#upstream, host, port, onSocket) : connectSOCKS(this.#upstream, host, port, onSocket);
@@ -516,4 +526,4 @@ async function connectTunnel(port, host, targetPort = 443, checkToken = '', onSo
   socket.setTimeout(0); return socket;
 }
 
-module.exports = { setPinnedLocalAddresses, SOCKSRelay, NetworkRelay, connectSOCKS, connectHTTP, connectCurrentNetwork, connectTunnel, SocketReader, authority };
+module.exports = { capturedEgressLocalAddresses, beginEgressCapture, setPinnedLocalAddresses, SOCKSRelay, NetworkRelay, connectSOCKS, connectHTTP, connectCurrentNetwork, connectTunnel, SocketReader, authority };

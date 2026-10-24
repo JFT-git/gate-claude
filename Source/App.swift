@@ -18,6 +18,8 @@ final class GuardModel: ObservableObject {
     @Published var barrierSummary = "Состояние барьера ещё не проверено"
     var barrierArmed = false
     private var barrierEnvURL: URL?
+    private var barrierLaunched = false
+    private var sessionNetworkMode = false
     @Published var timezone = "Europe/Amsterdam"
     @Published var language = "en-US"
     @Published var inspectPages = true
@@ -106,6 +108,7 @@ final class GuardModel: ObservableObject {
     var e2eStderrURL: URL?
     var e2eExtraArguments: [String] = []
     var e2eBarrierProbe: NetworkBarrier.Probe?
+    var e2eCapturedPin: SOCKSRelay.LocalPin?
     var e2eOnVerified: ((VerifiedProfile) -> Void)?
     var e2eInspector: ClaudeInspector? { inspector }
     var e2eRelayPort: UInt16? { relayPort }
@@ -287,6 +290,7 @@ final class GuardModel: ObservableObject {
                     self.addTraffic(record)
                 }
                 self.relay = relay
+                sessionNetworkMode = networkMode && relay.isDirect
                 let localPort = try await relay.start()
                 guard operation == token else { relay.stop(); return }
                 relayPort = localPort
@@ -302,7 +306,19 @@ final class GuardModel: ObservableObject {
                     try policy.verify(actual)
                 }
                 relay.setPinnedFamily(policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
-                if networkMode { relay.setPinnedLocalAddresses(try EgressPin.current()) }
+                if relay.isDirect {
+                    // Pin the addresses the control checks actually used rather than
+                    // the default route owner: split-route VPNs (0/1+128/1) would
+                    // otherwise pin the physical interface and bypass the tunnel.
+                    var captured = relay.capturedLocalAddresses()
+                    #if GUARD_E2E
+                    if captured == nil { captured = e2eCapturedPin }
+                    #endif
+                    guard let captured else {
+                        throw GuardError.message("Не удалось закрепить локальный адрес выхода. Доступ закрыт.")
+                    }
+                    relay.setPinnedLocalAddresses(captured)
+                }
                 try await verifyDestinations(operation: token)
                 guard operation == token else { return }
                 try await confirmSystemProxy(operation: token)
@@ -348,6 +364,9 @@ final class GuardModel: ObservableObject {
                     if self.barrierArmed, !self.currentBarrierProbe().active {
                         throw GuardError.message("Сетевой барьер отключён во время сессии.")
                     }
+                    // While the gate is paused, control probes rebind freely; app
+                    // traffic stays closed until the fresh proven pin is installed.
+                    if self.sessionNetworkMode { self.relay?.resetLocalPinning() }
                     let actual = try await self.currentIPCheck(self.relayPort)
                     guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
                     // A response started before the most recent route event cannot reopen the gate.
@@ -362,7 +381,17 @@ final class GuardModel: ObservableObject {
                     guard revision == self.networkRevision else { continue }
                     try self.policy.verify(actual)
                     self.relay?.setPinnedFamily(self.policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
-                    if !self.useProxy { self.relay?.setPinnedLocalAddresses(try EgressPin.current()) }
+                    if self.sessionNetworkMode, let relay = self.relay {
+                        // Re-pin from the addresses these very probes used, then open.
+                        var captured = relay.capturedLocalAddresses()
+                        #if GUARD_E2E
+                        if captured == nil { captured = self.e2eCapturedPin }
+                        #endif
+                        guard let captured else {
+                            throw GuardError.message("Не удалось закрепить локальный адрес выхода после изменения сети.")
+                        }
+                        relay.setPinnedLocalAddresses(captured)
+                    }
                     if wasSuspended, let relay = self.relay, !relay.unlock() {
                         throw GuardError.message("Шлюз ожидает успешного контрольного подключения.")
                     }
@@ -596,9 +625,13 @@ final class GuardModel: ObservableObject {
                 .appendingPathComponent("guard-env-" + UUID().uuidString.lowercased())
             try writeBarrierEnvironment(fullEnvironment, to: envURL)
             barrierEnvURL = envURL
-            child.environment = ["GUARD_ENV_FILE": envURL.path]
+            // sudo env_reset strips inherited variables; the env file path travels
+            // as a helper argument instead.
+            child.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+            barrierLaunched = true
         } else {
             child.environment = fullEnvironment
+            barrierLaunched = false
         }
         child.standardError = FileHandle.nullDevice
         #if GUARD_E2E
@@ -615,8 +648,9 @@ final class GuardModel: ObservableObject {
         #endif
         guard FileManager.default.isExecutableFile(atPath: helper.path) else { throw GuardError.message("В сборке отсутствует GuardHost.") }
         if useBarrierChain {
+            guard let barrierEnvURL else { throw GuardError.message("Окружение сессии для барьера не подготовлено.") }
             child.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-            child.arguments = ["-n", NetworkBarrier.helperPath, helper.path] + arguments
+            child.arguments = ["-n", NetworkBarrier.helperPath, "--env-file", barrierEnvURL.path, helper.path] + arguments
         } else {
             child.executableURL = helper; child.arguments = arguments
         }
@@ -715,6 +749,7 @@ final class GuardModel: ObservableObject {
         childBundleURL = nil
         password = ""
         clearBarrierEnvironment(); barrierArmed = false
+        barrierLaunched = false; sessionNetworkMode = false
         if latch { policy.latch(reason) }
         requiresRestart = policy.requiresRestart
         operation = UUID()
@@ -742,13 +777,33 @@ final class GuardModel: ObservableObject {
         process?.terminationHandler = nil
         if let process, process.isRunning {
             let pid = process.processIdentifier
+            if barrierLaunched {
+                // The visible child is sudo; the runtime execs through GuardDrop and
+                // GuardHost into its own process group led by sudo's only child.
+                // Signal THAT group so MCP and helper processes cannot linger.
+                process.terminate()
+                if let leader = childProcessGroup(of: pid) { kill(-leader, SIGKILL) }
             // GuardHost creates an independent process group; never signal our own group.
-            if getpgid(pid) == pid { kill(-pid, SIGKILL) } else { process.terminate() }
+            } else if getpgid(pid) == pid { kill(-pid, SIGKILL) } else { process.terminate() }
         }
         for app in NSWorkspace.shared.runningApplications {
             if let url = app.executableURL, url.standardizedFileURL.resolvingSymlinksInPath().path.hasPrefix(path + "/") { app.forceTerminate() }
         }
         process = nil; activePath = nil; claudeRunning = false
+    }
+    /// Returns the process-group leader started under the given sudo process, or nil.
+    private func childProcessGroup(of sudoPID: Int32) -> Int32? {
+        let task = Process(), pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        task.arguments = ["-P", String(sudoPID)]
+        task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return nil }
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else { return nil }
+        let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard let line = text.split(separator: "\n").first, let child = Int32(line), child > 1,
+              getpgid(child) == child else { return nil }
+        return child
     }
     func appendLog(_ text: String) {
         diagnostics.record("event", text)
@@ -956,7 +1011,7 @@ struct GuardView: View {
                                 Button("Установить или восстановить…") { model.installBarrier() }
                             }
                         }.font(.system(size: 12))
-                        Text("Барьер packet filter пропускает процессы Claude только к локальному шлюзу: любой другой исходящий трафик всей группы процессов (native, MCP, Cowork) блокируется ядром, включая момент смены IP. Установка одноразово требует пароль администратора; выключенный барьер оставляет обходной риск.")
+                        Text("Барьер packet filter пропускает процессы Claude только к локальному шлюзу: весь TCP/UDP-трафик группы процессов (native, MCP, Cowork), идущий наружу, блокируется ядром, включая момент смены IP. Установка одноразово требует пароль администратора; выключенный барьер оставляет обходной риск.")
                             .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     }.disabled(model.monitoring || model.busy || model.requiresRestart)
                 }

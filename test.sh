@@ -22,6 +22,14 @@ set +e
 .build/GuardDropTest /bin/true >/dev/null 2>&1; rc=$?
 set -e
 shell-check guarddrop-no-root 71 "$rc"
+set +e
+.build/GuardDropTest --env-file /tmp/x /bin/true >/dev/null 2>&1; rc=$?
+set -e
+shell-check guarddrop-env-arg-no-root 71 "$rc"
+set +e
+.build/GuardDropTest --env-file >/dev/null 2>&1; rc=$?
+set -e
+shell-check guarddrop-env-arg-usage 64 "$rc"
 
 # GuardHost restores the session environment only from a private, well-formed file.
 ENV_DIR="$(mktemp -d)"
@@ -58,8 +66,11 @@ chmod +x Tests/MockClaude.py
 .build/InspectorTests "$PWD/.build/GuardHostTest" "$PWD/Tests/MockClaude.py"
 
 # Packet-filter barrier: rules, sudoers, pf.conf merge and privileged scripts.
+# Stub for the build-time embedded helper hash; tests never install the barrier.
+[ -f .build/BarrierIntegrity.swift ] || \
+  printf '// Test stub - do not edit.\nenum BarrierIntegrity { static let guardDropSHA256 = "stub" }\n' > .build/BarrierIntegrity.swift
 xcrun swiftc -swift-version 5 -target "$TEST_ARCH-apple-macosx13.0" -module-cache-path "$CACHE" -parse-as-library -framework Network \
-  Source/Core.swift Source/Policy.swift Source/NetworkBarrier.swift Tests/BarrierTests.swift -o .build/BarrierTests
+  Source/Core.swift Source/Policy.swift Source/NetworkBarrier.swift .build/BarrierIntegrity.swift Tests/BarrierTests.swift -o .build/BarrierTests
 .build/BarrierTests
 
 # Runtime bootstrap network hardening (needs Node only for the offline harness).

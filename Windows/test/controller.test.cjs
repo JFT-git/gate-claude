@@ -114,13 +114,13 @@ test('stop during initial request cannot pin an IP or reopen resources after can
   assert.equal(controller.relay, null); assert.equal(controller.host, null);
 });
 
-test('local pin discovery runs on network establishment only', async t => {
+test('failed initial IP check never discovers or publishes a local pin', async t => {
   for (const mode of ['network', 'socks5']) {
     const controller = await fixture(t); let calls = 0;
     controller.localEgressAddresses = async () => { calls++; throw Error('fixture pin unavailable'); };
     initial = async () => { throw Error('fixture stops bootstrap'); };
     await controller.start({ ...input, mode });
-    assert.equal(calls, mode === 'network' ? 1 : 0);
+    assert.equal(calls, 0);
   }
 });
 test('successful revalidation refreshes the local pin and stop resets it', async t => {
@@ -155,13 +155,79 @@ test('interface watcher pauses synchronously before asynchronous revalidation', 
   watcher(); assert.deepEqual(events, ['pause', 'revalidate']);
   controller.stop(); release(''); await starting;
 });
-test('PowerShell pin discovery validates output and fails closed on execution error', async t => {
-  const controller = await fixture(t), windows = require('../src/windows.cjs'), original = windows.powershell; let script;
-  t.after(() => { windows.powershell = original; });
-  windows.powershell = async value => { script = value; return '{"v4":"127.0.0.1","v6":null}'; };
-  // Use the actual method instead of the fixture override.
-  assert.deepEqual(await GuardController.prototype.localEgressAddresses.call(controller), { v4: '127.0.0.1', v6: null });
-  assert.match(script, /Get-NetRoute/); assert.match(script, /169\.254/); assert.match(script, /WellKnown/);
-  windows.powershell = async () => { throw Error('fixture'); };
+async function capturedDial(address, inspect = () => {}) {
+  const net = require('node:net'), { EventEmitter } = require('node:events');
+  const original = net.createConnection;
+  net.createConnection = options => {
+    inspect(options);
+    const socket = new EventEmitter();
+    socket.localAddress = address;
+    socket.setTimeout = socket.pause = socket.destroy = () => socket;
+    queueMicrotask(() => socket.emit('connect'));
+    return socket;
+  };
+  try { return require('../src/relay.cjs').connectCurrentNetwork('203.0.113.1', 443, undefined, 4); }
+  finally { net.createConnection = original; }
+}
+test('local pin discovery reads captured control addresses and fails closed when empty', async t => {
+  const controller = await fixture(t), relay = require('../src/relay.cjs');
+  relay.beginEgressCapture();
   await assert.rejects(GuardController.prototype.localEgressAddresses.call(controller), /локальные адреса выхода Windows/);
+  await capturedDial('10.8.0.2');
+  assert.deepEqual(await GuardController.prototype.localEgressAddresses.call(controller), { v4: '10.8.0.2' });
+  relay.setPinnedLocalAddresses(null);
+  assert.deepEqual(relay.capturedEgressLocalAddresses(), { v4: '10.8.0.2' });
+  const copy = relay.capturedEgressLocalAddresses(); copy.v4 = '192.0.2.1';
+  assert.deepEqual(relay.capturedEgressLocalAddresses(), { v4: '10.8.0.2' });
+  relay.beginEgressCapture();
+  for (const address of ['127.0.0.1', '::1', '::ffff:10.8.0.2', 'invalid']) await capturedDial(address);
+  assert.deepEqual(relay.capturedEgressLocalAddresses(), {});
+});
+test('revalidation removes stale binding before all probes and pins the new address before resume', async t => {
+  const controller = await fixture(t), relay = require('../src/relay.cjs'), events = [];
+  controller.settings = { mode: 'network', interval: 30 }; controller.state = 'rechecking'; controller.route = '';
+  controller.policy.pin({ country_code: 'NL', ip: '203.0.113.7' });
+  relay.setPinnedLocalAddresses({ v4: '192.0.2.99' });
+  controller.relay = { port: 1234, pause() { events.push('pause'); }, resume() { events.push('resume'); }, close() {} };
+  controller.checkCurrentIP = async () => {
+    await capturedDial('10.8.0.3', options => { assert.equal(options.localAddress, undefined); events.push('unbound IP'); });
+    return '203.0.113.7';
+  };
+  controller.queryDestinations = async () => {
+    await capturedDial('10.8.0.3', options => { assert.equal(options.localAddress, undefined); events.push('unbound destinations'); });
+    return true;
+  };
+  controller.localEgressAddresses = async () => { events.push('capture'); return relay.capturedEgressLocalAddresses(); };
+  await controller.poll(controller.epoch);
+  assert.deepEqual(events, ['pause', 'unbound IP', 'unbound destinations', 'capture', 'resume']);
+  await capturedDial('10.8.0.3', options => assert.equal(options.localAddress, '10.8.0.3'));
+});
+test('a captured address changing while the new pin is read keeps traffic paused', async t => {
+  const controller = await fixture(t), relay = require('../src/relay.cjs'); let resumed = 0;
+  controller.settings = { mode: 'network', interval: 30 }; controller.state = 'rechecking'; controller.route = '';
+  controller.policy.pin({ country_code: 'NL', ip: '203.0.113.7' });
+  controller.relay = { port: 1234, pause() {}, resume() { resumed++; }, close() {} };
+  controller.checkCurrentIP = async () => { await capturedDial('10.8.0.2'); return '203.0.113.7'; };
+  controller.queryDestinations = async () => true;
+  controller.localEgressAddresses = async () => {
+    const pin = relay.capturedEgressLocalAddresses();
+    await capturedDial('10.8.0.3');
+    return pin;
+  };
+  await controller.poll(controller.epoch);
+  assert.equal(resumed, 0); assert.equal(controller.state, 'rechecking');
+});
+
+test('a revalidation event during local pin read forbids resume', async t => {
+  const controller = await fixture(t); let resumed = 0;
+  controller.settings = { mode: 'network', interval: 30 }; controller.state = 'rechecking'; controller.route = '';
+  controller.policy.pin({ country_code: 'NL', ip: '203.0.113.7' });
+  controller.relay = { port: 1234, pause() {}, resume() { resumed++; }, close() {} };
+  controller.checkCurrentIP = async () => '203.0.113.7'; controller.queryDestinations = async () => true;
+  controller.localEgressAddresses = async () => {
+    controller.pauseForRevalidation('fixture interface event');
+    return { v4: '10.8.0.3' };
+  };
+  await controller.poll(controller.epoch);
+  assert.equal(resumed, 0); assert.equal(controller.state, 'rechecking');
 });

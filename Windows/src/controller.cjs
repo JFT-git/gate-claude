@@ -5,7 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const net = require('node:net');
 const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
-const { SOCKSRelay, NetworkRelay, setPinnedLocalAddresses } = require('./relay.cjs');
+const { SOCKSRelay, NetworkRelay, setPinnedLocalAddresses, capturedEgressLocalAddresses, beginEgressCapture } = require('./relay.cjs');
 const { initialIP, currentIP, queryDestinationIP, NetworkCheckError } = require('./ip-check.cjs');
 const { readSystemProxy } = require('./system-proxy.cjs');
 const { prepareRuntime } = require('./runtime.cjs');
@@ -20,7 +20,6 @@ const { ensureNativeCodeAsset } = require('./native-code-asset.cjs');
 const { CodeGate } = require('./code-gate.cjs');
 const { randomBytes } = require('node:crypto');
 const { DeepLinkInbox, messages: linkMessages } = require('./deep-link.cjs');
-const windows = require('./windows.cjs');
 const DESTINATIONS = Object.freeze(['claude.ai', 'api.anthropic.com']);
 
 class GuardController extends EventEmitter {
@@ -118,7 +117,7 @@ class GuardController extends EventEmitter {
         }
       }, 1000);
       this.route = await this.routeFingerprint(); if (!active()) return;
-      await this.refreshLocalAddresses(epoch); if (!active()) return;
+      setPinnedLocalAddresses(null); beginEgressCapture();
       this.networkProxy = settings.mode === 'network' ? Object.freeze({ ...await this.networkProxyConfiguration() }) : null;
       if (!active()) return;
       this.relay = settings.mode === 'network' ? new NetworkRelay({ upstream: this.networkProxy }) : new SOCKSRelay({ host: settings.host, port: settings.port, username: settings.username, password: settings.password });
@@ -126,6 +125,7 @@ class GuardController extends EventEmitter {
       this.relay.on('revalidate', reason => { if (active()) this.revalidate(reason); });
       const port = await this.relay.start(); if (!active()) return;
       const pinExit = async () => {
+        const revision = this.revalidationRevision || 0, interfaces = networkFingerprint();
         const initial = await this.requestIP(epoch, initialIP, port, this.relay.checkToken); if (!active()) return false;
         const pin = this.policy.pin(initial); this.country = pin.country;
         if (settings.mode === 'network') this.relay.pinIPFamily(net.isIP(pin.ip));
@@ -136,7 +136,10 @@ class GuardController extends EventEmitter {
           if (active()) throw Error('Не удалось подтвердить настройки прокси Windows перед запуском.');
           return false;
         }
-        await this.refreshLocalAddresses(epoch); if (!active()) return false;
+        const localPin = await this.refreshLocalAddresses(epoch, false); if (!active()) return false;
+        if (this.usesLocalPin() && !localPin) throw Error('Локальный адрес выхода изменился во время проверки.');
+        if (revision !== (this.revalidationRevision || 0) || interfaces !== networkFingerprint()) throw Error('Сеть изменилась во время начальной проверки IP.');
+        if (!this.publishLocalAddresses(localPin)) throw Error('Локальный адрес изменился перед запуском.');
         this.log('Исходный IP закреплён: [IP скрыт] · ' + pin.country);
         this.schedulePoll(epoch, settings.interval * 1000);
         return true;
@@ -295,6 +298,7 @@ class GuardController extends EventEmitter {
       if (this.checkTask) await this.checkTask.promise;
       clearTimeout(this.pollTimer);
       if (!active()) return false;
+      this.beginLocalRevalidation();
       const revision = this.revalidationRevision || 0, interfaces = networkFingerprint();
       let beforeRoute, afterRoute, beforeRouteFailed = false;
       try {
@@ -329,7 +333,13 @@ class GuardController extends EventEmitter {
         this.pauseForRevalidation('Во время подготовки изменилась сеть. Проверяем закреплённый IP повторно.');
         continue;
       }
-      await this.refreshLocalAddresses(epoch); if (!active()) return false;
+      const localPin = await this.refreshLocalAddresses(epoch, false); if (!active()) return false;
+      if (this.usesLocalPin() && !localPin) continue;
+      if (revision !== (this.revalidationRevision || 0) || interfaces !== networkFingerprint()) {
+        this.pauseForRevalidation('Во время закрепления изменилась сеть. Повторяем проверку.');
+        continue;
+      }
+      if (!this.publishLocalAddresses(localPin)) continue;
       this.route = afterRoute; this.fingerprint = afterInterfaces;
       this.relay.resume(); if (this.state === 'rechecking') this.state = 'checking';
       this.schedulePoll(epoch, this.settings.interval * 1000);
@@ -410,26 +420,43 @@ class GuardController extends EventEmitter {
     });
   }
   async localEgressAddresses() {
-    try {
-      const script = ['IPv4', 'IPv6'].map((family, index) => {
-        const prefix = index ? '::/0' : '0.0.0.0/0';
-        const filter = index ? "$_.IPAddress -notmatch '^fe[89ab]'" : "$_.IPAddress -notlike '169.254.*'";
-        return `$i = Get-NetRoute -DestinationPrefix ${windows.psQuote(prefix)} | Sort-Object -Property RouteMetric, ifMetric | Select-Object -First 1 -ExpandProperty ifIndex; $v${index ? 6 : 4} = $null; if ($null -ne $i) { $v${index ? 6 : 4} = Get-NetIPAddress -InterfaceIndex $i -AddressFamily ${family} | Where-Object { $_.PrefixOrigin -ne 'WellKnown' -and ${filter} } | Select-Object -First 1 -ExpandProperty IPAddress }`;
-      }).join('\n') + '\n@{v4=$v4;v6=$v6} | ConvertTo-Json -Compress';
-      const pin = JSON.parse(await windows.powershell(script));
-      if (!pin || [4, 6].some(f => pin['v' + f] !== null && net.isIP(pin['v' + f]) !== f) || (!pin.v4 && !pin.v6)) throw Error();
-      return pin;
-    } catch { throw Error('Не удалось определить локальные адреса выхода Windows. Соединение закрыто.'); }
+    const pin = capturedEgressLocalAddresses();
+    if (!pin.v4 && !pin.v6) throw Error('Не удалось определить локальные адреса выхода Windows. Соединение закрыто.');
+    return pin;
   }
+  usesLocalPin() {
+    return this.settings?.mode === 'network' && this.networkProxy?.kind === 'direct';
+  }
+  beginLocalRevalidation() {
+    this.relay?.pause();
+    setPinnedLocalAddresses(null);
+    beginEgressCapture();
+  }
+
   async refreshLocalAddresses(epoch, publish = true) {
-    if (this.settings?.mode !== 'network') return;
+    if (!this.usesLocalPin()) return;
+    const captured = JSON.stringify(capturedEgressLocalAddresses());
     let pin;
     try { pin = await this.localEgressAddresses(); }
     catch (error) { if (this.epoch === epoch) this.block(error.message); throw error; }
     if (this.epoch === epoch && !this.policy.blocked) {
-      if (publish) setPinnedLocalAddresses(pin);
+      if (captured !== JSON.stringify(capturedEgressLocalAddresses())) {
+        this.pauseForRevalidation('Во время закрепления изменился локальный адрес выхода. Повторяем проверку.');
+        return;
+      }
+      this.localCaptureSignature = captured;
+      if (publish && !this.publishLocalAddresses(pin)) return;
       return pin;
     }
+  }
+  publishLocalAddresses(pin) {
+    if (!pin) return true;
+    if (this.localCaptureSignature !== JSON.stringify(capturedEgressLocalAddresses())) {
+      this.pauseForRevalidation('Локальный адрес изменился перед возобновлением. Повторяем проверку.');
+      return false;
+    }
+    setPinnedLocalAddresses(pin);
+    return true;
   }
   networkProxyConfiguration() { return readSystemProxy(); }
   async confirmNetworkProxy(epoch) {
@@ -557,6 +584,7 @@ class GuardController extends EventEmitter {
     if (!this.relay || !this.policy.pinned || this.policy.blocked || ['idle', 'blocked'].includes(this.state)) return false;
     if (invalidate) this.revalidationRevision = (this.revalidationRevision || 0) + 1;
     this.relay.pause();
+    setPinnedLocalAddresses(null);
     if (this.state !== 'rechecking') this.log(reason, 'warning');
     this.state = 'rechecking';
     this.status(reason + ' Трафик приостановлен до подтверждения прежнего IP.');
@@ -584,6 +612,7 @@ class GuardController extends EventEmitter {
       // the IP request, even when no interface event increments the revision.
       let beforeRoute, beforeRouteFailed = false;
       if (rechecking) {
+        this.beginLocalRevalidation();
         try { beforeRoute = await this.routeFingerprint(); }
         catch {
           if (active()) this.pauseForRevalidation('Не удалось проверить маршрут сети. Повторяем проверку.', false);
@@ -616,7 +645,8 @@ class GuardController extends EventEmitter {
       }
       if (rechecking && !await this.confirmNetworkProxy(epoch)) return;
       if (!active()) return;
-      const localPin = await this.refreshLocalAddresses(epoch, false); if (!active()) return;
+      const localPin = rechecking ? await this.refreshLocalAddresses(epoch, false) : null; if (!active()) return;
+      if (rechecking && this.usesLocalPin() && !localPin) return;
       const after = networkFingerprint();
       if (before !== after) {
         this.fingerprint = after;
@@ -633,7 +663,7 @@ class GuardController extends EventEmitter {
         this.pauseForRevalidation('Изменился маршрут сети. Проверяем закреплённый IP.');
         return;
       }
-      if (localPin) setPinnedLocalAddresses(localPin);
+      if (!this.publishLocalAddresses(localPin)) return;
       if (this.state === 'rechecking') {
         this.route = route.value; this.fingerprint = after;
         this.relay.resume();

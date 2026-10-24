@@ -23,13 +23,14 @@ struct BarrierTests {
 
     static func main() {
         let rules = NetworkBarrier.anchorRules()
-        check("anchor-pass-lo0", rules.contains("pass quick on lo0 all group _cpguard"))
-        check("anchor-block-quick", rules.contains("block return out quick all group _cpguard"))
+        check("anchor-pass-lo0", rules.contains("pass quick on lo0 all group _cpguard label \"cpguard-lo\""))
+        check("anchor-block-quick", rules.contains("block return out quick all group _cpguard label \"cpguard-block\""))
         check("anchor-order", (rules.range(of: "pass quick")?.lowerBound ?? rules.endIndex) < (rules.range(of: "block return")?.lowerBound ?? rules.startIndex))
 
         let sudoers = NetworkBarrier.sudoersContent()
-        check("sudoers-helper", sudoers.contains("%admin ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/claudeproxyguard-drop"))
-        check("sudoers-pfctl", sudoers.contains("%admin ALL=(root) NOPASSWD: /usr/sbin/pfctl -a claudeproxyguard -s rules"))
+        check("sudoers-helper", sudoers.contains("ALL ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/claudeproxyguard-drop"))
+        check("sudoers-pfctl", sudoers.contains("ALL ALL=(root) NOPASSWD: /sbin/pfctl -a claudeproxyguard -s rules"))
+        check("sudoers-pf-info", sudoers.contains("ALL ALL=(root) NOPASSWD: /sbin/pfctl -s info"))
         check("sudoers-no-wildcards", !sudoers.contains("*") && sudoers.hasSuffix("\n"))
 
         let sample = "scrub-anchor \"com.apple/*\"\nnat-anchor \"com.apple/*\"\nrdr-anchor \"com.apple/*\"\n" +
@@ -55,9 +56,10 @@ struct BarrierTests {
             bashSyntax(script, "install-script-syntax")
             check("install-script-helper-path", script.contains("HELPER=\"/Library/PrivilegedHelperTools/claudeproxyguard-drop\""))
             check("install-script-group", script.contains("GROUP=\"_cpguard\"") && script.contains("dscl . -create \"/Groups/$GROUP\""))
+            check("install-script-hash-pin", script.contains("shasum -a 256 \"$HELPER_SRC\"") && script.contains("helper hash mismatch"))
             check("install-script-visudo", script.contains("visudo -cf"))
             check("install-script-pf-validate", script.contains("pfctl -nf"))
-            check("install-script-pf-enable", script.contains("pfctl -ef /etc/pf.conf"))
+            check("install-script-pf-enable", script.contains("pfctl -ef /etc/pf.conf") && script.contains("Status: Enabled"))
             check("install-script-helper-arg", script.contains("install -o root -g wheel -m 0755 \"$HELPER_SRC\" \"$HELPER\""))
         } catch { check("install-script-generation", false) }
         bashSyntax(NetworkBarrier.uninstallScript(), "uninstall-script-syntax")
