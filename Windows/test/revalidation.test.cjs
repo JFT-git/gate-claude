@@ -46,6 +46,7 @@ async function fixture(t) {
   controller.state = 'running'; controller.settings = { mode: 'network', interval: 2 }; controller.route = 'route-A';
   controller.verified = { timezone: 'Europe/Amsterdam', language: 'en-US' };
   controller.relay = new Relay(); controller.routeFingerprint = async () => 'route-A';
+  controller.localEgressAddresses = async () => ({ v4: '127.0.0.1', v6: null });
   stubNetwork(controller); await controller.queryDestinations(controller.epoch, 1, 'fixture-control-token', true);
   provider = async (_port, token) => { assert.equal(token, 'fixture-control-token'); return { ip: pinned }; };
   t.after(async () => { controller.stop(); await fs.rm(root, { recursive: true, force: true }); });
@@ -295,7 +296,7 @@ test('IP monitoring starts before a slow runtime diagnostic connection and catch
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gate-startup-monitor-'));
   const c = new GuardController(root, root), channel = deferred(); let host, checks = 0;
   stubNetwork(c);
-  c.routeFingerprint = async () => 'route-A'; initialProvider = async () => ({ country_code: 'NL', ip: pinned });
+  c.routeFingerprint = async () => 'route-A'; c.localEgressAddresses = async () => ({ v4: '127.0.0.1', v6: null }); initialProvider = async () => ({ country_code: 'NL', ip: pinned });
   provider = async () => ({ ip: ++checks === 1 ? pinned : '203.0.113.8' });
   onSpawn = value => { host = value; }; waitForChannel = () => channel.promise;
   t.after(async () => { c.stop(); channel.resolve(); host?.emit('exit', 0); onSpawn = null; await fs.rm(root, { recursive: true, force: true }); });

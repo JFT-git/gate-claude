@@ -50,8 +50,244 @@ function expose(wc) {
     targetInfo: { targetId: String(wc.id), type: wc.getType() === 'webview' ? 'page' : 'page', title: '', url: wc.getURL() } } });
 }
 const sessionGates = new WeakMap();
+// --- Native network hardening (PG-05/06) ---------------------------------
+// The kernel packet filter (when armed) is the real boundary; these hooks add
+// fail-closed depth inside the main process for QUIC/UDP/DNS and direct Node
+// egress. Loopback stays available so local MCP/IPC keeps working.
+function installNetworkHardening() {
+  const net = require('node:net'), tls = require('node:tls'), dgram = require('node:dgram');
+  const dns = require('node:dns'), http = require('node:http'), https = require('node:https'), http2 = require('node:http2');
+  const denied = name => { const error = Error('Guard blocked network escape: ' + name); error.code = 'ERR_GUARD_NETWORK_DENIED'; return error; };
+  const deny = name => function () { throw denied(name); };
+  function hook(object, key, value) {
+    if (!object || typeof object[key] !== 'function') return;
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (descriptor && !descriptor.configurable) {
+      if (object[key] !== value) throw Error('Guard cannot protect ' + key);
+      return;
+    }
+    Object.defineProperty(object, key, { enumerable: descriptor?.enumerable ?? true, configurable: false, get: () => value, set() {} });
+  }
+  function block(object, names, label) { for (const name of names) hook(object, name, deny(label + '.' + name)); }
+  const literalLoopback = value => /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(String(value)) || String(value) === '::1';
+  // Node's exact classification (lib/net.js toNumber/isPipeName): a string is a
+  // unix path unless Number(value) >= 0, so "-1" is a path while " 0", "0x0",
+  // "+0", "0e0", "Infinity", "1e2" are TCP ports.
+  const isPipeName = value => typeof value === 'string' && !(Number(value) >= 0);
+  const isNumericForm = value => typeof value === 'number' || (typeof value === 'string' && Number(value) >= 0);
+  // Options objects are validated as ONE-TIME SNAPSHOTS with a null prototype:
+  // a getter answering loopback during validation but an external address when
+  // Node re-reads the property must never work, and an own enumerable
+  // "__proto__" key must not become the copy's prototype. Only the frozen
+  // copy is delegated.
+  const snapshot = target => {
+    const copy = Object.create(null);
+    for (const key of Object.keys(target)) {
+      Object.defineProperty(copy, key, { value: target[key], enumerable: true, writable: true, configurable: true });
+    }
+    return copy;
+  };
+  // Splits an options object into a validated transport form, or denies it.
+  // Mixed path+TCP forms are rejected: Node prioritizes port over path in
+  // listen(), so a sneaked-in port would bind under a unix disguise. Hostless
+  // TCP defaults to the NAME "localhost", whose resolution the DNS guard
+  // denies, so validated hostless connects get the loopback literal injected.
+  const validatedEndpoint = (target, label, hostlessAllowed, freeze = true) => {
+    const snap = snapshot(target);
+    const hasPath = snap.path != null, hasTCP = snap.host != null || snap.port != null;
+    if (hasPath && hasTCP) throw denied(label);
+    if (hasPath) { snap.path = String(snap.path); return freeze ? Object.freeze(snap) : snap; }
+    if (snap.port == null) throw denied(label);
+    if (snap.host == null) {
+      if (!hostlessAllowed) throw denied(label);
+      snap.host = '127.0.0.1';
+    } else if (!literalLoopback(snap.host)) throw denied(label);
+    return freeze ? Object.freeze(snap) : snap;
+  };
+  const originalConnect = net.Socket.prototype.connect;
+  hook(net.Socket.prototype, 'connect', function (...args) {
+    let target = args[0], extra = args.slice(1);
+    if (Array.isArray(target)) {
+      // Node's _normalizeArgs output: [options, listener]. Delegate the
+      // validated snapshot as POSITIONAL arguments — re-wrapping into an array
+      // would lose Node's normalization marker and break the call.
+      const options = target[0];
+      extra = typeof target[1] === 'function' ? [target[1]] : [];
+      if (!options || typeof options !== 'object' || Array.isArray(options)) throw denied('net.Socket.connect');
+      return originalConnect.call(this, validatedEndpoint(options, 'net.Socket.connect', true), ...extra);
+    }
+    if (isPipeName(target)) return originalConnect.call(this, target, ...extra); // unix socket: local
+    if (target && typeof target === 'object') return originalConnect.call(this, validatedEndpoint(target, 'net.Socket.connect', true), ...extra);
+    // Port form: connect(port[, host]) / connect("443"[, host]).
+    if (!isNumericForm(target)) throw denied('net.Socket.connect');
+    const host = typeof extra[0] === 'string' ? extra[0] : undefined;
+    const rest = host === undefined ? extra : extra.slice(1);
+    if (host !== undefined && !literalLoopback(host)) throw denied('net.Socket.connect');
+    return originalConnect.call(this, Number(target), host ?? '127.0.0.1', ...rest);
+  });
+  const pipeConnection = function (...args) { return new net.Socket().connect(...args); };
+  hook(net, 'connect', pipeConnection); hook(net, 'createConnection', pipeConnection);
+  const originalListen = net.Server.prototype.listen;
+  hook(net.Server.prototype, 'listen', function (...args) {
+    const target = args[0], extra = args.slice(1);
+    if (isPipeName(target)) return originalListen.call(this, target, ...extra); // unix socket: local
+    if (target && typeof target === 'object' && !Array.isArray(target)) {
+      const snap = snapshot(target);
+      // Pre-bound descriptors and wrapped handles cannot be re-validated here.
+      if (snap.fd != null || snap.handle != null || snap._handle != null) throw denied('net.Server.listen');
+      // listen() without an explicit loopback host would bind every interface.
+      // The snapshot stays MUTABLE: Node writes options.exclusive onto it.
+      return originalListen.call(this, validatedEndpoint(snap, 'net.Server.listen', false, false), ...extra);
+    }
+    // listen(port[, host]) — including numeric strings like "0" or "0x0".
+    if (!isNumericForm(target)) throw denied('net.Server.listen');
+    const host = typeof extra[0] === 'string' ? extra[0] : undefined;
+    if (!literalLoopback(host)) throw denied('net.Server.listen');
+    return originalListen.call(this, Number(target), host, ...extra.slice(1));
+  });
+  const originalTls = tls.connect;
+  hook(tls, 'connect', function (...args) {
+    let target = args[0], extra = args.slice(1);
+    if (Array.isArray(target)) {
+      extra = typeof target[1] === 'function' ? [target[1]] : [];
+      target = target[0];
+    }
+    if (target && typeof target === 'object' && !Array.isArray(target)) {
+      const snap = snapshot(target);
+      if (snap.socket) return originalTls.call(this, Object.freeze(snap), ...extra); // wraps an already gated socket
+      return originalTls.call(this, validatedEndpoint(snap, 'tls.connect', true), ...extra);
+    }
+    if (isPipeName(target)) return originalTls.call(this, target, ...extra);
+    if (!isNumericForm(target)) throw denied('tls.connect');
+    // tls.connect(port[, host][, options][, cb]): Node MERGES a secondary
+    // options object over the positional arguments, so its host/path win over
+    // the positional host. Snapshot and validate the merged endpoint.
+    const positionalHost = typeof extra[0] === 'string' ? extra[0] : undefined;
+    const rest = positionalHost === undefined ? extra : extra.slice(1);
+    let effectiveHost = positionalHost, delegatedRest = rest;
+    const objIndex = rest.findIndex(value => value && typeof value === 'object' && !Array.isArray(value));
+    if (objIndex >= 0) {
+      const overrides = snapshot(rest[objIndex]);
+      if (overrides.path != null) throw denied('tls.connect'); // mixed with a positional port
+      if (overrides.host != null) effectiveHost = String(overrides.host);
+      delegatedRest = rest.map((value, index) => (index === objIndex ? Object.freeze(overrides) : value));
+    }
+    if (effectiveHost !== undefined && !literalLoopback(effectiveHost)) throw denied('tls.connect');
+    return originalTls.call(this, Number(target), effectiveHost ?? '127.0.0.1', ...delegatedRest);
+  });
+  block(dgram, ['createSocket'], 'dgram');
+  block(dgram.Socket?.prototype, ['send', 'connect', 'bind', 'addMembership', 'addSourceSpecificMembership'], 'dgram.Socket');
+  const dnsMethods = object => Object.getOwnPropertyNames(object || {}).filter(name => /^(?:resolve|reverse)/.test(name));
+  for (const object of [dns, dns.promises, dns.Resolver?.prototype, dns.promises?.Resolver?.prototype]) block(object, dnsMethods(object), 'dns');
+  block(dns.Resolver?.prototype, ['lookup'], 'dns'); block(dns.promises?.Resolver?.prototype, ['lookup'], 'dns');
+  // Node resolves even literal listen/connect hosts through dns.lookup; loopback
+  // literals make no network query, so only those may pass.
+  const originalLookup = dns.lookup;
+  hook(dns, 'lookup', function (name, ...rest) {
+    if (literalLoopback(String(name))) return originalLookup.apply(this, [name, ...rest]);
+    throw denied('dns.lookup');
+  });
+  if (dns.promises && typeof dns.promises.lookup === 'function') {
+    const originalPromisesLookup = dns.promises.lookup;
+    hook(dns.promises, 'lookup', function (name, ...rest) {
+      if (literalLoopback(String(name))) return originalPromisesLookup.apply(this, [name, ...rest]);
+      throw denied('dns.promises.lookup');
+    });
+  }
+  const httpGuard = (original, label) => function (...args) {
+    const target = args[0];
+    let host;
+    try {
+      if (typeof target === 'string' || target instanceof URL) host = new URL(target).hostname;
+      else host = target?.hostname ?? (typeof target?.host === 'string' ? target.host.split(':')[0] : undefined);
+    } catch { throw denied(label); }
+    if (host === undefined || literalLoopback(host)) return original.apply(this, args);
+    throw denied(label);
+  };
+  hook(http, 'request', httpGuard(http.request, 'http.request')); hook(http, 'get', httpGuard(http.get, 'http.get'));
+  hook(https, 'request', httpGuard(https.request, 'https.request')); hook(https, 'get', httpGuard(https.get, 'https.get'));
+  const originalHttp2 = http2.connect;
+  hook(http2, 'connect', function (authority) {
+    let host;
+    try { host = new URL(String(authority)).hostname; } catch { throw denied('http2.connect'); }
+    if (literalLoopback(host)) return originalHttp2.apply(this, arguments);
+    throw denied('http2.connect');
+  });
+  const originalFetch = globalThis.fetch;
+  if (typeof originalFetch === 'function') {
+    hook(globalThis, 'fetch', function (input) {
+      let host;
+      try { host = new URL(typeof input === 'string' ? input : input.url).hostname; } catch { return Promise.reject(denied('fetch')); }
+      if (literalLoopback(host)) return originalFetch.apply(this, arguments);
+      return Promise.reject(denied('fetch'));
+    });
+  }
+  for (const name of ['WebSocket', 'EventSource']) {
+    const original = globalThis[name];
+    if (typeof original !== 'function') continue;
+    hook(globalThis, name, function (url) {
+      let host;
+      try { host = new URL(String(url)).hostname; } catch { throw denied(name); }
+      if (!literalLoopback(host)) throw denied(name);
+      return Reflect.construct(original, arguments);
+    });
+  }
+  const proxySettingsMatch = options => options && options.mode === 'fixed_servers' &&
+    options.proxyRules === cfg.proxyURL && options.proxyBypassRules === '<-loopback>' && !options.pacScript;
+  const protectedSessions = new WeakSet();
+  function protectSession(s) {
+    if (!s || protectedSessions.has(s)) return;
+    protectedSessions.add(s);
+    const setProxy = s.setProxy;
+    hook(s, 'setProxy', function (options) {
+      if (!cfg.proxyURL || !proxySettingsMatch(options)) return Promise.reject(denied('session.setProxy'));
+      return setProxy.call(this, options);
+    });
+    block(s, ['resolveHost'], 'session');
+  }
+  app.on('session-created', protectSession);
+  installNetworkHardening.protectSession = protectSession;
+  const commandLine = app.commandLine;
+  const switches = {
+    'force-webrtc-ip-handling-policy': 'disable_non_proxied_udp', 'disable-quic': '', 'dns-prefetch-disable': '',
+    // Destination names are resolved by the relay; Chromium only connects to its
+    // literal loopback address. Speculative/background hostname lookups must fail.
+    'host-resolver-rules': 'MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'
+  };
+  if (cfg.proxyURL) { switches['proxy-server'] = cfg.proxyURL; switches['proxy-bypass-list'] = '<-loopback>'; }
+  const dangerousSwitches = new Set(['no-proxy-server', 'proxy-auto-detect', 'proxy-pac-url', 'enable-quic']);
+  const appendSwitch = commandLine.appendSwitch;
+  for (const [name, value] of Object.entries(switches)) appendSwitch.call(commandLine, name, value);
+  hook(commandLine, 'appendSwitch', function (name, value = '') {
+    const key = String(name).replace(/^--/, '').toLowerCase();
+    if (dangerousSwitches.has(key) || (Object.hasOwn(switches, key) && String(value) !== switches[key])) throw denied('commandLine.appendSwitch');
+    return appendSwitch.call(this, name, value);
+  });
+  const removeSwitch = commandLine.removeSwitch;
+  hook(commandLine, 'removeSwitch', function (name) {
+    if (Object.hasOwn(switches, String(name).replace(/^--/, '').toLowerCase())) throw denied('commandLine.removeSwitch');
+    return removeSwitch.call(this, name);
+  });
+  const appendArgument = commandLine.appendArgument;
+  hook(commandLine, 'appendArgument', function (argument) {
+    if (String(argument).startsWith('--')) throw denied('commandLine.appendArgument');
+    return appendArgument.call(this, argument);
+  });
+  try { block(electron.net, ['resolveHost'], 'electron.net'); } catch {}
+  installNetworkHardening.lockWebRTC = wc => {
+    if (typeof wc.setWebRTCIPHandlingPolicy !== 'function') return;
+    const policy = wc.setWebRTCIPHandlingPolicy;
+    policy.call(wc, 'disable_non_proxied_udp');
+    hook(wc, 'setWebRTCIPHandlingPolicy', function (value) {
+      if (value !== 'disable_non_proxied_udp') throw denied('webContents.setWebRTCIPHandlingPolicy');
+      return policy.call(this, value);
+    });
+  };
+}
+installNetworkHardening();
 function configureSession(s) {
   if (sessionGates.has(s)) return sessionGates.get(s);
+  installNetworkHardening.protectSession?.(s);
   const gate = cfg.proxyURL ? s.setProxy({ mode: 'fixed_servers', proxyRules: cfg.proxyURL, proxyBypassRules: '<-loopback>' }) : Promise.resolve();
   sessionGates.set(s, gate); gate.catch(fatal); return gate;
 }
@@ -106,7 +342,7 @@ function attach(wc) {
   }
   expose(wc);
 }
-app.on('web-contents-created', (_event, wc) => { try { attach(wc); } catch (error) { fatal(error); } });
+app.on('web-contents-created', (_event, wc) => { try { installNetworkHardening.lockWebRTC?.(wc); attach(wc); } catch (error) { fatal(error); } });
 async function command(m) {
   let result;
   if (!m.sessionId) {

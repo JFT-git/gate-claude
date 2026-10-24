@@ -21,6 +21,13 @@ struct ProxySettings: Equatable {
               let port = UInt16(port), port > 0 else {
             throw GuardError.message("Введите хост без socks5:// и порт от 1 до 65535.")
         }
+        // Multicast DNS names resolve outside any pinned route and reveal the proxy
+        // name on the local network; literal addresses or ordinary DNS names only.
+        let lowered = host.lowercased()
+        guard !lowered.hasSuffix(".local"), !lowered.hasSuffix(".local."),
+              !lowered.hasSuffix(".lan"), !lowered.hasSuffix(".internal") else {
+            throw GuardError.message("Имя прокси в зоне .local/.lan/.internal не поддерживается: оно разрешается через mDNS мимо закреплённого маршрута. Укажите числовой адрес или обычное DNS-имя.")
+        }
         guard username.utf8.count <= 255, password.utf8.count <= 255 else {
             throw GuardError.message("Логин и пароль SOCKS5 должны быть не длиннее 255 байт.")
         }
@@ -164,12 +171,18 @@ final class SOCKSRelay: @unchecked Sendable {
     }()
     enum Mode { case probeOnly, open, blocked }
     enum PinFamily { case v4, v6 }
+    /// Kill switch for current-network sessions: upstream sockets are bound to the
+    /// pinned local address of the approved egress interface. When the interface or
+    /// VPN disappears, the address is gone and new connections fail before any packet
+    /// leaves. A missing address for a required family refuses that family.
+    struct LocalPin: Equatable { let v4: String?; let v6: String? }
     private let queue = DispatchQueue(label: "local.proxyguard.relay")
     private let settings: ProxySettings?
     private var listener: NWListener?
     private var tunnels: [UUID: RelayTunnel] = [:]
     private var mode: Mode = .probeOnly
     private var pinnedFamily: PinFamily?
+    private var pinnedLocal: LocalPin?
     private var startup: CheckedContinuation<UInt16, Error>?
     private var alive = true
     private var faultReported = false
@@ -209,7 +222,7 @@ final class SOCKSRelay: @unchecked Sendable {
                             connection.cancel(); return
                         }
                         let id = UUID()
-                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily, checkToken: self.checkToken)
+                        let tunnel = RelayTunnel(client: connection, settings: self.settings, queue: self.queue, pinnedFamily: self.pinnedFamily, pinnedLocal: self.pinnedLocal, checkToken: self.checkToken, captureGeneration: self.currentCaptureGeneration)
                         tunnel.isAllowed = { [weak self] host, port, control in
                             guard let self, self.alive else { return false }
                             switch self.mode {
@@ -225,6 +238,7 @@ final class SOCKSRelay: @unchecked Sendable {
                         }
                         tunnel.onUpstreamFault = { [weak self] in self?.upstreamFailed() }
                         tunnel.onProbeConnected = { [weak self] in self?.faultReported = false }
+                        tunnel.onLocalEndpoint = { [weak self] host, generation in self?.noteEgressLocal(host, generation: generation) }
                         self.tunnels[id] = tunnel
                         tunnel.start()
                     }
@@ -247,6 +261,51 @@ final class SOCKSRelay: @unchecked Sendable {
         queue.sync { pinnedFamily = family }
     }
 
+    /// nil disables the egress kill switch (SOCKS sessions manage their own upstream).
+    func setPinnedLocalAddresses(_ pin: LocalPin?) {
+        queue.sync { pinnedLocal = pin }
+    }
+
+    // The pinned addresses are learned from the actual control connections of the
+    // IP checks, not from the default route: split-route VPNs (0/1+128/1) make the
+    // default route point at the physical interface while traffic really leaves
+    // through the tunnel. Capturing the proven egress address pins the right one.
+    // Only authenticated control tunnels may teach the pin, and a capture made
+    // before the latest reset (old generation) is ignored, so an in-flight dial
+    // from the previous network cannot poison the new capture.
+    private var capturedV4: String?
+    private var capturedV6: String?
+    private var captureGeneration: UInt64 = 0
+    fileprivate var currentCaptureGeneration: UInt64 { captureGeneration }
+    fileprivate func noteEgressLocal(_ host: String, generation: UInt64) {
+        guard generation == captureGeneration else { return }
+        var v4 = in_addr(); var v6 = in6_addr()
+        if inet_pton(AF_INET, host, &v4) == 1 {
+            if !host.hasPrefix("127.") && !host.hasPrefix("169.254.") { capturedV4 = host }
+        } else if inet_pton(AF_INET6, host, &v6) == 1 {
+            // ULA (fc00::/7) is accepted: IPv6-only VPNs legitimately use ULA
+            // tunnel source addresses. Loopback, link-local, unspecified and
+            // mapped IPv4 are still rejected.
+            let lower = host.lowercased()
+            if lower != "::1" && lower != "::" && !lower.hasPrefix("fe80")
+                && !RelayTunnel.isMappedIPv4(lower) { capturedV6 = host }
+        }
+    }
+    /// Local addresses observed on egress connections; nil when nothing was learned.
+    func capturedLocalAddresses() -> LocalPin? {
+        queue.sync {
+            guard capturedV4 != nil || capturedV6 != nil else { return nil }
+            return LocalPin(v4: capturedV4, v6: capturedV6)
+        }
+    }
+    /// Direct current-network relays bind egress to the proven local addresses;
+    /// relays with a SOCKS upstream leave egress to the proxy process instead.
+    var isDirect: Bool { settings == nil }
+    /// Clears both the pin and the learned addresses (session stop and revalidation).
+    func resetLocalPinning() {
+        queue.sync { pinnedLocal = nil; capturedV4 = nil; capturedV6 = nil; captureGeneration &+= 1 }
+    }
+
     func unlock() -> Bool {
         queue.sync {
             guard alive, mode == .probeOnly, !faultReported else { return false }
@@ -266,7 +325,7 @@ final class SOCKSRelay: @unchecked Sendable {
 
     func stop() {
         queue.sync {
-            alive = false; mode = .blocked; pinnedFamily = nil
+            alive = false; mode = .blocked; pinnedFamily = nil; pinnedLocal = nil
             for tunnel in Array(tunnels.values) { tunnel.close() }
             listener?.cancel(); listener = nil
         }
@@ -289,6 +348,7 @@ private final class RelayTunnel {
     private let settings: ProxySettings?
     private let queue: DispatchQueue
     var pinnedFamily: SOCKSRelay.PinFamily?
+    private let pinnedLocal: SOCKSRelay.LocalPin?
     private var closed = false
     private var established = false
     private var header = Data()
@@ -302,11 +362,24 @@ private final class RelayTunnel {
     var onClose: (() -> Void)?
     var onUpstreamFault: (() -> Void)?
     var onProbeConnected: (() -> Void)?
+    var onLocalEndpoint: ((String, UInt64) -> Void)?
+    private let captureGeneration: UInt64
 
-    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?, checkToken: String) {
+    init(client: NWConnection, settings: ProxySettings?, queue: DispatchQueue, pinnedFamily: SOCKSRelay.PinFamily?, pinnedLocal: SOCKSRelay.LocalPin?, checkToken: String, captureGeneration: UInt64) {
         self.checkToken = checkToken
         self.client = client; self.settings = settings; self.queue = queue
-        self.pinnedFamily = pinnedFamily
+        self.pinnedFamily = pinnedFamily; self.pinnedLocal = pinnedLocal
+        self.captureGeneration = captureGeneration
+    }
+
+    /// IPv4-mapped IPv6 must never open an unmonitored IPv4 connection.
+    static func isMappedIPv4(_ host: String) -> Bool {
+        var v6 = in6_addr()
+        guard inet_pton(AF_INET6, host, &v6) == 1 else { return false }
+        return withUnsafeBytes(of: &v6) { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            return bytes[0..<10].allSatisfy { $0 == 0 } && bytes[10] == 0xff && bytes[11] == 0xff
+        }
     }
 
     func start() {
@@ -409,7 +482,7 @@ private final class RelayTunnel {
             if inet_pton(AF_INET, destination, &v4) == 1 {
                 guard family == AF_INET else { close(); return }
             } else if inet_pton(AF_INET6, destination, &v6) == 1 {
-                guard family == AF_INET6 else { close(); return }
+                guard family == AF_INET6, !Self.isMappedIPv4(destination) else { close(); return }
             } else {
                 var hints = addrinfo()
                 hints.ai_family = family
@@ -427,14 +500,51 @@ private final class RelayTunnel {
                     close(); return
                 }
                 host = String(cString: literal)
+                guard !Self.isMappedIPv4(host) else { close(); return }
             }
         }
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        let parameters = NWParameters.tcp
+        if let pin = pinnedLocal {
+            // Kill switch: bind the upstream socket to the pinned address of the
+            // approved egress interface. If that interface or VPN is gone, the bind
+            // fails and no packet can leave through a fallback route.
+            var v4check = in_addr()
+            let isV4 = inet_pton(AF_INET, host, &v4check) == 1
+            var parsedV4 = in_addr(); var parsedV6 = in6_addr()
+            guard let local = isV4 ? pin.v4 : pin.v6,
+                  (isV4 ? inet_pton(AF_INET, local, &parsedV4) : inet_pton(AF_INET6, local, &parsedV6)) == 1,
+                  isV4 || !Self.isMappedIPv4(local) else { close(); return }
+            parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(local), port: .any)
+        }
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: parameters)
         upstream = connection
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, !self.closed else { return }
             switch state {
-            case .ready: self.connected()
+            case .ready:
+                // Learn the proven egress address of this connection: it becomes the
+                // kill-switch pin, so the pin always reflects the real route taken.
+                // Only authenticated control tunnels may teach the pin — application
+                // dials never influence which address gets pinned.
+                if self.settings == nil, self.isControl, let local = connection.currentPath?.localEndpoint,
+                   case .hostPort(let localHost, _) = local {
+                    switch localHost {
+                    case .ipv4(let address):
+                        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                        _ = address.rawValue.withUnsafeBytes { ptr in
+                            inet_ntop(AF_INET, ptr.baseAddress, &buffer, socklen_t(buffer.count))
+                        }
+                        self.onLocalEndpoint?(String(cString: buffer), self.captureGeneration)
+                    case .ipv6(let address):
+                        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                        _ = address.rawValue.withUnsafeBytes { ptr in
+                            inet_ntop(AF_INET6, ptr.baseAddress, &buffer, socklen_t(buffer.count))
+                        }
+                        self.onLocalEndpoint?(String(cString: buffer), self.captureGeneration)
+                    default: break
+                    }
+                }
+                self.connected()
             // A single destination failing is not evidence of a changed exit IP.
             case .failed, .waiting: self.close()
             default: break
@@ -556,3 +666,4 @@ private final class RelayTunnel {
 
     private func failUpstream() { guard !closed else { return }; close(); onUpstreamFault?() }
 }
+

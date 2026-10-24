@@ -5,7 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const net = require('node:net');
 const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
-const { SOCKSRelay, NetworkRelay } = require('./relay.cjs');
+const { SOCKSRelay, NetworkRelay, setPinnedLocalAddresses, capturedEgressLocalAddresses, beginEgressCapture } = require('./relay.cjs');
 const { initialIP, currentIP, queryDestinationIP, NetworkCheckError } = require('./ip-check.cjs');
 const { readSystemProxy } = require('./system-proxy.cjs');
 const { prepareRuntime } = require('./runtime.cjs');
@@ -111,11 +111,13 @@ class GuardController extends EventEmitter {
         if (!active()) return;
         const fingerprint = networkFingerprint();
         if (fingerprint !== this.fingerprint) {
+          this.relay?.pause();
           this.fingerprint = fingerprint;
           this.revalidate('Изменились локальные адреса или сетевые интерфейсы. Проверяем закреплённый IP.');
         }
       }, 1000);
       this.route = await this.routeFingerprint(); if (!active()) return;
+      setPinnedLocalAddresses(null); beginEgressCapture();
       this.networkProxy = settings.mode === 'network' ? Object.freeze({ ...await this.networkProxyConfiguration() }) : null;
       if (!active()) return;
       this.relay = settings.mode === 'network' ? new NetworkRelay({ upstream: this.networkProxy }) : new SOCKSRelay({ host: settings.host, port: settings.port, username: settings.username, password: settings.password });
@@ -123,6 +125,7 @@ class GuardController extends EventEmitter {
       this.relay.on('revalidate', reason => { if (active()) this.revalidate(reason); });
       const port = await this.relay.start(); if (!active()) return;
       const pinExit = async () => {
+        const revision = this.revalidationRevision || 0, interfaces = networkFingerprint();
         const initial = await this.requestIP(epoch, initialIP, port, this.relay.checkToken); if (!active()) return false;
         const pin = this.policy.pin(initial); this.country = pin.country;
         if (settings.mode === 'network') this.relay.pinIPFamily(net.isIP(pin.ip));
@@ -133,6 +136,10 @@ class GuardController extends EventEmitter {
           if (active()) throw Error('Не удалось подтвердить настройки прокси Windows перед запуском.');
           return false;
         }
+        const localPin = await this.refreshLocalAddresses(epoch, false); if (!active()) return false;
+        if (this.usesLocalPin() && !localPin) throw Error('Локальный адрес выхода изменился во время проверки.');
+        if (revision !== (this.revalidationRevision || 0) || interfaces !== networkFingerprint()) throw Error('Сеть изменилась во время начальной проверки IP.');
+        if (!this.publishLocalAddresses(localPin)) throw Error('Локальный адрес изменился перед запуском.');
         this.log('Исходный IP закреплён: [IP скрыт] · ' + pin.country);
         this.schedulePoll(epoch, settings.interval * 1000);
         return true;
@@ -291,6 +298,7 @@ class GuardController extends EventEmitter {
       if (this.checkTask) await this.checkTask.promise;
       clearTimeout(this.pollTimer);
       if (!active()) return false;
+      this.beginLocalRevalidation();
       const revision = this.revalidationRevision || 0, interfaces = networkFingerprint();
       let beforeRoute, afterRoute, beforeRouteFailed = false;
       try {
@@ -325,6 +333,13 @@ class GuardController extends EventEmitter {
         this.pauseForRevalidation('Во время подготовки изменилась сеть. Проверяем закреплённый IP повторно.');
         continue;
       }
+      const localPin = await this.refreshLocalAddresses(epoch, false); if (!active()) return false;
+      if (this.usesLocalPin() && !localPin) continue;
+      if (revision !== (this.revalidationRevision || 0) || interfaces !== networkFingerprint()) {
+        this.pauseForRevalidation('Во время закрепления изменилась сеть. Повторяем проверку.');
+        continue;
+      }
+      if (!this.publishLocalAddresses(localPin)) continue;
       this.route = afterRoute; this.fingerprint = afterInterfaces;
       this.relay.resume(); if (this.state === 'rechecking') this.state = 'checking';
       this.schedulePoll(epoch, this.settings.interval * 1000);
@@ -403,6 +418,45 @@ class GuardController extends EventEmitter {
       });
       try { child.stdin.end(Buffer.concat([header, body])); } catch { fail(); }
     });
+  }
+  async localEgressAddresses() {
+    const pin = capturedEgressLocalAddresses();
+    if (!pin.v4 && !pin.v6) throw Error('Не удалось определить локальные адреса выхода Windows. Соединение закрыто.');
+    return pin;
+  }
+  usesLocalPin() {
+    return this.settings?.mode === 'network' && this.networkProxy?.kind === 'direct';
+  }
+  beginLocalRevalidation() {
+    this.relay?.pause();
+    setPinnedLocalAddresses(null);
+    beginEgressCapture();
+  }
+
+  async refreshLocalAddresses(epoch, publish = true) {
+    if (!this.usesLocalPin()) return;
+    const captured = JSON.stringify(capturedEgressLocalAddresses());
+    let pin;
+    try { pin = await this.localEgressAddresses(); }
+    catch (error) { if (this.epoch === epoch) this.block(error.message); throw error; }
+    if (this.epoch === epoch && !this.policy.blocked) {
+      if (captured !== JSON.stringify(capturedEgressLocalAddresses())) {
+        this.pauseForRevalidation('Во время закрепления изменился локальный адрес выхода. Повторяем проверку.');
+        return;
+      }
+      this.localCaptureSignature = captured;
+      if (publish && !this.publishLocalAddresses(pin)) return;
+      return pin;
+    }
+  }
+  publishLocalAddresses(pin) {
+    if (!pin) return true;
+    if (this.localCaptureSignature !== JSON.stringify(capturedEgressLocalAddresses())) {
+      this.pauseForRevalidation('Локальный адрес изменился перед возобновлением. Повторяем проверку.');
+      return false;
+    }
+    setPinnedLocalAddresses(pin);
+    return true;
   }
   networkProxyConfiguration() { return readSystemProxy(); }
   async confirmNetworkProxy(epoch) {
@@ -530,6 +584,7 @@ class GuardController extends EventEmitter {
     if (!this.relay || !this.policy.pinned || this.policy.blocked || ['idle', 'blocked'].includes(this.state)) return false;
     if (invalidate) this.revalidationRevision = (this.revalidationRevision || 0) + 1;
     this.relay.pause();
+    setPinnedLocalAddresses(null);
     if (this.state !== 'rechecking') this.log(reason, 'warning');
     this.state = 'rechecking';
     this.status(reason + ' Трафик приостановлен до подтверждения прежнего IP.');
@@ -557,6 +612,7 @@ class GuardController extends EventEmitter {
       // the IP request, even when no interface event increments the revision.
       let beforeRoute, beforeRouteFailed = false;
       if (rechecking) {
+        this.beginLocalRevalidation();
         try { beforeRoute = await this.routeFingerprint(); }
         catch {
           if (active()) this.pauseForRevalidation('Не удалось проверить маршрут сети. Повторяем проверку.', false);
@@ -589,6 +645,8 @@ class GuardController extends EventEmitter {
       }
       if (rechecking && !await this.confirmNetworkProxy(epoch)) return;
       if (!active()) return;
+      const localPin = rechecking ? await this.refreshLocalAddresses(epoch, false) : null; if (!active()) return;
+      if (rechecking && this.usesLocalPin() && !localPin) return;
       const after = networkFingerprint();
       if (before !== after) {
         this.fingerprint = after;
@@ -605,6 +663,7 @@ class GuardController extends EventEmitter {
         this.pauseForRevalidation('Изменился маршрут сети. Проверяем закреплённый IP.');
         return;
       }
+      if (!this.publishLocalAddresses(localPin)) return;
       if (this.state === 'rechecking') {
         this.route = route.value; this.fingerprint = after;
         this.relay.resume();
@@ -624,6 +683,7 @@ class GuardController extends EventEmitter {
     this.checkTask = task; return task.promise;
   }
   teardown() {
+    setPinnedLocalAddresses(null);
     this.codeGate?.close(); this.codeGate = null;
     this.codeAssetAbort?.abort(); this.codeAssetAbort = null;
     this.cancelCodeState?.();
