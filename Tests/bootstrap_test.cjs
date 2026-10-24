@@ -102,6 +102,45 @@ check('net-connect-normalized-array-loopback', () => { const s = net.connect(net
 check('server-listen-tricky-numeric-strings', () => {
   for (const value of [' 0', '0x0', '+0', '0e0']) assert.throws(() => net.createServer().listen(value), /Guard blocked/, value);
 });
+// Options are validated as one-time snapshots: getters must not answer
+// loopback during validation and something else when Node re-reads them.
+check('net-connect-getter-bypass-denied', () => {
+  let reads = 0;
+  const options = { port: 443, get host() { return ++reads <= 2 ? '127.0.0.1' : '203.0.113.9'; } };
+  const s = net.connect(options); s.on('error', () => {}); s.destroy();
+  assert.ok(reads > 0);
+});
+check('net-connect-getter-external-stays-local', async () => {
+  // The frozen snapshot is delegated: even a hostile getter cannot smuggle an
+  // external host past the validation read.
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  let reads = 0;
+  const options = { port, get host() { return ++reads === 1 ? '127.0.0.1' : '203.0.113.9'; } };
+  await new Promise((resolve, reject) => {
+    const s = net.connect(options);
+    s.once('connect', () => { s.destroy(); resolve(); });
+    s.once('error', reject);
+  });
+  server.close();
+});
+check('server-listen-mixed-path-port-denied', () => assert.throws(() => net.createServer().listen({ path: '/tmp/guard-x.sock', port: 0 }), /Guard blocked/));
+check('server-listen-handle-denied', () => assert.throws(() => net.createServer().listen({ host: '127.0.0.1', handle: { port: 0 } }), /Guard blocked/));
+check('server-listen-fd-denied', () => assert.throws(() => net.createServer().listen({ fd: 99 }), /Guard blocked/));
+check('net-connect-normalized-array-hostless', async () => {
+  // Hostless normalized arrays get loopback injected and must not lose the
+  // listener to an ERR_MISSING_ARGS rewrap.
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise((resolve, reject) => {
+    const s = net.connect(net._normalizeArgs([{ port }]));
+    s.once('connect', () => { s.destroy(); resolve(); });
+    s.once('error', reject);
+  });
+  server.close();
+});
 check('net-connect-hostless-options-loopback', async () => {
   const server = net.createServer();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
