@@ -97,6 +97,33 @@ check('server-listen-numeric-string-no-host', () => assert.throws(() => net.crea
 check('server-listen-numeric-string-loopback', () => { const s = net.createServer(); s.listen('0', '127.0.0.1'); s.close(); });
 check('net-connect-normalized-array-external', () => assert.throws(() => net.connect(net._normalizeArgs([{ host: '203.0.113.9', port: 443 }])), /Guard blocked/));
 check('net-connect-normalized-array-loopback', () => { const s = net.connect(net._normalizeArgs([{ host: '127.0.0.1', port: 9 }])); s.destroy(); });
+// Node normalizes " 0", "0x0", "+0", "0e0" to TCP port 0 (wildcard bind),
+// not to unix paths; hostless connects must reach loopback without DNS.
+check('server-listen-tricky-numeric-strings', () => {
+  for (const value of [' 0', '0x0', '+0', '0e0']) assert.throws(() => net.createServer().listen(value), /Guard blocked/, value);
+});
+check('net-connect-hostless-options-loopback', async () => {
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise((resolve, reject) => {
+    const s = net.connect({ port });
+    s.once('connect', () => { s.destroy(); resolve(); });
+    s.once('error', reject);
+  });
+  server.close();
+});
+check('net-connect-hostless-port-loopback', async () => {
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise((resolve, reject) => {
+    const s = net.connect(port);
+    s.once('connect', () => { s.destroy(); resolve(); });
+    s.once('error', reject);
+  });
+  server.close();
+});
 
 const tls = require('node:tls');
 check('tls-connect-external', () => assert.throws(() => tls.connect(443, '203.0.113.9'), /Guard blocked/));

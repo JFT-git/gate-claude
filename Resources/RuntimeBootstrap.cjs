@@ -70,6 +70,12 @@ function installNetworkHardening() {
   }
   function block(object, names, label) { for (const name of names) hook(object, name, deny(label + '.' + name)); }
   const literalLoopback = value => /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(String(value)) || String(value) === '::1';
+  // Node treats a string as a unix path ONLY when it is not numeric at all:
+  // "443", " 0", "0x0", "+0", "0e0" all normalize to TCP ports. Hostless TCP
+  // forms default to the NAME "localhost", whose resolution the DNS guard
+  // denies, so validated hostless forms get the loopback literal injected.
+  const isPipeName = value => typeof value === 'string' && Number.isNaN(Number(value));
+  const isNumericForm = value => typeof value === 'number' || (typeof value === 'string' && !Number.isNaN(Number(value)));
   const originalConnect = net.Socket.prototype.connect;
   hook(net.Socket.prototype, 'connect', function (...args) {
     let target = args[0];
@@ -77,30 +83,25 @@ function installNetworkHardening() {
       // Node's _normalizeArgs turns every connect() form into
       // [options, listener]; passing that array back in would skip the string
       // and property checks below, so only validated object options may pass.
-      target = target[0];
-      if (!target || typeof target !== 'object') throw denied('net.Socket.connect');
-      if (target.path) return originalConnect.apply(this, args); // unix socket: local
-      // connect() without a host defaults to localhost; an explicit host must
-      // be a loopback literal.
-      if (!target.host || literalLoopback(target.host)) return originalConnect.apply(this, args);
+      const options = target[0];
+      if (!options || typeof options !== 'object') throw denied('net.Socket.connect');
+      if (options.path) return originalConnect.apply(this, args); // unix socket: local
+      if (!options.host) return originalConnect.apply(this, [[Object.assign({}, options, { host: '127.0.0.1' }), target[1]]]);
+      if (literalLoopback(options.host)) return originalConnect.apply(this, args);
       throw denied('net.Socket.connect');
     }
-    if (typeof target === 'string') {
-      if (target.startsWith('/')) return originalConnect.apply(this, args); // unix socket: local
-      // Numeric-string port form: connect("443", "host").
-      const host = typeof args[1] === 'string' ? args[1] : undefined;
-      if (/^\d+$/.test(target) && (!host || literalLoopback(host))) return originalConnect.apply(this, args);
-      throw denied('net.Socket.connect');
-    }
+    if (isPipeName(target)) return originalConnect.apply(this, args); // unix socket: local
     if (target && typeof target === 'object') {
       if (target.path) return originalConnect.apply(this, args); // unix socket: local
-      // connect() without a host defaults to localhost; an explicit host must
-      // be a loopback literal.
-      if (!target.host || literalLoopback(target.host)) return originalConnect.apply(this, args);
+      if (!target.host) return originalConnect.apply(this, [Object.assign({}, target, { host: '127.0.0.1' }), ...args.slice(1)]);
+      if (literalLoopback(target.host)) return originalConnect.apply(this, args);
       throw denied('net.Socket.connect');
     }
+    // Port form: connect(port[, host]) / connect("443"[, host]).
+    if (!isNumericForm(target)) throw denied('net.Socket.connect');
     const host = typeof args[1] === 'string' ? args[1] : undefined;
-    if (!host || literalLoopback(host)) return originalConnect.apply(this, args);
+    if (!host) return originalConnect.apply(this, [target, '127.0.0.1', ...args.slice(2)]);
+    if (literalLoopback(host)) return originalConnect.apply(this, args);
     throw denied('net.Socket.connect');
   });
   const pipeConnection = function (...args) { return new net.Socket().connect(...args); };
@@ -108,15 +109,14 @@ function installNetworkHardening() {
   const originalListen = net.Server.prototype.listen;
   hook(net.Server.prototype, 'listen', function (...args) {
     const target = args[0];
-    if (typeof target === 'string' && !/^\d+$/.test(target)) return originalListen.apply(this, args); // unix socket: local
-    // A numeric string is a PORT to Node, not a path: listen("0") would bind
-    // every interface. Treat it exactly like the numeric form below.
-    if (target && typeof target === 'object') {
+    if (isPipeName(target)) return originalListen.apply(this, args); // unix socket: local
+    if (target && typeof target === 'object' && !Array.isArray(target)) {
       if (target.path) return originalListen.apply(this, args);
       if (literalLoopback(target.host)) return originalListen.apply(this, args);
       throw denied('net.Server.listen');
     }
-    // listen(port) without a host would bind every interface: require loopback.
+    // listen(port[, host]) — including numeric strings like "0" or "0x0" —
+    // without an explicit loopback host would bind every interface.
     const host = typeof args[1] === 'string' ? args[1] : undefined;
     if (literalLoopback(host)) return originalListen.apply(this, args);
     throw denied('net.Server.listen');
@@ -124,14 +124,20 @@ function installNetworkHardening() {
   const originalTls = tls.connect;
   hook(tls, 'connect', function (...args) {
     const target = args[0];
-    if (target && typeof target === 'object' && target.socket) return originalTls.apply(this, args); // wraps a gated socket
-    if (typeof target === 'string' && /^\d+$/.test(target)) {
+    if (target && typeof target === 'object' && !Array.isArray(target) && target.socket) return originalTls.apply(this, args); // wraps a gated socket
+    if (typeof target === 'string' && !isPipeName(target)) {
       const host = typeof args[1] === 'string' ? args[1] : undefined;
-      if (!host || literalLoopback(host)) return originalTls.apply(this, args);
+      if (!host) return originalTls.apply(this, [target, '127.0.0.1', ...args.slice(2)]);
+      if (literalLoopback(host)) return originalTls.apply(this, args);
       throw denied('tls.connect');
     }
     const host = target && typeof target === 'object' ? target.host : (typeof args[0] === 'number' ? args[1] : typeof target === 'string' ? target : undefined);
-    if (!host || literalLoopback(host)) return originalTls.apply(this, args);
+    if (!host) {
+      if (target && typeof target === 'object' && !Array.isArray(target)) return originalTls.apply(this, [Object.assign({}, target, { host: '127.0.0.1' }), ...args.slice(1)]);
+      if (typeof args[0] === 'number') return originalTls.apply(this, [args[0], '127.0.0.1', ...args.slice(2)]);
+      return originalTls.apply(this, args);
+    }
+    if (literalLoopback(host)) return originalTls.apply(this, args);
     throw denied('tls.connect');
   });
   block(dgram, ['createSocket'], 'dgram');
