@@ -9,7 +9,7 @@ expected={
 }
 for p in ['README.md','SECURITY.md','CHANGELOG.md',*[x.relative_to(root).as_posix() for x in (root/'docs').rglob('*') if x.is_file()]]:
  expected['Resources/Documentation/'+p]=root/p
-for p in ['MacOS/ClaudeProxyGuard','MacOS/GuardHost','_CodeSignature/CodeResources']:
+for p in ['MacOS/ClaudeProxyGuard','MacOS/GuardHost','MacOS/GuardDrop','_CodeSignature/CodeResources']:
  expected[p]=root/'Claude Proxy Guard.app/Contents'/p
 seen=set()
 with zipfile.ZipFile(sys.argv[1]) as z:
