@@ -70,18 +70,21 @@ function installNetworkHardening() {
   }
   function block(object, names, label) { for (const name of names) hook(object, name, deny(label + '.' + name)); }
   const literalLoopback = value => /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(String(value)) || String(value) === '::1';
-  // Node treats a string as a unix path ONLY when it is not numeric at all:
-  // "443", " 0", "0x0", "+0", "0e0" all normalize to TCP ports. Hostless TCP
-  // forms default to the NAME "localhost", whose resolution the DNS guard
-  // denies, so validated hostless forms get the loopback literal injected.
-  const isPipeName = value => typeof value === 'string' && Number.isNaN(Number(value));
-  const isNumericForm = value => typeof value === 'number' || (typeof value === 'string' && !Number.isNaN(Number(value)));
-  // Options objects are validated as ONE-TIME SNAPSHOTS: a getter answering
-  // loopback during validation but an external address when Node re-reads the
-  // property must never work — only the frozen copy is delegated.
+  // Node's exact classification (lib/net.js toNumber/isPipeName): a string is a
+  // unix path unless Number(value) >= 0, so "-1" is a path while " 0", "0x0",
+  // "+0", "0e0", "Infinity", "1e2" are TCP ports.
+  const isPipeName = value => typeof value === 'string' && !(Number(value) >= 0);
+  const isNumericForm = value => typeof value === 'number' || (typeof value === 'string' && Number(value) >= 0);
+  // Options objects are validated as ONE-TIME SNAPSHOTS with a null prototype:
+  // a getter answering loopback during validation but an external address when
+  // Node re-reads the property must never work, and an own enumerable
+  // "__proto__" key must not become the copy's prototype. Only the frozen
+  // copy is delegated.
   const snapshot = target => {
-    const copy = {};
-    for (const key of Object.keys(target)) copy[key] = target[key];
+    const copy = Object.create(null);
+    for (const key of Object.keys(target)) {
+      Object.defineProperty(copy, key, { value: target[key], enumerable: true, writable: true, configurable: true });
+    }
     return copy;
   };
   // Splits an options object into a validated transport form, or denies it.
@@ -93,13 +96,13 @@ function installNetworkHardening() {
     const snap = snapshot(target);
     const hasPath = snap.path != null, hasTCP = snap.host != null || snap.port != null;
     if (hasPath && hasTCP) throw denied(label);
-    if (hasPath) { snap.path = String(snap.path); return snap; }
+    if (hasPath) { snap.path = String(snap.path); return Object.freeze(snap); }
     if (snap.port == null) throw denied(label);
     if (snap.host == null) {
       if (!hostlessAllowed) throw denied(label);
       snap.host = '127.0.0.1';
     } else if (!literalLoopback(snap.host)) throw denied(label);
-    return snap;
+    return Object.freeze(snap);
   };
   const originalConnect = net.Socket.prototype.connect;
   hook(net.Socket.prototype, 'connect', function (...args) {
@@ -150,15 +153,26 @@ function installNetworkHardening() {
     }
     if (target && typeof target === 'object' && !Array.isArray(target)) {
       const snap = snapshot(target);
-      if (snap.socket) return originalTls.call(this, snap, ...extra); // wraps an already gated socket
+      if (snap.socket) return originalTls.call(this, Object.freeze(snap), ...extra); // wraps an already gated socket
       return originalTls.call(this, validatedEndpoint(snap, 'tls.connect', true), ...extra);
     }
     if (isPipeName(target)) return originalTls.call(this, target, ...extra);
     if (!isNumericForm(target)) throw denied('tls.connect');
-    const host = typeof extra[0] === 'string' ? extra[0] : undefined;
-    const rest = host === undefined ? extra : extra.slice(1);
-    if (host !== undefined && !literalLoopback(host)) throw denied('tls.connect');
-    return originalTls.call(this, Number(target), host ?? '127.0.0.1', ...rest);
+    // tls.connect(port[, host][, options][, cb]): Node MERGES a secondary
+    // options object over the positional arguments, so its host/path win over
+    // the positional host. Snapshot and validate the merged endpoint.
+    const positionalHost = typeof extra[0] === 'string' ? extra[0] : undefined;
+    const rest = positionalHost === undefined ? extra : extra.slice(1);
+    let effectiveHost = positionalHost, delegatedRest = rest;
+    const objIndex = rest.findIndex(value => value && typeof value === 'object' && !Array.isArray(value));
+    if (objIndex >= 0) {
+      const overrides = snapshot(rest[objIndex]);
+      if (overrides.path != null) throw denied('tls.connect'); // mixed with a positional port
+      if (overrides.host != null) effectiveHost = String(overrides.host);
+      delegatedRest = rest.map((value, index) => (index === objIndex ? Object.freeze(overrides) : value));
+    }
+    if (effectiveHost !== undefined && !literalLoopback(effectiveHost)) throw denied('tls.connect');
+    return originalTls.call(this, Number(target), effectiveHost ?? '127.0.0.1', ...delegatedRest);
   });
   block(dgram, ['createSocket'], 'dgram');
   block(dgram.Socket?.prototype, ['send', 'connect', 'bind', 'addMembership', 'addSourceSpecificMembership'], 'dgram.Socket');

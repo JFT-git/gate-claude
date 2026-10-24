@@ -141,6 +141,68 @@ check('net-connect-normalized-array-hostless', async () => {
   });
   server.close();
 });
+check('net-connect-callback-positions', async () => {
+  // connect(port, host, cb) and connect({port}, cb) keep their callbacks.
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise((resolve, reject) => { const s = net.connect(port, '127.0.0.1', () => { s.destroy(); resolve(); }); s.once('error', reject); });
+  await new Promise((resolve, reject) => { const s = net.connect({ port }, () => { s.destroy(); resolve(); }); s.once('error', reject); });
+  server.close();
+});
+check('unix-socket-roundtrip', async () => {
+  const sock = path.join(os.tmpdir(), 'guard-' + process.pid + '.sock');
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(sock, resolve));
+  await new Promise((resolve, reject) => { const s = net.connect(sock, () => { s.destroy(); resolve(); }); s.once('error', reject); });
+  server.close(); fs.rmSync(sock, { force: true });
+});
+check('tls-connect-socket-wrap-allowed', async () => {
+  // tls.connect({socket}) wraps an already gated socket: must pass through.
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const raw = net.connect(port, '127.0.0.1');
+  await new Promise((resolve, reject) => { raw.once('connect', resolve); raw.once('error', reject); });
+  const tls = require('node:tls');
+  const wrapped = tls.connect({ socket: raw, servername: 'localhost' });
+  wrapped.on('error', () => {}); wrapped.destroy(); server.close();
+});
+// An own enumerable "__proto__" key must not become the snapshot's prototype:
+// the snapshot has a null prototype, so a hostile host getter is never read.
+check('net-connect-proto-key-stays-loopback', async () => {
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const evil = {};
+  Object.defineProperty(evil, 'host', { enumerable: true, get() { return '203.0.113.9'; } });
+  const options = { port };
+  Object.defineProperty(options, '__proto__', { enumerable: true, value: evil });
+  await new Promise((resolve, reject) => {
+    const s = net.connect(options);
+    s.once('connect', () => { s.destroy(); resolve(); });
+    s.once('error', reject);
+    setTimeout(() => reject(Error('connect timeout')), 3000);
+  });
+  server.close();
+});
+// Node merges a secondary options object over positional tls.connect args:
+// its host/path must be validated too.
+check('tls-connect-secondary-options-host-denied', () => {
+  const tls = require('node:tls');
+  assert.throws(() => tls.connect(443, '127.0.0.1', { host: '203.0.113.9' }), /Guard blocked/);
+});
+check('tls-connect-secondary-options-path-denied', () => {
+  const tls = require('node:tls');
+  assert.throws(() => tls.connect(443, '127.0.0.1', { path: '/tmp/guard-x.sock' }), /Guard blocked/);
+});
+check('tls-connect-secondary-options-loopback', () => {
+  const tls = require('node:tls');
+  const s = tls.connect(9, '127.0.0.1', { servername: 'localhost' });
+  s.on('error', () => {}); s.destroy();
+});
+// Node classifies negative numeric strings as pipe names (toNumber >= 0).
+check('negative-numeric-string-is-pipe-name', () => { const s = net.connect('-1'); s.on('error', () => {}); s.destroy(); });
 check('net-connect-hostless-options-loopback', async () => {
   const server = net.createServer();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
