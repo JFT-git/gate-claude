@@ -128,6 +128,23 @@ check('net-connect-getter-external-stays-local', async () => {
 check('server-listen-mixed-path-port-denied', () => assert.throws(() => net.createServer().listen({ path: '/tmp/guard-x.sock', port: 0 }), /Guard blocked/));
 check('server-listen-handle-denied', () => assert.throws(() => net.createServer().listen({ host: '127.0.0.1', handle: { port: 0 } }), /Guard blocked/));
 check('server-listen-fd-denied', () => assert.throws(() => net.createServer().listen({ fd: 99 }), /Guard blocked/));
+// Node writes options.exclusive onto the listen options: the delegated
+// snapshot must stay mutable for reusePort forms. macOS itself rejects
+// SO_REUSEPORT with ENOTSUP — acceptable, as long as the guard is not the
+// cause (no TypeError from a frozen options object).
+check('server-listen-reuseport-loopback', async () => {
+  const server = net.createServer();
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen({ port: 0, host: '127.0.0.1', reusePort: true }, resolve);
+    });
+    assert.strictEqual(server.address().address, '127.0.0.1');
+    server.close();
+  } catch (error) {
+    assert.strictEqual(error.code, 'ENOTSUP');
+  }
+});
 check('net-connect-normalized-array-hostless', async () => {
   // Hostless normalized arrays get loopback injected and must not lose the
   // listener to an ERR_MISSING_ARGS rewrap.

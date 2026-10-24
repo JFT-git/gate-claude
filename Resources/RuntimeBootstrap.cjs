@@ -92,17 +92,17 @@ function installNetworkHardening() {
   // listen(), so a sneaked-in port would bind under a unix disguise. Hostless
   // TCP defaults to the NAME "localhost", whose resolution the DNS guard
   // denies, so validated hostless connects get the loopback literal injected.
-  const validatedEndpoint = (target, label, hostlessAllowed) => {
+  const validatedEndpoint = (target, label, hostlessAllowed, freeze = true) => {
     const snap = snapshot(target);
     const hasPath = snap.path != null, hasTCP = snap.host != null || snap.port != null;
     if (hasPath && hasTCP) throw denied(label);
-    if (hasPath) { snap.path = String(snap.path); return Object.freeze(snap); }
+    if (hasPath) { snap.path = String(snap.path); return freeze ? Object.freeze(snap) : snap; }
     if (snap.port == null) throw denied(label);
     if (snap.host == null) {
       if (!hostlessAllowed) throw denied(label);
       snap.host = '127.0.0.1';
     } else if (!literalLoopback(snap.host)) throw denied(label);
-    return Object.freeze(snap);
+    return freeze ? Object.freeze(snap) : snap;
   };
   const originalConnect = net.Socket.prototype.connect;
   hook(net.Socket.prototype, 'connect', function (...args) {
@@ -136,7 +136,8 @@ function installNetworkHardening() {
       // Pre-bound descriptors and wrapped handles cannot be re-validated here.
       if (snap.fd != null || snap.handle != null || snap._handle != null) throw denied('net.Server.listen');
       // listen() without an explicit loopback host would bind every interface.
-      return originalListen.call(this, validatedEndpoint(snap, 'net.Server.listen', false), ...extra);
+      // The snapshot stays MUTABLE: Node writes options.exclusive onto it.
+      return originalListen.call(this, validatedEndpoint(snap, 'net.Server.listen', false, false), ...extra);
     }
     // listen(port[, host]) — including numeric strings like "0" or "0x0".
     if (!isNumericForm(target)) throw denied('net.Server.listen');
