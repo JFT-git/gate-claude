@@ -138,6 +138,16 @@ function windowsBootstrap(base, networkGuard = '', options = {}) {
   if (base.split(commandAnchor).length !== 2) throw Error('Неизвестная версия канала Guard.');
   const navigationAnchor = 'wc[name] = (...args) => ready.then';
   if (base.split(profileAnchor).length !== 2 || base.split(navigationAnchor).length !== 2) throw Error('Неизвестная версия защиты профиля Guard.');
+  // The shared bootstrap installs the macOS loopback policy. Windows already
+  // installs its stricter guard below (only the authenticated pipe is allowed).
+  // Running both would redefine non-configurable hooks and abort on connect.
+  // Keep the shared policy when no Windows guard is supplied; never ignore a
+  // hook conflict or replace the strict Windows policy with the loopback one.
+  if (networkGuard) {
+    const hardeningAnchor = '\ninstallNetworkHardening();\n';
+    if (base.split(hardeningAnchor).length !== 2) throw Error('Неизвестная версия сетевой защиты Guard.');
+    base = base.replace(hardeningAnchor, '\n// Network hooks, sessions and WebRTC are protected by the Windows guard above.\n');
+  }
   const replacement = `app.setPath('sessionData', cfg.userData);
 // Cookie SQLite flushes separately from Chromium's delayed Local State writes.
 // Never admit a login page until its Windows DPAPI-wrapped key is on disk.

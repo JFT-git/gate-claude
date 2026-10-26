@@ -44,6 +44,11 @@ test('ordinary bootstraps never initialize Code and refuse an unexpected enabled
   const ordinary = guardSection({}, undefined); ordinary.run(); assert.deepEqual(ordinary.events, ['guard']);
   const mismatch = guardSection({}, { hostPath: 'fixture' }); assert.throws(mismatch.run, /has not been prepared/); assert.deepEqual(mismatch.events, ['guard']); assert.throws(() => A.windowsBootstrap(base, '', { codeEnabled: true }), /native network guard/); assert.throws(() => A.windowsBootstrap(base, '', { codeEnabled: 'yes' }), /Неверный режим/);
 });
+test('Windows guard refuses an unknown shared hardening entry point', () => {
+  const changed = base.replace('\ninstallNetworkHardening();\n', '\ninstallNetworkHardening(cfg);\n');
+  assert.notEqual(changed, base);
+  assert.throws(() => A.windowsBootstrap(changed, 'module.exports.installNetworkGuard=()=>({});'), /Неизвестная версия сетевой защиты/);
+});
 test('the actual original ASAR receives the pinned SDK and marketplace patches with their shared sibling transport', t => {
   const filename = path.resolve(__dirname, '../../../../work/windows/source/app/resources/app.asar'); if (!fs.existsSync(filename)) return t.skip('Original vendor source cache is not distributed.');
   const original = fs.readFileSync(filename), unchangedHash = A.hash(original), parsed = A.parseArchive(original), sdk = P.findManagedCliSDK(parsed), codeMain = P.findManagedCliMain(parsed), codeSessions = P.findManagedCliSessions(parsed), codeScratch = P.findManagedCliScratch(parsed), own = fs.readFileSync(path.join(__dirname, '../src/managed-cli.cjs'));

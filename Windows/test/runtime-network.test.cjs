@@ -106,3 +106,47 @@ test('runtime guard accepts only its own randomized diagnostic pipe configuratio
     const result=installNetworkGuard({...cfg,channelPipe:pipe});assert.equal(result.channelPipe,pipe);
     const net=require('node:net');for(const address of [{path:pipe,port:443},{path:pipe,host:'example.invalid'},{path:pipe,fd:1}])denied(()=>net.connect(address));`);
 });
+
+for (const codeEnabled of [false, true]) test(`complete Windows bootstrap starts with the strict guard (${codeEnabled ? 'Code' : 'Chat'})`, () => {
+  run(`const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+    const root=${JSON.stringify(path.resolve(__dirname, '../..'))};
+    const userData=fs.mkdtempSync(path.join(os.tmpdir(),'guard-win-boot-'));
+    const pipe='\\\\\\\\.\\\\pipe\\\\gate-claude-'+'a'.repeat(32),token='b'.repeat(64);
+    const code=${codeEnabled} ? {hostPath:'C:\\\\Guard\\\\CodeHost.exe'} : undefined;
+    process.env.PROXY_GUARD_CONFIG=JSON.stringify({...cfg,userData,channelPipe:pipe,channelToken:token,code});
+    fs.writeFileSync(path.join(userData,'Local State'),JSON.stringify({os_crypt:{encrypted_key:Buffer.concat([Buffer.from('DPAPI'),Buffer.alloc(64)]).toString('base64')}}));
+    app.setName=()=>{};app.setPath=()=>{};app.setAppUserModelId=()=>{};app.exit=code=>{throw Error('Unexpected runtime exit: '+code);};
+    app.whenReady=()=>Promise.resolve();
+    electron.webContents={getAllWebContents:()=>[]};electron.safeStorage={isEncryptionAvailable:()=>true};
+    const bridge=new EventEmitter();bridge.write=packet=>calls.push(['bridge',JSON.parse(packet.slice(0,-1))]);
+    const net=require('node:net');net.connect=address=>{assert.equal(address,pipe);return bridge;};
+    net.Socket.prototype.connect=function(...args){calls.push(['pipe',...args]);return this;};
+    const load=Module._load;let managed=0;
+    Module._load=function(name,...args){
+      if(name==='./proxy-guard-managed-cli.cjs')return {initCodeTransport:(received,spawn)=>{assert.deepEqual(received,code);assert.equal(typeof spawn,'function');managed++;}};
+      return load.call(this,name,...args);
+    };
+    try {
+      const {windowsBootstrap}=require(path.join(root,'Windows/src/asar.cjs'));
+      const source=windowsBootstrap(fs.readFileSync(path.join(root,'Resources/RuntimeBootstrap.cjs'),'utf8'),fs.readFileSync(path.join(root,'Windows/src/runtime-network-guard.cjs'),'utf8'),{codeEnabled:${codeEnabled}}).toString();
+      const boot=new Module(path.join(userData,'bootstrap.cjs'));boot.paths=Module._nodeModulePaths(userData);
+      boot._compile(source+'\\nmodule.exports.ready=guardProfileReady;',boot.id);
+      await boot.exports.ready;
+      assert.equal(managed,${codeEnabled ? 1 : 0});
+      bridge.emit('connect');assert.equal(calls.find(v=>v[0]==='bridge')[1].params.token,token);
+      denied(()=>net.connect(443,'203.0.113.9'));denied(()=>net.connect(8123,'127.0.0.1'));
+      denied(()=>net.connect('\\\\\\\\.\\\\pipe\\\\other'));denied(()=>new net.Server().listen(0,'127.0.0.1'));
+      const own=net.connect(pipe);assert.deepEqual(calls.find(v=>v[0]==='pipe'),['pipe',pipe]);own.destroy();
+      denied(()=>require('node:tls').connect(443,'203.0.113.9'));
+      denied(()=>require('node:dgram').createSocket('udp4'));denied(()=>require('node:dns').lookup('claude.ai',()=>{}));
+      denied(()=>require('node:child_process').spawn('fixture-must-never-run'));
+      app.emit('session-created',session);
+      await assert.rejects(session.setProxy({mode:'direct'}),e=>e.code==='ERR_GUARD_NETWORK_DENIED');
+      await session.setProxy({mode:'fixed_servers',proxyRules:cfg.proxyURL,proxyBypassRules:'<-loopback>'});
+      denied(()=>session.resolveHost('claude.ai'));denied(()=>app.commandLine.removeSwitch('proxy-server'));
+      const contents={id:777,session,getType:()=>'remote',setWebRTCIPHandlingPolicy:value=>calls.push(['webrtc',value])};
+      app.emit('web-contents-created',{},contents);assert.deepEqual(calls.find(v=>v[0]==='webrtc'),['webrtc','disable_non_proxied_udp']);
+      denied(()=>contents.setWebRTCIPHandlingPolicy('default'));
+      net.connect=()=>{};denied(()=>net.connect(443,'203.0.113.9'));
+    } finally {fs.rmSync(userData,{recursive:true,force:true});}`);
+});
