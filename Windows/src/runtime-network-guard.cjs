@@ -4,7 +4,9 @@
 // native/Node escape paths; it is not a kernel firewall or a hostile-code sandbox.
 let installed;
 function installNetworkGuard(cfg) {
-  const parsed = new URL(cfg?.proxyURL || '');
+  const proxyURL = cfg?.proxyURL;
+  if (typeof proxyURL !== 'string') throw Error('Guard requires one explicit loopback HTTP relay.');
+  const parsed = new URL(proxyURL);
   if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1' || !parsed.port ||
       parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
     throw Error('Guard requires one explicit loopback HTTP relay.');
@@ -12,7 +14,7 @@ function installNetworkGuard(cfg) {
   const codeFingerprint = JSON.stringify(cfg.code || null);
   if (installed) {
     if (installed.codeFingerprint !== codeFingerprint) throw Error('Guard Code configuration is immutable.');
-    if (installed.proxyURL !== cfg.proxyURL || installed.channelPipe !== (cfg.channelPipe || null)) throw Error('Guard network configuration is immutable.');
+    if (installed.proxyURL !== proxyURL || installed.channelPipe !== (cfg.channelPipe || null)) throw Error('Guard network configuration is immutable.');
     return installed;
   }
   const electron = require('electron');
@@ -38,18 +40,25 @@ function installNetworkGuard(cfg) {
   }
   function block(object, names, label) { for (const name of names) hook(object, name, deny(label + '.' + name)); }
   const originalConnect = net.Socket.prototype.connect;
-  const isOwnPipe = args => {
+  const pipeArguments = (args, label) => {
+    if (!ownPipe || args.length < 1 || args.length > 2 || (args[1] !== undefined && typeof args[1] !== 'function')) throw denied(label);
     const target = args[0];
-    return ownPipe && (target === ownPipe || (target && typeof target === 'object' && target.path === ownPipe &&
-      target.port == null && target.host == null && target.fd == null));
+    if (typeof target === 'string') {
+      if (target !== ownPipe) throw denied(label);
+    } else {
+      if (!target || typeof target !== 'object' || Array.isArray(target)) throw denied(label);
+      // Read each field once. Never pass the caller's object to Node: getters
+      // could return our pipe during validation and another path during connect.
+      const path = target.path, port = target.port, host = target.host, fd = target.fd;
+      if (path !== ownPipe || port != null || host != null || fd != null) throw denied(label);
+    }
+    return args[1] === undefined ? [ownPipe] : [ownPipe, args[1]];
   };
   hook(net.Socket.prototype, 'connect', function (...args) {
-    if (!isOwnPipe(args)) throw denied('net.Socket.connect');
-    return originalConnect.apply(this, args);
+    return originalConnect.apply(this, pipeArguments(args, 'net.Socket.connect'));
   });
   const pipeConnection = function (...args) {
-    if (!isOwnPipe(args)) throw denied('net.connect');
-    return new net.Socket().connect(...args);
+    return new net.Socket().connect(...pipeArguments(args, 'net.connect'));
   };
   hook(net, 'connect', pipeConnection); hook(net, 'createConnection', pipeConnection);
   block(net.Server?.prototype, ['listen'], 'net.Server');
@@ -88,16 +97,25 @@ function installNetworkGuard(cfg) {
   block(electron.autoUpdater, ['quitAndInstall', 'setFeedURL'], 'autoUpdater');
   hook(electron.autoUpdater, 'checkForUpdates', function () { this.emit?.('update-not-available'); });
   block(electron.net, ['resolveHost'], 'electron.net');
-  const proxySettingsMatch = options => options && options.mode === 'fixed_servers' &&
-    options.proxyRules === cfg.proxyURL && options.proxyBypassRules === '<-loopback>' && !options.pacScript;
+  const freeze = Object.freeze;
+  const proxySettingsSnapshot = options => {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) throw denied('session.setProxy');
+    const mode = options.mode, proxyRules = options.proxyRules, proxyBypassRules = options.proxyBypassRules, pacScript = options.pacScript;
+    if (mode !== 'fixed_servers' || proxyRules !== proxyURL || proxyBypassRules !== '<-loopback>' || pacScript) throw denied('session.setProxy');
+    // A fresh object with no prototype/accessors also prevents inherited PAC
+    // settings or later mutations from changing what Electron actually applies.
+    return freeze({ __proto__: null, mode: 'fixed_servers', proxyRules: proxyURL, proxyBypassRules: '<-loopback>' });
+  };
   const protectedSessions = new WeakSet();
   function protectSession(session) {
     if (!session || protectedSessions.has(session)) return;
     protectedSessions.add(session);
     const setProxy = session.setProxy;
     hook(session, 'setProxy', function (options) {
-      if (!proxySettingsMatch(options)) return Promise.reject(denied('session.setProxy'));
-      return setProxy.call(this, options);
+      let snapshot;
+      try { snapshot = proxySettingsSnapshot(options); }
+      catch { return Promise.reject(denied('session.setProxy')); }
+      return setProxy.call(this, snapshot);
     });
     block(session, ['resolveHost'], 'session');
   }
@@ -117,7 +135,7 @@ function installNetworkGuard(cfg) {
     }
   });
   const commandLine = electron.app.commandLine;
-  const switches = { 'proxy-server': cfg.proxyURL, 'proxy-bypass-list': '<-loopback>',
+  const switches = { 'proxy-server': proxyURL, 'proxy-bypass-list': '<-loopback>',
     'force-webrtc-ip-handling-policy': 'disable_non_proxied_udp', 'disable-quic': '', 'dns-prefetch-disable': '',
     // Destination names are resolved by the relay; Chromium only connects to its
     // literal loopback address. Speculative/background hostname lookups must fail.
@@ -149,7 +167,7 @@ function installNetworkGuard(cfg) {
     return binding.call(this, name);
   });
   block(process, ['dlopen'], 'process');
-  installed = Object.freeze({ installed: true, proxyURL: cfg.proxyURL, channelPipe: cfg.channelPipe || null, codeFingerprint, spawnCodeBroker });
+  installed = freeze({ installed: true, proxyURL, channelPipe: cfg.channelPipe || null, codeFingerprint, spawnCodeBroker });
   return installed;
 }
 module.exports = { installNetworkGuard };

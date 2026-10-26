@@ -6,8 +6,8 @@
 
 ## Платформы и возможности
 
-- **Windows 10/11 x64 — 0.6.13.** Исправлен сбой запуска `Guard cannot protect connect`. Доступны установщик `Setup.exe` и portable ZIP. Electron 44.9.2; локальный шлюз, WFP для исполняемых файлов копии Claude, Windows Job Object. Claude Code, native Git HTTPS и PowerShell работают через предусмотренный AppContainer/CodeGate. Code закреплён на Desktop 3.1623.0 и CLI 2.1.304; Git Bash и Git SSH в этом режиме недоступны.
-- **macOS 13+ — 0.3.7, universal arm64 + x86_64.** Один DMG или ZIP для Apple Silicon и Intel. SwiftUI, локальный шлюз, мониторинг IP и PF-барьер; архитектура и ограничения описаны в [SECURITY.md](SECURITY.md). В релизе 0.6.13 приложены неизменённые macOS-файлы из 0.6.12.
+- **Windows 10/11 x64 — 0.6.14.** Закрыты обходы JavaScript-проверок прокси и диагностического IPC; исправление запуска `Guard cannot protect connect` сохранено. Доступны установщик `Setup.exe` и portable ZIP. Electron 44.9.2; локальный шлюз, WFP для исполняемых файлов копии Claude, Windows Job Object. Claude Code, native Git HTTPS и PowerShell работают через предусмотренный AppContainer/CodeGate. Code закреплён на Desktop 3.1623.0 и CLI 2.1.304; Git Bash и Git SSH в этом режиме недоступны.
+- **macOS 13+ — 0.3.7, universal arm64 + x86_64.** Один DMG или ZIP для Apple Silicon и Intel. SwiftUI, локальный шлюз, мониторинг IP и PF-барьер; архитектура и ограничения описаны в [SECURITY.md](SECURITY.md). В релизе 0.6.14 приложены неизменённые macOS-файлы из 0.6.12.
 - Linux и отдельная Windows ARM64-сборка не подготовлены. macOS Intel-компонент можно собрать и проверить как часть universal-бандла; исполнение на Intel проверяется отдельно.
 
 Доступны текущая сеть/VPN и SOCKS5, закрепление IP, пауза при временной ошибке проверки, завершение сессии при подтверждённой смене IP, профиль страницы, локальные журналы и экспорт доступного HTTP/SSE/WebSocket-трафика. Проверки периодические: мгновенный сетевой kill switch и абсолютное отсутствие утечек не заявляются.
@@ -19,7 +19,7 @@
 ### Windows
 
 1. Установите официальный Claude Desktop отдельно.
-2. Запустите `ClaudeProxyGuard-Windows-0.6.13-x64-Setup.exe` для установки текущему пользователю либо полностью распакуйте portable ZIP в локальную папку. Не переносите один EXE: рядом нужны Electron, native-помощники и комплекты инструментов.
+2. Запустите `ClaudeProxyGuard-Windows-0.6.14-x64-Setup.exe` для установки текущему пользователю либо полностью распакуйте portable ZIP в локальную папку. Не переносите один EXE: рядом нужны Electron, native-помощники и комплекты инструментов.
 3. Запустите `Claude Proxy Guard.exe` обычным способом. Выберите текущую сеть/VPN либо SOCKS5. Claude ищется по установленным пакетам, в том числе WindowsApps; менять права WindowsApps не нужно.
 4. Нажмите **«Запустить»**, подтвердите штатное окно Windows для NetworkFence и дождитесь фактической проверки профиля.
 5. Для Code включите соответствующий пункт. Постоянная рабочая папка открывается кнопкой в интерфейсе; её файлы сохраняются после выхода.

@@ -107,6 +107,48 @@ test('runtime guard accepts only its own randomized diagnostic pipe configuratio
     const net=require('node:net');for(const address of [{path:pipe,port:443},{path:pipe,host:'example.invalid'},{path:pipe,fd:1}])denied(()=>net.connect(address));`);
 });
 
+test('proxy protection delegates a stable configuration after reading changing getters once', () => {
+  run(`let applied;
+    session.setProxy=async options=>{await Promise.resolve();applied={mode:options.mode,proxyRules:options.proxyRules,proxyBypassRules:options.proxyBypassRules,pacScript:options.pacScript};};
+    installNetworkGuard(cfg);app.emit('session-created',session);
+    const good={mode:'fixed_servers',proxyRules:cfg.proxyURL,proxyBypassRules:'<-loopback>',pacScript:undefined};
+    const bad={mode:'direct',proxyRules:'direct://',proxyBypassRules:'*',pacScript:'https://example.invalid/proxy.pac'};
+    for(const name of Object.keys(good)){
+      let reads=0;const options={...good};Object.defineProperty(options,name,{get(){return ++reads===1?good[name]:bad[name];}});
+      await session.setProxy(options);assert.deepEqual(applied,good,name);assert.equal(reads,1,name);
+    }
+    let changedReads=0;const options={...good,get mode(){this.proxyRules='direct://';changedReads++;return 'fixed_servers';}};
+    await assert.rejects(session.setProxy(options),e=>e.code==='ERR_GUARD_NETWORK_DENIED');assert.equal(changedReads,1);`);
+});
+
+test('proxy protection rejects coercible values and never delegates an inherited PAC', () => {
+  run(`let applied;
+    session.setProxy=async options=>{applied={mode:options.mode,proxyRules:options.proxyRules,proxyBypassRules:options.proxyBypassRules,pacScript:options.pacScript};};
+    installNetworkGuard(cfg);app.emit('session-created',session);
+    const good={mode:'fixed_servers',proxyRules:cfg.proxyURL,proxyBypassRules:'<-loopback>'};
+    for(const value of [null,[],{...good,mode:{toString:()=>good.mode}},{...good,proxyRules:{toString:()=>cfg.proxyURL}},{...good,pacScript:'https://example.invalid/proxy.pac'}])
+      await assert.rejects(session.setProxy(value),e=>e.code==='ERR_GUARD_NETWORK_DENIED');
+    let reads=0;const proto={get pacScript(){return ++reads===1?undefined:'https://example.invalid/proxy.pac';}};
+    await session.setProxy(Object.assign(Object.create(proto),good));assert.equal(applied.pacScript,undefined);assert.equal(reads,1);`);
+});
+
+test('diagnostic pipe connections delegate only the checked path and preserve their callbacks', () => {
+  run(`const net=require('node:net'),observed=[];let callbacks=0;
+    net.Socket.prototype.connect=function(...args){const target=args[0];observed.push(typeof target==='string'?target:target.path);if(typeof args[1]==='function')args[1].call(this);return this;};
+    const pipe='\\\\\\\\.\\\\pipe\\\\gate-claude-'+'a'.repeat(32);
+    installNetworkGuard({...cfg,channelPipe:pipe});
+    const connect=[(options,callback)=>new net.Socket().connect(options,callback),net.connect,net.createConnection];
+    for(const [index,open] of connect.entries()){
+      let reads=0;const options={get path(){return ++reads<=(index===0?1:2)?pipe:'foreign.sock';}};
+      const socket=open(options,function(){assert.equal(this instanceof net.Socket,true);callbacks++;});socket.destroy();
+      assert.equal(observed.at(-1),pipe);assert.equal(reads,1);
+      open(pipe,()=>{callbacks++;}).destroy();
+    }
+    assert.equal(callbacks,6);
+    denied(()=>net.connect(pipe,{path:'foreign.sock'}));denied(()=>net.connect(pipe,()=>{},{}));
+    denied(()=>net.connect({path:pipe,port:443}));denied(()=>net.connect({path:pipe,fd:1}));`);
+});
+
 for (const codeEnabled of [false, true]) test(`complete Windows bootstrap starts with the strict guard (${codeEnabled ? 'Code' : 'Chat'})`, () => {
   run(`const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
     const root=${JSON.stringify(path.resolve(__dirname, '../..'))};
