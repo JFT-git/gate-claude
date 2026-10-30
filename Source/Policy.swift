@@ -14,6 +14,79 @@ enum IPIdentity {
     }
 }
 
+/// Separate from the browser profile: stopping, upgrading or restarting Guard
+/// never authorizes another exit. Only the confirmed UI reset writes nil.
+struct IPMemory {
+    static let mismatch = "Внешний IP не совпадает с сохранённым. Верните закреплённый IP. Перезапуск Guard не разрешает другой адрес; смена возможна только после сброса с подтверждением."
+    static let unavailable = "Не удалось прочитать или сохранить закреплённый IP. Доступ закрыт. Проверьте файл памяти IP или сбросьте закрепление в интерфейсе."
+    let url: URL
+    static var defaultURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ClaudeProxyGuard/ip-memory.json")
+    }
+    private struct Document: Codable { let version: Int; let pinnedIP: String? }
+    func load() throws -> String? {
+        var before = stat()
+        guard lstat(url.path, &before) == 0 else {
+            if errno == ENOENT { return nil }
+            throw GuardError.message(Self.unavailable)
+        }
+        guard before.st_mode & S_IFMT == S_IFREG, before.st_nlink == 1, before.st_size <= 4096 else { throw GuardError.message(Self.unavailable) }
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else { throw GuardError.message(Self.unavailable) }
+        defer { close(fd) }
+        var after = stat()
+        guard fstat(fd, &after) == 0, after.st_mode & S_IFMT == S_IFREG, after.st_nlink == 1,
+              after.st_size <= 4096, before.st_ino == after.st_ino, before.st_dev == after.st_dev else { throw GuardError.message(Self.unavailable) }
+        var buffer = [UInt8](repeating: 0, count: 4097)
+        let count = read(fd, &buffer, buffer.count)
+        guard count > 0, count <= 4096 else { throw GuardError.message(Self.unavailable) }
+        do {
+            let data = Data(buffer.prefix(count))
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  Set(object.keys) == Set(["version", "pinnedIP"]) else { throw GuardError.message(Self.unavailable) }
+            let document = try JSONDecoder().decode(Document.self, from: data)
+            guard document.version == 1 else { throw GuardError.message(Self.unavailable) }
+            guard let ip = document.pinnedIP else { return nil }
+            guard !ip.contains("%") else { throw GuardError.message(Self.unavailable) }
+            return try IPIdentity.canonical(ip)
+        } catch { throw GuardError.message(Self.unavailable) }
+    }
+    @discardableResult func check(_ ip: String) throws -> String? {
+        let saved = try load()
+        if let saved, saved != (try IPIdentity.canonical(ip)) { throw GuardError.message(Self.mismatch) }
+        return saved
+    }
+    @discardableResult func commit(_ ip: String) throws -> String {
+        let canonical = try IPIdentity.canonical(ip)
+        if try check(canonical) == nil { try write(canonical) }
+        guard try load() == canonical else { throw GuardError.message(Self.unavailable) }
+        return canonical
+    }
+    func reset() throws {
+        try write(nil)
+        guard try load() == nil else { throw GuardError.message(Self.unavailable) }
+    }
+    private func write(_ ip: String?) throws {
+        let fm = FileManager.default, directory = url.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(".ip-memory-" + UUID().uuidString + ".tmp")
+        defer { try? fm.removeItem(at: temporary) }
+        do {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            var parent = stat(), old = stat()
+            guard lstat(directory.path, &parent) == 0, parent.st_mode & S_IFMT == S_IFDIR else { throw GuardError.message(Self.unavailable) }
+            let exists = lstat(url.path, &old) == 0
+            guard exists ? old.st_mode & S_IFMT == S_IFREG && old.st_nlink == 1 : errno == ENOENT else { throw GuardError.message(Self.unavailable) }
+            let data = try JSONSerialization.data(withJSONObject: ["version": 1, "pinnedIP": ip.map { $0 as Any } ?? NSNull()], options: [.sortedKeys])
+            let fd = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+            guard fd >= 0 else { throw GuardError.message(Self.unavailable) }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            try handle.write(contentsOf: data); try handle.synchronize(); try handle.close()
+            guard rename(temporary.path, url.path) == 0 else { throw GuardError.message(Self.unavailable) }
+        } catch { throw GuardError.message(Self.unavailable) }
+    }
+}
+
 struct SessionPolicy {
     private(set) var destinationPins: [String: String] = [:]
     private(set) var pinnedIP: String?
@@ -47,6 +120,9 @@ struct SessionPolicy {
         if countryCode == "RU" {
             let reason = "Маршрут Claude вышел через RU. Перезапустите Guard."
             latch(reason); throw GuardError.message(reason)
+        }
+        guard canonical == pinnedIP else {
+            latch(IPMemory.mismatch); throw GuardError.message(IPMemory.mismatch)
         }
         if let baseline = destinationPins[hostname], baseline != canonical {
             let reason = "Внешний IP маршрута Claude изменился: \(baseline) → \(canonical). Перезапустите Guard."

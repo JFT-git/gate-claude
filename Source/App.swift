@@ -32,7 +32,7 @@ final class GuardModel: ObservableObject {
     // While a previous runtime tree is still draining (graceful stop grace
     // window), a fresh launch must wait for the cleanup to finish or it trips
     // the profile singleton lock and races the straggler sweep.
-    private var runtimeDrain: RuntimeDrain?
+    @Published private var runtimeDrain: RuntimeDrain?
     @Published var timezone = "Europe/Amsterdam"
     @Published var language = "en-US"
     @Published var inspectPages = true
@@ -68,6 +68,10 @@ final class GuardModel: ObservableObject {
     private var pathMonitor: NWPathMonitor?
     private var localBaseline = Set<String>()
     private var policy = SessionPolicy()
+    private let ipMemory: IPMemory
+    @Published private(set) var savedIP: String?
+    @Published private(set) var ipMemoryError: String?
+    var canResetIP: Bool { !busy && !monitoring && !claudeRunning && !restarting && runtimeDrain == nil && (savedIP != nil || ipMemoryError != nil) }
     private var systemProxy: SystemProxy.Snapshot?
     private var revalidationTask: Task<Void, Never>?
     private var launchPending = false
@@ -193,8 +197,16 @@ final class GuardModel: ObservableObject {
     }
 
 
-    init(diagnosticsURL: URL? = nil) {
+    init(diagnosticsURL: URL? = nil, ipMemoryURL: URL? = nil) {
+        #if GUARD_E2E
+        // Every existing fixture stays isolated; restart tests explicitly share a URL.
+        let memoryURL = ipMemoryURL ?? FileManager.default.temporaryDirectory.appendingPathComponent("guard-ip-memory-" + UUID().uuidString + "/ip-memory.json")
+        #else
+        let memoryURL = ipMemoryURL ?? IPMemory.defaultURL
+        #endif
+        ipMemory = IPMemory(url: memoryURL)
         diagnostics = GuardDiagnostics(url: diagnosticsURL)
+        do { savedIP = try ipMemory.load() } catch { ipMemoryError = error.localizedDescription }
         previousStop = diagnostics.previousFailure()
         let d = UserDefaults.standard
         if d.object(forKey: "useProxy") != nil { useProxy = d.bool(forKey: "useProxy") }
@@ -249,11 +261,13 @@ final class GuardModel: ObservableObject {
         report = nil; traffic.removeAll(); lastVerifiedProfile = nil; profileStatus = "Профиль страницы ещё не проверен"
         let token = UUID(); operation = token
         allowed = false; busy = true; phase = "Проверяем исходный IP…"
-        detail = "Подтверждаем иностранный IP и фиксируем адрес для этой сессии."
+        detail = "Проверяем подключение по постоянно закреплённому IP. Другой адрес не разрешён."
         localBaseline = NetworkSnapshot.current()
         Task { [self] in
             defer { if launch { password = "" } }
             do {
+                do { savedIP = try ipMemory.load(); ipMemoryError = nil }
+                catch { ipMemoryError = error.localizedDescription; throw error }
                 try LaunchProfile(timezone: timezone, language: language).validate()
                 // PG-01: without the packet-filter barrier native Claude components
                 // (MCP, Cowork, helpers) could bypass the relay entirely. A session
@@ -307,12 +321,15 @@ final class GuardModel: ObservableObject {
                 let localPort = try await relay.start()
                 guard operation == token else { relay.stop(); return }
                 relayPort = localPort
+                relay.setPinnedFamily(savedIP.map { $0.contains(":") ? .v6 : .v4 })
                 guard operation == token else { return }
                 startNetworkGuard(token: token)
                 let result = try await initialIPCheck(relayPort)
                 guard operation == token else { return }
                 report = result
                 try policy.establish(result)
+                do { try ipMemory.check(result.ip) }
+                catch { policy.latch(error.localizedDescription); throw error }
                 if watchPublicIP {
                     let actual = try await currentIPCheck(relayPort)
                     guard operation == token else { return }
@@ -336,6 +353,7 @@ final class GuardModel: ObservableObject {
                 guard operation == token else { return }
                 try await confirmSystemProxy(operation: token)
                 guard operation == token else { return }
+                try persistIP(result.ip)
                 localBaseline = NetworkSnapshot.current()
                 if sleeping {
                     monitoring = true; busy = false; launchAfterValidation = launch
@@ -345,7 +363,7 @@ final class GuardModel: ObservableObject {
                 relay.setPinnedFamily(policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
                 if !relay.unlock() { throw GuardError.message("Локальный шлюз уже закрыт.") }
                 allowed = true; monitoring = true; busy = false
-                phase = "IP закреплён за сессией"
+                phase = "Постоянный IP подтверждён"
                 detail = watchPublicIP ? "Внешний IP: каждые \(interval) с. Изменение сети приостанавливает шлюз до повторной проверки IP." : "Изменение локальной сети приостанавливает шлюз для проверки IP. Периодические проверки отключены."
                 appendLog("Исходный IP закреплён: \(result.ip) · \(result.countryCode)")
                 scheduleCheck()
@@ -399,6 +417,7 @@ final class GuardModel: ObservableObject {
                     guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
                     guard revision == self.networkRevision else { continue }
                     try self.policy.verify(actual)
+                    try self.persistIP(actual)
                     self.relay?.setPinnedFamily(self.policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
                     if self.sessionNetworkMode, wasSuspended, let relay = self.relay {
                         // Re-pin from the addresses these very probes used, then open.
@@ -417,7 +436,7 @@ final class GuardModel: ObservableObject {
                     self.localBaseline = NetworkSnapshot.current()
                     if let last = self.report { self.report = IPReport(ip: actual, countryCode: last.countryCode, country: last.country, date: Date()) }
                     self.allowed = true; self.monitoring = true; self.busy = self.launchPending
-                    self.phase = "IP закреплён за сессией"
+                    self.phase = "Постоянный IP подтверждён"
                     if wasSuspended {
                         self.detail = "Прежний внешний IP подтверждён. Шлюз возобновлён."
                         self.appendLog("Повторная проверка подтвердила прежний IP; шлюз возобновлён.")
@@ -766,6 +785,19 @@ final class GuardModel: ObservableObject {
         operationFailure = nil
         block(requiresRestart ? (policy.lockedReason ?? "Перезапустите Guard.") : "Сессия остановлена пользователем.", manual: true)
     }
+    private func persistIP(_ ip: String) throws {
+        do { savedIP = try ipMemory.commit(ip); ipMemoryError = nil }
+        catch { ipMemoryError = error.localizedDescription; policy.latch(error.localizedDescription); throw error }
+    }
+    /// Called only after the native warning. A security latch still needs restart.
+    func resetIP() {
+        guard canResetIP else { return }
+        do {
+            try ipMemory.reset(); savedIP = nil; ipMemoryError = nil
+            detail = requiresRestart ? "Память IP сброшена. Перезапустите Guard перед новым подключением." : "Память IP сброшена. Следующий проверенный адрес будет закреплён."
+            appendLog("Закрепление IP сброшено пользователем после подтверждения.")
+        } catch { ipMemoryError = error.localizedDescription; operationFailure = error.localizedDescription }
+    }
     func restart() {
         guard !restarting, let onRestart else { return }
         operationFailure = nil
@@ -984,6 +1016,17 @@ private func confirmRestartDialog() -> Bool {
     return alert.runModal() == .alertFirstButtonReturn
 }
 
+private func confirmResetIPDialog() -> Bool {
+    NSApp.activate(ignoringOtherApps: true)
+    let alert = NSAlert()
+    alert.messageText = "Сбросить закреплённый IP?"
+    alert.informativeText = "Следующее подключение сможет закрепить другой внешний IP. Сброс разрешит смену адреса и может потребовать повторной авторизации. Сохранённый профиль Claude останется. После заблокированной сессии потребуется перезапустить Guard."
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Отмена").keyEquivalent = "\u{1b}"
+    alert.addButton(withTitle: "Сбросить закрепление").hasDestructiveAction = true
+    return alert.runModal() == .alertSecondButtonReturn
+}
+
 struct GuardView: View {
     @ObservedObject var model: GuardModel
     @StateObject private var presentation = GuardPresentation()
@@ -1005,7 +1048,7 @@ struct GuardView: View {
                         Text("Проверка IP перед запуском Claude").font(.system(size: 13)).foregroundStyle(GuardPalette.secondary)
                     }
                     Spacer()
-                    Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.7")).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
+                    Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.8")).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
                 }
                 Surface {
                     VStack(alignment: .leading, spacing: 14) {
@@ -1071,6 +1114,22 @@ struct GuardView: View {
                 Surface {
                     VStack(alignment: .leading, spacing: 16) {
                         Text("Подключение").font(.system(size: 15, weight: .semibold))
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Постоянный IP").font(.system(size: 13, weight: .semibold))
+                            if let error = model.ipMemoryError {
+                                Text(error).foregroundStyle(GuardPalette.danger)
+                            } else if let ip = model.savedIP {
+                                Text("Разрешён только IP: \(ip)").font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                            } else {
+                                Text("Первый успешно проверенный IP будет сохранён между запусками.")
+                            }
+                            Text("Общий выход и маршруты Claude должны использовать закреплённый адрес. Другой IP блокируется.")
+                                .foregroundStyle(GuardPalette.secondary)
+                            Button("Сбросить закрепление…") {
+                                guard model.canResetIP, confirmResetIPDialog() else { return }
+                                model.resetIP()
+                            }.disabled(!model.canResetIP)
+                        }.font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
                         Picker("Маршрут", selection: $model.useProxy) {
                             Text("SOCKS5-прокси").tag(true)
                             Text("Текущая сеть / VPN").tag(false)
@@ -1101,7 +1160,7 @@ struct GuardView: View {
                             }.labelsHidden().frame(width: 150)
                         }
                         Text("Публичный IP проверяется через ipify постоянно: без периодического контроля смена выхода может остаться незамеченной.").font(.system(size: 12))
-                        Text("Изменение сети или ошибка проверки приостанавливает шлюз. Прежний подтверждённый IP возобновляет сессию; другой IP блокирует её до перезапуска Guard.")
+                        Text("Изменение сети или ошибка проверки приостанавливает шлюз. Прежний подтверждённый IP возобновляет сессию. Другой IP закрывает её; перезапуск Guard сохраняет закрепление.")
                             .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     }.disabled(model.monitoring || model.busy || model.requiresRestart)
                 }

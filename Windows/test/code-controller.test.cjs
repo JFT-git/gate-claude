@@ -146,7 +146,7 @@ async function fixture(t) {
   c.controller.localEgressAddresses = async () => ({ v4: '127.0.0.1', v6: null });
   c.proxyDescriptor = Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) });
   c.controller.networkProxyConfiguration = async () => c.proxyDescriptor;
-  c.controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: hostname === 'claude.ai' ? '203.0.113.20' : '203.0.113.21', country_code: 'NL' });
+  c.controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: '203.0.113.7', country_code: 'NL' });
   t.after(async () => {
     c.runtimePending?.resolve(); c.assetPending?.resolve(); c.filesPending?.resolve(); c.toolsPending?.resolve(); c.fencePending?.resolve(); c.fenceClosePending?.resolve();
     c.controller.stop(); for (const process of c.processes) process.finish(0);
@@ -222,7 +222,7 @@ test('Code captures the static system proxy and pins family and both destination
   c.proxyDescriptor = Object.freeze({ kind: 'http', host: '127.0.0.1', port: 9697, fingerprint: 'e'.repeat(64) });
   c.onAssetDownload = () => {
     assert.equal(c.controller.destinationPolicies.size, 2); assert.equal(c.relay.ipFamily, 4);
-    assert.equal(c.controller.destinationPolicies.get('claude.ai').pinned, '203.0.113.20');
+    assert.equal(c.controller.destinationPolicies.get('claude.ai').pinned, '203.0.113.7');
     return { path: c.assetPath };
   };
   await c.controller.start(input);
@@ -236,14 +236,13 @@ test('an initial RU destination prevents every Code download and guest launch', 
   await c.controller.start(input);
   assert.equal(c.controller.state, 'blocked'); assert.equal(c.assetCalls, 0); assert.equal(c.fenceCalls, 0); assert.equal(c.hostSpawns, 0);
 });
-test('stable mixed-family destination exits are pinned independently before Code starts', async t => {
+test('a mixed-family destination exit is refused before Code starts or downloads', async t => {
   const c = await fixture(t);
   c.controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: hostname === 'claude.ai' ? '2001:db8::20' : '203.0.113.21', country_code: 'NL' });
   await c.controller.start(input); await c.controller.poll(c.controller.epoch);
   assert.equal(c.controller.policy.pinned, '203.0.113.7');
-  assert.equal(c.controller.destinationPolicies.get('claude.ai').pinned, '2001:db8::20');
-  assert.equal(c.controller.destinationPolicies.get('api.anthropic.com').pinned, '203.0.113.21');
-  assert.equal(c.hostSpawns, 1); assert.equal(c.controller.policy.blocked, false); assert.equal(c.relay.unlocked, true);
+  assert.equal(c.hostSpawns, 0); assert.equal(c.assetCalls, 0); assert.equal(c.controller.policy.blocked, true); assert.equal(c.relay.closed, true);
+  assert.equal(c.controller.ipMemory.load(), null);
 });
 test('the final Code confirmation checks destination exits even when its route read fails', async t => {
   const c = await fixture(t), normal = c.controller.requestDestinationIP; let routes = 0;

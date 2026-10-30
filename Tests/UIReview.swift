@@ -9,7 +9,9 @@ import AppKit
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("guard-ui-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
-        let model = GuardModel(diagnosticsURL: temporary.appendingPathComponent("diagnostics.jsonl"))
+        let memory = temporary.appendingPathComponent("ip-memory.json")
+        try IPMemory(url: memory).commit("203.0.113.7")
+        let model = GuardModel(diagnosticsURL: temporary.appendingPathComponent("diagnostics.jsonl"), ipMemoryURL: memory)
         model.host = "127.0.0.1"; model.port = "1080"; model.username = ""; model.password = ""
         model.claudePath = "/Applications/Claude.app"; model.previousStop = nil
         model.phase = "Тест интерфейса: ожидание"; model.detail = "Тестовый профиль. Claude и сеть не запускаются."

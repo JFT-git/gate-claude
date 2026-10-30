@@ -30,6 +30,7 @@ function refreshControls() {
   $('host').required = socks; $('port').required = socks; $('claudePath').readOnly = $('claudeSource').value !== 'manual';
   $('export').disabled = records.size === 0 || pending.has('export');
   $('restartConfirmYes').disabled = !c.restart;
+  $('resetIP').disabled = !ready || !['idle','blocked'].includes(state.state) || state.windowsApprovalPending || pending.size > 0 || (!state.savedIP && !state.ipMemoryError);
   for (const [id, key] of [['protocolSettings','protocolSettings'],['protocolCheck','protocolCheck'],['codeWorkspace','workspace'],['serviceRefresh','service']]) { $(id).disabled = !ready || pending.has(key); $(id).setAttribute('aria-busy', String(pending.has(key))); }
   for (const button of document.querySelectorAll('[data-service]')) button.disabled = pending.has('service') || VM.service(serviceSnapshot).busy;
   $('serviceActivity').hidden = !pending.has('service') && !VM.service(serviceSnapshot).busy;
@@ -41,6 +42,7 @@ function showState(value) {
   $('state').textContent = ({ idle: 'Готов к запуску', checking: 'Проверка подключения', starting: 'Запуск и проверка Claude', running: 'Claude под защитой Guard', rechecking: 'Трафик приостановлен', blocked: 'Сессия закрыта' })[value.state];
   $('message').textContent = value.message || 'Выберите подключение и запустите проверку.'; $('lamp').className = 'lamp ' + value.state;
   $('country').textContent = value.country ? value.country + ' · ' + (value.exitIP || 'IP закреплён') : 'IP не закреплён';
+  $('savedIP').textContent = value.ipMemoryError || (value.savedIP ? 'Разрешён только IP: ' + value.savedIP : 'Адрес ещё не сохранён. Он будет закреплён после успешной проверки подключения.');
   if (value.profile) { $('profile').textContent = value.profile.timezone + ' · ' + value.profile.language; $('locale').textContent = 'Intl locale: ' + value.profile.locale; }
   else { $('profile').textContent = value.state === 'blocked' ? 'Соединение закрыто' : 'Ожидаем запуск Claude'; $('locale').textContent = 'Проверяются Intl, navigator и Accept-Language'; }
   if (value.state === 'running' && previous.state !== 'running') { $('errorBanner').hidden = true; lastOperation('Проверка сессии', 'профиль подтверждён'); }
@@ -137,6 +139,12 @@ $('settings').addEventListener('submit',async event=>{
   },result=>result?.state==='running'?'сессия подтверждена':'запрос принят контроллером');
 });
 $('stop').addEventListener('click',()=>{if(VM.controls(state,[...pending],ready).stop) void perform('stop','Остановка',async()=>{const result=await window.guard.stop();if(result?.state)showState(result);return result;},'команда отправлена');});
+$('resetIP').addEventListener('click',()=>{
+  if($('resetIP').disabled)return;
+  void perform('resetIP','Сброс закрепления IP',async()=>{
+    const result=await window.guard.resetIP();if(result?.state)showState(result);return result;
+  },result=>result?.canceled?'отменён':'закрепление сброшено');
+});
 function hideRestartConfirm(){
   if($('restartConfirm').hidden)return;
   if($('restartConfirm').contains(document.activeElement))$('restart').focus();

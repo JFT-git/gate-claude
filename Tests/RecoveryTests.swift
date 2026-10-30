@@ -100,12 +100,62 @@ import Darwin
         } catch { expect(false, "current-network transport setup: \(error.localizedDescription)") }
     }
 
+    @MainActor static func verifyPersistentIP(root: URL) async {
+        let file = root.appendingPathComponent("persistent-ip/ip-memory.json")
+        let memory = IPMemory(url: file)
+        func saved() -> String? {
+            do { return try memory.load() }
+            catch { expect(false, "expected readable IP memory"); return "[unreadable]" }
+        }
+        func model(_ address: String) -> GuardModel {
+            let value = GuardModel(diagnosticsURL: root.appendingPathComponent(UUID().uuidString + ".jsonl"), ipMemoryURL: file)
+            value.e2eRuntimeRoot = root; value.useProxy = false; value.interval = 30
+            value.e2eSystemProxyCapture = { try SystemProxy.parse("<dictionary> {\n}") }
+            value.e2eCapturedPin = SOCKSRelay.LocalPin(v4: "192.0.2.10", v6: nil)
+            value.timezone = "Europe/Amsterdam"; value.language = "en-US"
+            value.e2eInitialCheck = { _ in IPReport(ip: address, countryCode: "NL", country: "NL", date: Date()) }
+            value.e2ePublicCheck = { _ in address }
+            return value
+        }
+        let first = model("203.0.113.7")
+        first.check(andLaunch: false)
+        expect(await wait { first.allowed }, "first fully checked session is admitted")
+        expect(saved() == "203.0.113.7", "first checked IP is saved before traffic is allowed")
+        expect(!first.canResetIP, "reset is unavailable during an active session")
+        first.resetIP(); expect(saved() == "203.0.113.7", "active reset cannot delete the saved pin")
+        first.stop(); expect(first.canResetIP, "reset becomes available after stop")
+        expect(saved() == "203.0.113.7", "manual stop preserves the saved IP")
+        let same = model("203.0.113.7"); same.check(andLaunch: false)
+        expect(await wait { same.allowed }, "new model accepts the same saved IP"); same.stop()
+        let changed = model("203.0.113.8"); changed.check(andLaunch: false)
+        expect(await wait { changed.requiresRestart }, "new model rejects another foreign IP across restarts")
+        expect(!changed.allowed && changed.e2eRelayPort == nil, "mismatch closes the relay before any launch")
+        expect(saved() == "203.0.113.7", "rejected IP cannot overwrite stored memory")
+        changed.resetIP(); expect(saved() == nil && changed.requiresRestart, "explicit reset clears memory but cannot reopen a latched session")
+        let reset = model("203.0.113.8"); reset.check(andLaunch: false)
+        expect(await wait { reset.allowed }, "a fresh session may pin another IP after explicit reset"); reset.stop()
+        try? memory.reset()
+        let split = model("203.0.113.7")
+        split.e2eDestinationCheck = { _ in ("203.0.113.9", "NL") }
+        split.check(andLaunch: false)
+        expect(await wait { split.requiresRestart }, "a different destination exit blocks the session")
+        expect(saved() == nil, "split route cannot save a first pin")
+        try? Data("{broken".utf8).write(to: file)
+        let corrupt = model("203.0.113.7"); var checked = false
+        corrupt.e2eInitialCheck = { _ in checked = true; throw GuardError.message("unexpected probe") }
+        corrupt.check(andLaunch: false)
+        expect(await wait { !corrupt.busy } && !checked && !corrupt.allowed, "invalid memory blocks before a network probe")
+        corrupt.resetIP(); expect(saved() == nil, "explicit reset recovers a damaged memory file")
+        for value in [first, same, changed, reset, split, corrupt] { value.shutdown() }
+    }
+
     @MainActor static func main() async {
         signal(SIGPIPE, SIG_IGN)
         await verifyCurrentNetworkTransport()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Guard-recovery-" + UUID().uuidString)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        await verifyPersistentIP(root: root)
         let model = GuardModel(diagnosticsURL: root.appendingPathComponent("diagnostics.jsonl"))
         model.e2eRuntimeRoot = root // Prevent writing actual preferences.
         model.e2eSystemProxyCapture = { try SystemProxy.parse("<dictionary> {\n}") }

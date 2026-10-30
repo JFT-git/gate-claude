@@ -31,7 +31,7 @@ async function until(check) { for (let n = 0; n < 100; n++) { if (check()) retur
 function stubNetwork(controller) {
   const direct = Object.freeze({ kind: 'direct', host: '', port: 0, fingerprint: 'd'.repeat(64) });
   controller.networkProxy = direct; controller.networkProxyConfiguration = async () => direct;
-  controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: hostname === 'claude.ai' ? '203.0.113.20' : '203.0.113.21', country_code: 'NL' });
+  controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: '203.0.113.7', country_code: 'NL' });
 }
 class Relay extends EventEmitter {
   constructor() { super(); this.port = 1; this.checkToken = 'fixture-control-token'; this.paused = false; this.resumes = 0; this.closed = false; }
@@ -137,8 +137,8 @@ test('repeated failed route reads still check unchanged IP and never reopen traf
 test('stable independent destination exits do not cause a false IP-change block', async t => {
   const c = await fixture(t), relay = c.relay;
   c.pauseForRevalidation('Recheck each destination'); await c.poll(c.epoch);
-  assert.equal(c.policy.pinned, pinned); assert.equal(c.destinationPolicies.get('claude.ai').pinned, '203.0.113.20');
-  assert.equal(c.destinationPolicies.get('api.anthropic.com').pinned, '203.0.113.21');
+  assert.equal(c.policy.pinned, pinned); assert.equal(c.destinationPolicies.get('claude.ai').pinned, '203.0.113.7');
+  assert.equal(c.destinationPolicies.get('api.anthropic.com').pinned, '203.0.113.7');
   assert.equal(c.state, 'running'); assert.equal(c.policy.blocked, false); assert.equal(relay.resumes, 1);
 });
 test('an unchanged ipify answer cannot hide a changed Claude destination while another probe is slow', async t => {
@@ -149,7 +149,7 @@ test('an unchanged ipify answer cannot hide a changed Claude destination while a
   };
   const pending = c.poll(c.epoch); await until(() => c.state === 'blocked');
   assert.equal(pendingHost, 'api.anthropic.com'); assert.equal(relay.closed, true); assert.equal(relay.resumes, 0);
-  slow.resolve({ hostname: pendingHost, ip: '203.0.113.21', country_code: 'NL' }); await pending;
+  slow.resolve({ hostname: pendingHost, ip: '203.0.113.7', country_code: 'NL' }); await pending;
   assert.equal(c.state, 'blocked'); assert.equal(c.relay, null);
 });
 test('a Claude destination switching IPv4 to IPv6 terminates even while ipify stays unchanged', async t => {
@@ -174,7 +174,7 @@ test('route failures still check destination exits and terminate on a confirmed 
   const c = await fixture(t), relay = c.relay; let domains = 0;
   c.pauseForRevalidation('Recheck after a route transition');
   c.routeFingerprint = async () => { throw new RouteReadError('TIMEOUT'); };
-  c.requestDestinationIP = async (_epoch, hostname) => { domains++; return { hostname, ip: hostname === 'claude.ai' ? '203.0.113.22' : '203.0.113.21', country_code: 'NL' }; };
+  c.requestDestinationIP = async (_epoch, hostname) => { domains++; return { hostname, ip: hostname === 'claude.ai' ? '203.0.113.22' : '203.0.113.7', country_code: 'NL' }; };
   await c.poll(c.epoch);
   assert.equal(domains, 2); assert.equal(c.state, 'blocked'); assert.equal(relay.closed, true);
 });
@@ -212,7 +212,7 @@ test('a system-proxy change at the end of a successful recheck cannot reopen tra
 test('stop while destination probes are pending prevents late answers from reopening traffic', async t => {
   const c = await fixture(t), relay = c.relay, answer = deferred(); let domains = 0;
   c.pauseForRevalidation('Recheck destination exits');
-  c.requestDestinationIP = async (_epoch, hostname) => { domains++; await answer.promise; return { hostname, ip: '203.0.113.20', country_code: 'NL' }; };
+  c.requestDestinationIP = async (_epoch, hostname) => { domains++; await answer.promise; return { hostname, ip: '203.0.113.7', country_code: 'NL' }; };
   const pending = c.poll(c.epoch); await until(() => domains === 2); c.stop(); const epoch = c.epoch;
   answer.resolve(); await pending;
   assert.equal(c.epoch, epoch); assert.equal(c.state, 'blocked'); assert.equal(relay.closed, true); assert.equal(relay.resumes, 0);

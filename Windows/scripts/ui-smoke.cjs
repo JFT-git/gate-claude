@@ -4,9 +4,9 @@
 const {app,BrowserWindow,ipcMain,nativeTheme}=require('electron');const fs=require('node:fs');const path=require('node:path');const assert=require('node:assert/strict');const os=require('node:os');
 const out=path.resolve(process.env.GATE_UI_TEST_OUT||path.join(os.tmpdir(),'gate-ui-smoke'));
 const userData=fs.mkdtempSync(path.join(os.tmpdir(),'gate-ui-fixture-'));app.setPath('userData',userData);
-const calls={},checks=[];let win,heldStart,holdStart=false,failRestart=false;
+const calls={},checks=[];let win,heldStart,holdStart=false,failRestart=false,fixtureIP=null,cancelReset=true;
 let service={schema:1,available:false,state:'unavailable',actions:[]};
-const state=phase=>({state:phase,message:'Тест интерфейса · '+phase});
+const state=phase=>({state:phase,message:'Тест интерфейса · '+phase,savedIP:fixtureIP});
 const settings={mode:'network',claudeSource:'auto',interval:5,timezone:'Europe/Amsterdam',language:'en-US',captureBodies:false,codeEnabled:false};
 ipcMain.handle('fixture:call',async(_event,name)=>{
  calls[name]=(calls[name]||0)+1;
@@ -16,6 +16,7 @@ ipcMain.handle('fixture:call',async(_event,name)=>{
  if(name==='find')return{status:'found',path:'C:\\Fixture\\Claude.exe',message:'Тестовый путь; Claude не запускается'};
  if(name==='start'){if(holdStart)return new Promise(resolve=>heldStart=resolve);return state('running');}
  if(name==='stop')return state('blocked');
+ if(name==='resetIP'){if(cancelReset)return{canceled:true};fixtureIP=null;return state('idle');}
  if(name==='restart'){if(failRestart)throw Error('private-token-must-not-render');return{};}
  return{};
 });
@@ -34,6 +35,17 @@ app.whenReady().then(async()=>{
  await check('unavailable service never presents install or running success',async()=>{assert.equal(await js(`document.getElementById('serviceActions').hidden`),true);assert.match(await js(`document.getElementById('serviceMessage').textContent`),/недоступна/);});
  await check('three main buttons share one row and equal dimensions',async()=>{const b=await buttons();for(const id of ['stop','restart'])for(const key of ['y','width','height'])assert.ok(Math.abs(b.start.rect[key]-b[id].rect[key])<1,`${id}:${key}`);assert.equal(b.start.disabled,false);assert.equal(b.stop.disabled,true);});
  await check('no external scripts, styles, images or privileged renderer APIs',async()=>{assert.equal(await js(`typeof require`),'undefined');assert.equal(await js(`typeof window.guard.serviceStatus`),'function');assert.equal(await js(`Array.from(document.querySelectorAll('[src],[href]')).filter(e=>/^https?:/.test(e.getAttribute('src')||e.getAttribute('href'))).length`),0);});
+ await check('persistent IP is visible at startup; canceled reset keeps it and active sessions refuse reset',async()=>{
+   assert.equal(await js(`document.getElementById('resetIP').disabled`),true);
+   fixtureIP='203.0.113.7';await emit({type:'state',data:state('idle')});
+   assert.match(await js(`document.getElementById('savedIP').textContent`),/203\.0\.113\.7/);
+   await js(`document.getElementById('resetIP').click()`);await wait(`!document.getElementById('resetIP').disabled`);
+   assert.match(await js(`document.getElementById('savedIP').textContent`),/203\.0\.113\.7/);
+   await emit({type:'state',data:state('running')});assert.equal(await js(`document.getElementById('resetIP').disabled`),true);
+   await emit({type:'state',data:state('idle')});cancelReset=false;
+   await js(`document.getElementById('resetIP').click()`);await wait(`document.getElementById('resetIP').disabled&&document.getElementById('savedIP').textContent.includes('ещё не сохранён')`);
+   assert.equal(calls.resetIP,2);cancelReset=true;
+ });
  await new Promise(r=>setTimeout(r,220));
  await check('primary action text contrast at rest exceeds WCAG AA',async()=>{const colors=await js(`(()=>{const c=getComputedStyle(document.getElementById('start'));return[c.color,c.backgroundColor]})()`);assert.ok(lumRatio(colors)>=4.5,colors.join(' / '));});
  nativeTheme.themeSource='light';await new Promise(r=>setTimeout(r,150));

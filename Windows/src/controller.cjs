@@ -5,6 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const net = require('node:net');
 const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
+const { IPMemory, MISMATCH } = require('./ip-memory.cjs');
 const { SOCKSRelay, NetworkRelay, setPinnedLocalAddresses, capturedEgressLocalAddresses, beginEgressCapture } = require('./relay.cjs');
 const { initialIP, currentIP, queryDestinationIP, NetworkCheckError } = require('./ip-check.cjs');
 const { readSystemProxy } = require('./system-proxy.cjs');
@@ -34,10 +35,20 @@ class GuardController extends EventEmitter {
     });
     this.fenceOwnerWindow = options.ownerWindow;
     this.root = root; this.resources = resources; this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
+    this.ipMemory = new IPMemory(root); this.savedIP = null; this.ipMemoryError = '';
+    try { this.savedIP = this.ipMemory.load(); } catch (error) { this.ipMemoryError = error.message; }
     try { this.events = JSON.parse(fs.readFileSync(path.join(root, 'diagnostics.json'), 'utf8')).slice(-80); } catch {}
   }
   status(message) { this.message = message; this.emit('state', this.snapshot()); }
-  snapshot() { return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null, country: this.country || '', exitIP: this.policy.pinned || '', windowsApprovalPending: NetworkFence.approvalPending }; }
+  snapshot() { return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null, country: this.country || '', exitIP: this.policy.pinned || '', savedIP: this.savedIP, ipMemoryError: this.ipMemoryError, windowsApprovalPending: NetworkFence.approvalPending }; }
+  canResetIP() { return ['idle', 'blocked'].includes(this.state) && !NetworkFence.approvalPending && !this.fencePending && !this.codePreparationPending; }
+  resetIP() {
+    if (!this.canResetIP()) throw Error('Сначала остановите сессию Claude и дождитесь завершения запуска.');
+    this.ipMemory.reset(); this.savedIP = null; this.ipMemoryError = '';
+    this.log('Закрепление IP сброшено пользователем после подтверждения.', 'warning');
+    this.status(this.state === 'blocked' ? 'Память IP сброшена. Перезапустите Guard перед новым подключением.' : 'Память IP сброшена. Следующий проверенный адрес будет закреплён.');
+    return this.snapshot();
+  }
   log(message, kind = 'event') {
     const event = { date: new Date().toISOString(), kind, message: diagnostic(message) };
     this.events.push(event); this.events = this.events.slice(-80);
@@ -97,6 +108,8 @@ class GuardController extends EventEmitter {
     this.codePreparationPending = settings.codeEnabled === true; this.codePreparationEpoch = epoch;
     this.state = 'checking'; this.verified = null; this.revalidationRevision = 0; this.status(settings.mode === 'network' ? 'Проверяем страну и закрепляем IP текущей сети / VPN…' : 'Проверяем страну и закрепляем IP через SOCKS5…');
     try {
+      try { this.savedIP = this.ipMemory.load(); this.ipMemoryError = ''; }
+      catch (error) { this.ipMemoryError = error.message; throw error; }
       // Validate and clone the signed source before any Code asset can be downloaded.
       // Cancellation also latches during runtime copying, before Code's profile exists.
       const preparedRuntime = await prepareRuntime(settings.claudePath, this.root, path.join(this.resources, 'RuntimeBootstrap.cjs'), text => { if (active()) this.status(text); }, settings.codeEnabled === true ? { codeEnabled: true } : undefined);
@@ -128,6 +141,7 @@ class GuardController extends EventEmitter {
         const revision = this.revalidationRevision || 0, interfaces = networkFingerprint();
         const initial = await this.requestIP(epoch, initialIP, port, this.relay.checkToken); if (!active()) return false;
         const pin = this.policy.pin(initial); this.country = pin.country;
+        this.ipMemory.check(pin.ip);
         if (settings.mode === 'network') this.relay.pinIPFamily(net.isIP(pin.ip));
         const current = await this.requestIP(epoch, currentIP, port, this.relay.checkToken); if (!active()) return false;
         this.policy.check(current.ip); if (!active()) return false;
@@ -140,6 +154,9 @@ class GuardController extends EventEmitter {
         if (this.usesLocalPin() && !localPin) throw Error('Локальный адрес выхода изменился во время проверки.');
         if (revision !== (this.revalidationRevision || 0) || interfaces !== networkFingerprint()) throw Error('Сеть изменилась во время начальной проверки IP.');
         if (!this.publishLocalAddresses(localPin)) throw Error('Локальный адрес изменился перед запуском.');
+        // All probes and route checks must succeed before first-time persistence.
+        // A failed write leaves Claude and application traffic closed.
+        this.savedIP = this.ipMemory.commit(pin.ip);
         this.log('Исходный IP закреплён: [IP скрыт] · ' + pin.country);
         this.schedulePoll(epoch, settings.interval * 1000);
         return true;
@@ -506,6 +523,7 @@ class GuardController extends EventEmitter {
           if (String(result.country_code || '').toUpperCase() === 'RU') this.block('Маршрут Claude вышел через RU. Сессия закрыта до перезапуска Guard.');
           throw Error('Invalid destination country');
         }
+        if (ip !== this.policy.pinned) { this.block('Внешний IP маршрута Claude изменился. ' + MISMATCH); return false; }
         if (pin) this.destinationPolicies.set(hostname, policy);
         else {
           const pinned = this.destinationPolicies.get(hostname);
@@ -567,7 +585,7 @@ class GuardController extends EventEmitter {
     }
     if (this.epoch !== epoch) throw Error('Проверка отменена.');
     const started = performance.now();
-    const request = Promise.resolve().then(() => check(port, token, require('node:net').isIP(this.policy.pinned || ''))); this.ipRequest = request;
+    const request = Promise.resolve().then(() => check(port, token, require('node:net').isIP(this.policy.pinned || this.savedIP || ''))); this.ipRequest = request;
     try { return await request; }
     catch (error) {
       if (this.epoch === epoch && !this.policy.blocked && this.relay) this.reportProbeFailure(check === initialIP ? 'geo' : 'public', error, performance.now() - started);

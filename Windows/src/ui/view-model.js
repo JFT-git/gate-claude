@@ -7,6 +7,7 @@
   const active = ['checking', 'starting', 'running', 'rechecking'];
   function controls(state, pending = [], ready = true) {
     const phase = state?.state || 'idle', has = name => pending.includes(name);
+    if (has('resetIP')) return { start: false, stop: false, restart: false, settings: false, progress: true, primary: null };
     return {
       start: ready && phase === 'idle' && !has('start') && !has('stop') && !has('restart'),
       stop: ready && (active.includes(phase) || phase === 'idle' && has('start')) && !has('stop') && !has('restart'),

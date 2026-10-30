@@ -33,6 +33,56 @@ test('initial RU, malformed IP, mismatch and service failures close relay and la
     await assert.rejects(controller.start(input));
   }
 });
+test('saved IP is read by a new controller and a different exit cannot replace it across restarts', async t => {
+  const controller = await fixture(t); controller.ipMemory.commit('203.0.113.7');
+  const reopened = new GuardController(controller.root, controller.root);
+  assert.equal(reopened.snapshot().savedIP, '203.0.113.7'); reopened.stop();
+  initial = async () => ({ success: true, country_code: 'NL', ip: '203.0.113.8' });
+  current = async () => { throw Error('A mismatched exit must be rejected before further checks'); };
+  await controller.start(input);
+  assert.equal(controller.state, 'blocked'); assert.equal(controller.host, null); assert.equal(controller.relay, null);
+  assert.equal(controller.ipMemory.load(), '203.0.113.7');
+  controller.stop(); assert.equal(controller.ipMemory.load(), '203.0.113.7');
+  controller.resetIP(); assert.equal(controller.ipMemory.load(), null);
+  assert.equal(controller.state, 'blocked', 'explicit reset cannot reopen a latched session');
+});
+test('a foreign destination using a different exit blocks first launch without saving any pin', async t => {
+  const controller = await fixture(t);
+  initial = async () => ({ success: true, country_code: 'NL', ip: '203.0.113.7' }); current = async () => ({ ip: '203.0.113.7' });
+  controller.requestDestinationIP = async (_epoch, hostname) => ({ hostname, ip: '203.0.113.8', country_code: 'NL' });
+  await controller.start(input);
+  assert.equal(controller.state, 'blocked'); assert.equal(controller.ipMemory.load(), null); assert.equal(controller.host, null);
+});
+test('failed persistence closes the relay before runtime launch', async t => {
+  const controller = await fixture(t);
+  initial = async () => ({ success: true, country_code: 'NL', ip: '203.0.113.7' }); current = async () => ({ ip: '203.0.113.7' });
+  controller.ipMemory.commit = () => { throw Error('fixture disk failure'); };
+  await controller.start(input);
+  assert.equal(controller.state, 'blocked'); assert.equal(controller.relay, null); assert.equal(controller.host, null); assert.equal(controller.ipMemory.load(), null);
+});
+test('reset is refused while starting, running, rechecking or awaiting native protection', async t => {
+  const controller = await fixture(t); controller.ipMemory.commit('203.0.113.7');
+  for (const state of ['checking', 'starting', 'running', 'rechecking']) {
+    controller.state = state; assert.throws(() => controller.resetIP()); assert.equal(controller.ipMemory.load(), '203.0.113.7');
+  }
+  controller.state = 'blocked'; controller.fencePending = true; assert.throws(() => controller.resetIP()); controller.fencePending = false;
+});
+test('canceling the trusted warning preserves the pin; only explicit confirmation resets it', async t => {
+  const { resetIPWithConfirmation } = require('../src/ip-reset.cjs');
+  const controller = await fixture(t); controller.ipMemory.commit('203.0.113.7');
+  assert.deepEqual(await resetIPWithConfirmation(controller, async () => false), { canceled: true });
+  assert.equal(controller.ipMemory.load(), '203.0.113.7');
+  assert.deepEqual(await resetIPWithConfirmation(controller, async () => 1), { canceled: true });
+  assert.equal(controller.ipMemory.load(), '203.0.113.7');
+  await resetIPWithConfirmation(controller, async () => true);
+  assert.equal(controller.ipMemory.load(), null);
+});
+test('a new startup while the warning is pending cannot clear the pin', async t => {
+  const { resetIPWithConfirmation } = require('../src/ip-reset.cjs');
+  const controller = await fixture(t); controller.ipMemory.commit('203.0.113.7');
+  await assert.rejects(resetIPWithConfirmation(controller, async () => { controller.state = 'starting'; return true; }));
+  assert.equal(controller.ipMemory.load(), '203.0.113.7');
+});
 test('current network session closes its live tunnel and latches on a new foreign IP', async t => {
   const net = require('node:net'), { once } = require('node:events');
   const { NetworkRelay, connectTunnel } = require('../src/relay.cjs');

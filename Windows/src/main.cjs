@@ -11,12 +11,13 @@ const { diagnostic } = require('./sanitize.cjs');
 const { takeDeepLinkFromArgv, LINK_REFUSED } = require('./deep-link.cjs');
 const { ensureGuardProtocolRegistration, SETTINGS_URL } = require('./protocol-registration.cjs');
 const { ServiceIntegration } = require('./service-integration.cjs');
+const { resetIPWithConfirmation } = require('./ip-reset.cjs');
 
 app.setName('Claude Proxy Guard');
 app.setAppUserModelId?.('local.proxyguard.gate-claude');
 if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
-  let window, controller, protocolState, earlyLinkRefused = false;
+  let window, controller, protocolState, earlyLinkRefused = false, resettingIP = false;
   const receiveDeepLink = argv => {
     const link = takeDeepLinkFromArgv(argv);
     if (!link.hadLink) return;
@@ -99,6 +100,7 @@ else {
       return result.canceled ? '' : result.filePaths[0];
     });
     handle('start', async input => {
+      if (resettingIP) throw Error('Сначала закройте предупреждение о сбросе IP.');
       const value = validateSettings(input);
       if (value.claudeSource === 'auto') {
         const found = await findClaude();
@@ -111,6 +113,21 @@ else {
       traffic.clear(); send('clear', null); await controller.start(value); return controller.snapshot();
     });
     handle('stop', () => { controller.stop(); return controller.snapshot(); });
+    handle('resetIP', async () => {
+      if (resettingIP || !controller.canResetIP()) throw Error('Сначала остановите сессию Claude и дождитесь завершения запуска.');
+      resettingIP = true;
+      try {
+        return await resetIPWithConfirmation(controller, async () => {
+          const result = await dialog.showMessageBox(window, {
+            type: 'warning', title: 'Сбросить закреплённый IP?',
+            message: 'Следующее подключение сможет закрепить другой внешний IP.',
+            detail: 'Стабильный IP помогает сохранять один маршрут подключения. Сброс разрешит смену адреса и может потребовать повторной авторизации. Сохранённый профиль Claude останется. После заблокированной сессии потребуется перезапустить Guard.',
+            buttons: ['Отмена', 'Сбросить закрепление'], defaultId: 0, cancelId: 0, noLink: true
+          });
+          return result.response === 1;
+        });
+      } finally { resettingIP = false; }
+    });
     handle('restart', async () => {
       if (NetworkFence.approvalPending) throw Error('Сначала ответьте на системный запрос Windows. Для отмены запуска выберите «Нет», затем перезапустите Guard.');
       const host = controller.host; controller.stop();

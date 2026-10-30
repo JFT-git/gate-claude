@@ -72,7 +72,7 @@ import Network
             let result = try IPChecker.parseDestinationTrace(Data(trace.utf8), hostname: "claude.ai", family: 4)
             expect(result.ip == "203.0.113.7" && result.countryCode == "DE", "valid destination trace")
             var policy = SessionPolicy()
-            try policy.establish(IPReport.parse(json("DE", "203.0.113.1")))
+            try policy.establish(IPReport.parse(json("DE", "203.0.113.7")))
             try policy.verifyDestination(hostname: "claude.ai", ip: result.ip, countryCode: result.countryCode)
             rejected("destination IP change rejected") { try policy.verifyDestination(hostname: "claude.ai", ip: "203.0.113.8", countryCode: "DE") }
             expect(policy.requiresRestart, "destination change latches like main IP")

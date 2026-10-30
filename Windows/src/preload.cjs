@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('guard', Object.freeze({
   protocolCheck: () => ipcRenderer.invoke('guard:protocolCheck'),
   start: settings => ipcRenderer.invoke('guard:start', settings),
   stop: () => ipcRenderer.invoke('guard:stop'),
+  resetIP: () => ipcRenderer.invoke('guard:resetIP'),
   restart: () => ipcRenderer.invoke('guard:restart'),
   export: () => ipcRenderer.invoke('guard:export'),
   subscribe: callback => { const listener = (_event, value) => callback(value); ipcRenderer.on('guard:event', listener); return () => ipcRenderer.off('guard:event', listener); }
