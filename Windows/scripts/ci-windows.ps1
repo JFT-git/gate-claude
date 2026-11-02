@@ -117,7 +117,12 @@ Copy-Item -LiteralPath (Join-Path $repositoryRoot 'Resources\RuntimeBootstrap.cj
 $hostHelper = Join-Path $resources 'GuardHost.exe'
 $fenceHelper = Join-Path $resources 'NetworkFence.exe'
 Invoke-Checked -Executable $csc -Arguments @('/nologo', '/optimize+', '/platform:anycpu', '/target:exe', ('/out:' + $hostHelper), (Join-Path $windowsRoot 'native\GuardHost.cs')) -Label 'GuardHost compilation'
-Invoke-Checked -Executable $csc -Arguments @('/nologo', '/optimize+', '/platform:x64', '/target:exe', ('/out:' + $fenceHelper), (Join-Path $windowsRoot 'native\NetworkFence.cs')) -Label 'NetworkFence compilation'
+Invoke-Checked -Executable $csc -Arguments @(
+    '/nologo', '/optimize+', '/platform:x64', '/target:exe', ('/out:' + $fenceHelper),
+    (Join-Path $windowsRoot 'native\NetworkFence.cs'),
+    (Join-Path $windowsRoot 'native\CodeNetworkFence.cs'),
+    (Join-Path $windowsRoot 'native\CodeFenceSession.cs')
+) -Label 'NetworkFence compilation'
 
 $oldEnvironment = @{}
 foreach ($name in @('GATE_HOST', 'GATE_FENCE_HELPER', 'NODE_EXTRA_CA_CERTS')) {

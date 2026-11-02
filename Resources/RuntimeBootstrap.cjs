@@ -55,6 +55,10 @@ const sessionGates = new WeakMap();
 // fail-closed depth inside the main process for QUIC/UDP/DNS and direct Node
 // egress. Loopback stays available so local MCP/IPC keeps working.
 function installNetworkHardening() {
+  // Capture the trusted primitive once. Do not let caller accessors or later
+  // mutations of a configuration object change the native proxy policy.
+  const configuredProxyURL = cfg.proxyURL;
+  const proxyURL = typeof configuredProxyURL === 'string' && configuredProxyURL ? configuredProxyURL : null;
   const net = require('node:net'), tls = require('node:tls'), dgram = require('node:dgram');
   const dns = require('node:dns'), http = require('node:http'), https = require('node:https'), http2 = require('node:http2');
   const denied = name => { const error = Error('Guard blocked network escape: ' + name); error.code = 'ERR_GUARD_NETWORK_DENIED'; return error; };
@@ -69,7 +73,10 @@ function installNetworkHardening() {
     Object.defineProperty(object, key, { enumerable: descriptor?.enumerable ?? true, configurable: false, get: () => value, set() {} });
   }
   function block(object, names, label) { for (const name of names) hook(object, name, deny(label + '.' + name)); }
-  const literalLoopback = value => /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(String(value)) || String(value) === '::1';
+  // Numeric-looking hostnames such as 127.1.2.999 must not reach the system
+  // resolver. They are not IP literals and can trigger DNS outside the relay.
+  const literalLoopback = value => typeof value === 'string' &&
+    ((net.isIP(value) === 4 && value.startsWith('127.')) || value === '::1');
   // Node's exact classification (lib/net.js toNumber/isPipeName): a string is a
   // unix path unless Number(value) >= 0, so "-1" is a path while " 0", "0x0",
   // "+0", "0e0", "Infinity", "1e2" are TCP ports.
@@ -184,13 +191,13 @@ function installNetworkHardening() {
   // literals make no network query, so only those may pass.
   const originalLookup = dns.lookup;
   hook(dns, 'lookup', function (name, ...rest) {
-    if (literalLoopback(String(name))) return originalLookup.apply(this, [name, ...rest]);
+    if (literalLoopback(name)) return originalLookup.apply(this, [name, ...rest]);
     throw denied('dns.lookup');
   });
   if (dns.promises && typeof dns.promises.lookup === 'function') {
     const originalPromisesLookup = dns.promises.lookup;
     hook(dns.promises, 'lookup', function (name, ...rest) {
-      if (literalLoopback(String(name))) return originalPromisesLookup.apply(this, [name, ...rest]);
+      if (literalLoopback(name)) return originalPromisesLookup.apply(this, [name, ...rest]);
       throw denied('dns.promises.lookup');
     });
   }
@@ -232,16 +239,24 @@ function installNetworkHardening() {
       return Reflect.construct(original, arguments);
     });
   }
-  const proxySettingsMatch = options => options && options.mode === 'fixed_servers' &&
-    options.proxyRules === cfg.proxyURL && options.proxyBypassRules === '<-loopback>' && !options.pacScript;
+  const proxySettingsSnapshot = options => {
+    if (!proxyURL || !options || typeof options !== 'object' || Array.isArray(options)) throw denied('session.setProxy');
+    const mode = options.mode, proxyRules = options.proxyRules, proxyBypassRules = options.proxyBypassRules, pacScript = options.pacScript;
+    if (mode !== 'fixed_servers' || proxyRules !== proxyURL || proxyBypassRules !== '<-loopback>' || pacScript) throw denied('session.setProxy');
+    // Electron must receive the validated values, never the original accessors
+    // or inherited/PAC fields. Its native conversion reads options again.
+    return Object.freeze({ __proto__: null, mode: 'fixed_servers', proxyRules: proxyURL, proxyBypassRules: '<-loopback>' });
+  };
   const protectedSessions = new WeakSet();
   function protectSession(s) {
     if (!s || protectedSessions.has(s)) return;
     protectedSessions.add(s);
     const setProxy = s.setProxy;
     hook(s, 'setProxy', function (options) {
-      if (!cfg.proxyURL || !proxySettingsMatch(options)) return Promise.reject(denied('session.setProxy'));
-      return setProxy.call(this, options);
+      let snapshot;
+      try { snapshot = proxySettingsSnapshot(options); }
+      catch { return Promise.reject(denied('session.setProxy')); }
+      return setProxy.call(this, snapshot);
     });
     block(s, ['resolveHost'], 'session');
   }
@@ -254,7 +269,7 @@ function installNetworkHardening() {
     // literal loopback address. Speculative/background hostname lookups must fail.
     'host-resolver-rules': 'MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'
   };
-  if (cfg.proxyURL) { switches['proxy-server'] = cfg.proxyURL; switches['proxy-bypass-list'] = '<-loopback>'; }
+  if (proxyURL) { switches['proxy-server'] = proxyURL; switches['proxy-bypass-list'] = '<-loopback>'; }
   const dangerousSwitches = new Set(['no-proxy-server', 'proxy-auto-detect', 'proxy-pac-url', 'enable-quic']);
   const appendSwitch = commandLine.appendSwitch;
   for (const [name, value] of Object.entries(switches)) appendSwitch.call(commandLine, name, value);

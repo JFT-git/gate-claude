@@ -4,6 +4,7 @@ const net = require('node:net');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const os = require('node:os');
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 class Channel extends EventEmitter {
   constructor() {
@@ -26,9 +27,13 @@ class Channel extends EventEmitter {
           const packet = buffer.subarray(0, delimiter); buffer = buffer.subarray(delimiter + 1);
           let message;
           try { message = JSON.parse(packet.toString('utf8')); } catch { socket.destroy(); return; }
+          if (!record(message)) { socket.destroy(); return; }
           if (!authenticated) {
-            const token = Buffer.from(String(message.params?.token || ''));
-            if (message.method !== 'ProxyGuard.hello' || token.length !== this.token.length ||
+            const params = message.params;
+            if (message.method !== 'ProxyGuard.hello' || !record(params) || typeof params.token !== 'string' ||
+                !/^[a-f0-9]{64}$/.test(params.token)) { socket.destroy(); return; }
+            const token = Buffer.from(params.token);
+            if (token.length !== this.token.length ||
                 !crypto.timingSafeEqual(token, Buffer.from(this.token)) || this.socket) { socket.destroy(); return; }
             authenticated = true; clearTimeout(timer); this.socket = socket; this.emit('connected');
           } else if (message.id && this.pending.has(message.id)) {

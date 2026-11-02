@@ -144,18 +144,19 @@ function installNetworkGuard(cfg) {
   const appendSwitch = commandLine.appendSwitch;
   for (const [name, value] of Object.entries(switches)) appendSwitch.call(commandLine, name, value);
   hook(commandLine, 'appendSwitch', function (name, value = '') {
-    const key = String(name).replace(/^--/, '').toLowerCase();
-    if (dangerousSwitches.has(key) || (Object.hasOwn(switches, key) && String(value) !== switches[key])) throw denied('commandLine.appendSwitch');
+    if (typeof name !== 'string' || typeof value !== 'string' || /[\x00-\x1f\x7f]/.test(name + value)) throw denied('commandLine.appendSwitch');
+    const key = name.replace(/^--/, '').toLowerCase();
+    if (dangerousSwitches.has(key) || (Object.hasOwn(switches, key) && value !== switches[key])) throw denied('commandLine.appendSwitch');
     return appendSwitch.call(this, name, value);
   });
   const removeSwitch = commandLine.removeSwitch;
   hook(commandLine, 'removeSwitch', function (name) {
-    if (Object.hasOwn(switches, String(name).replace(/^--/, '').toLowerCase())) throw denied('commandLine.removeSwitch');
+    if (typeof name !== 'string' || /[\x00-\x1f\x7f]/.test(name) || Object.hasOwn(switches, name.replace(/^--/, '').toLowerCase())) throw denied('commandLine.removeSwitch');
     return removeSwitch.call(this, name);
   });
   const appendArgument = commandLine.appendArgument;
   hook(commandLine, 'appendArgument', function (argument) {
-    if (String(argument).startsWith('--')) throw denied('commandLine.appendArgument');
+    if (typeof argument !== 'string' || /[\x00-\x1f\x7f]/.test(argument) || argument.startsWith('--')) throw denied('commandLine.appendArgument');
     return appendArgument.call(this, argument);
   });
   // Block public low-level entry points too. Node internals and Electron's own
@@ -163,7 +164,9 @@ function installNetworkGuard(cfg) {
   const binding = process.binding;
   const dangerousBindings = new Set(['tcp_wrap', 'udp_wrap', 'cares_wrap', 'process_wrap', 'spawn_sync', 'tls_wrap', 'pipe_wrap']);
   hook(process, 'binding', function (name) {
-    if (dangerousBindings.has(String(name))) throw denied('process.binding');
+    // Node coerces binding names again at the native boundary. Accept only the
+    // actual string we validated, never a caller-controlled conversion object.
+    if (typeof name !== 'string' || dangerousBindings.has(name)) throw denied('process.binding');
     return binding.call(this, name);
   });
   block(process, ['dlopen'], 'process');

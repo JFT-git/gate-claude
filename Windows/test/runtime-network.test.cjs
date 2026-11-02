@@ -100,6 +100,24 @@ test('runtime guard denies arbitrary IPC and resists replacement of patched nati
     process.binding=()=>{throw Error('replacement executed');};denied(()=>process.binding('tcp_wrap'));`);
 });
 
+test('native binding names must be primitive strings without invoking caller conversions', () => {
+  run(`installNetworkGuard(cfg);let reads=0;
+    for(const name of [{toString(){reads++;return 'fs';}},new String('fs'),null,undefined,42,[]])denied(()=>process.binding(name));
+    assert.equal(reads,0);assert.equal(typeof process.binding('fs'),'object');
+    for(const name of ['tcp_wrap','process_wrap','spawn_sync','pipe_wrap'])denied(()=>process.binding(name));`);
+});
+
+test('command-line native calls reject coercible values and control characters before delegation', () => {
+  run(`installNetworkGuard(cfg);const count=calls.length;let reads=0;
+    const value={toString(){reads++;return 'fixture';}};
+    denied(()=>app.commandLine.appendSwitch(value));denied(()=>app.commandLine.appendSwitch('fixture',value));
+    denied(()=>app.commandLine.removeSwitch(value));denied(()=>app.commandLine.appendArgument(value));
+    for(const name of ['fixture\\0proxy-server','fixture\\r','fixture\\n']){denied(()=>app.commandLine.appendSwitch(name));denied(()=>app.commandLine.removeSwitch(name));denied(()=>app.commandLine.appendArgument(name));}
+    denied(()=>app.commandLine.appendSwitch('fixture','value\\0tail'));
+    assert.equal(reads,0);assert.equal(calls.length,count);
+    app.commandLine.appendSwitch('fixture','allowed');assert.deepEqual(calls.at(-1),['fixture','allowed']);`);
+});
+
 test('runtime guard accepts only its own randomized diagnostic pipe configuration', () => {
   run(`assert.throws(()=>installNetworkGuard({...cfg,channelPipe:'\\\\.\\pipe\\other'}));
     const pipe='\\\\\\\\.\\\\pipe\\\\gate-claude-'+'a'.repeat(32);

@@ -252,6 +252,21 @@ check('dgram-denied', () => assert.throws(() => dgram.createSocket('udp4'), /Gua
 const dns = require('node:dns');
 check('dns-lookup-denied', () => assert.throws(() => dns.lookup('claude.ai', () => {}), /Guard blocked/));
 check('dns-lookup-loopback-literal', () => dns.lookup('127.0.0.1', (error, address) => { assert.ifError(error); assert.strictEqual(address, '127.0.0.1'); }));
+check('dns-invalid-loopback-lookalikes-denied', () => {
+  for (const host of ['127.1.2.999', '127.256.0.1', '127.01.0.1', '127.0.0.1.example.invalid']) {
+    assert.strictEqual(net.isIP(host), 0);
+    assert.throws(() => dns.lookup(host, () => {}), /Guard blocked/, host);
+    assert.throws(() => dns.promises.lookup(host), /Guard blocked/, host);
+    assert.throws(() => net.connect({host, port: 443}), /Guard blocked/, host);
+  }
+});
+check('dns-loopback-coercion-denied', () => {
+  let coercions = 0;
+  const hostname = { toString() { coercions++; return '127.0.0.1'; } };
+  assert.throws(() => dns.lookup(hostname, () => {}), /Guard blocked/);
+  assert.throws(() => dns.promises.lookup(hostname), /Guard blocked/);
+  assert.strictEqual(coercions, 0);
+});
 check('dns-resolve-denied', () => assert.throws(() => dns.resolve4('claude.ai', () => {}), /Guard blocked/));
 check('dns-promises-denied', () => assert.throws(() => dns.promises.lookup('claude.ai'), /Guard blocked/));
 check('dns-resolver-denied', () => assert.throws(() => new dns.Resolver().resolve4('claude.ai', () => {}), /Guard blocked/));
@@ -277,6 +292,44 @@ check('session-proxy-locked', () => {
   return wrong.then(() => { throw Error('setProxy allowed'); }, () => {});
 });
 check('session-proxy-exact-allowed', () => session.setProxy({ mode: 'fixed_servers', proxyRules: 'http://127.0.0.1:8123', proxyBypassRules: '<-loopback>' }));
+check('session-proxy-getters-snapshotted-once', async () => {
+  const good = { mode: 'fixed_servers', proxyRules: 'http://127.0.0.1:8123', proxyBypassRules: '<-loopback>', pacScript: undefined };
+  const bad = { mode: 'direct', proxyRules: 'direct://', proxyBypassRules: '*', pacScript: 'https://example.invalid/proxy.pac' };
+  for (const field of Object.keys(good)) {
+    const target = new FakeSession(); appEvents.emit('session-created', target);
+    let reads = 0;
+    const options = { ...good };
+    Object.defineProperty(options, field, { get() { return ++reads === 1 ? good[field] : bad[field]; } });
+    await target.setProxy(options);
+    const delegated = target.calls[0];
+    assert.strictEqual(reads, 1, field);
+    assert.notStrictEqual(delegated, options);
+    assert.strictEqual(Object.getPrototypeOf(delegated), null);
+    assert.ok(Object.isFrozen(delegated));
+    assert.deepStrictEqual(Object.keys(delegated).sort(), ['mode', 'proxyBypassRules', 'proxyRules']);
+    assert.strictEqual(delegated.mode, good.mode);
+    assert.strictEqual(delegated.proxyRules, good.proxyRules);
+    assert.strictEqual(delegated.proxyBypassRules, good.proxyBypassRules);
+  }
+});
+check('session-proxy-coercion-denied', async () => {
+  for (const field of ['mode', 'proxyRules', 'proxyBypassRules']) {
+    const options = { mode: 'fixed_servers', proxyRules: 'http://127.0.0.1:8123', proxyBypassRules: '<-loopback>' };
+    let coercions = 0;
+    const expected = options[field];
+    options[field] = { toString() { coercions++; return expected; } };
+    await assert.rejects(session.setProxy(options), /Guard blocked/);
+    assert.strictEqual(coercions, 0);
+  }
+});
+check('session-proxy-throwing-getter-denied', async () => {
+  await assert.rejects(session.setProxy({ get mode() { throw Error('hostile getter'); } }), /Guard blocked/);
+});
+check('session-proxy-inherited-pac-denied', async () => {
+  const options = Object.assign(Object.create({ pacScript: 'https://example.invalid/proxy.pac' }),
+    { mode: 'fixed_servers', proxyRules: 'http://127.0.0.1:8123', proxyBypassRules: '<-loopback>' });
+  await assert.rejects(session.setProxy(options), /Guard blocked/);
+});
 check('session-resolveHost-denied', () => assert.throws(() => session.resolveHost('claude.ai'), /Guard blocked/));
 
 let policyValue = null;
