@@ -112,6 +112,10 @@ final class GuardModel: ObservableObject {
         return inbox
     }()
     var onRestart: (() -> Void)?
+    var canRestartGuard: (() -> Bool)?
+    var checkForUpdates: (() -> Void)?
+    @Published var updateStatus = "Проверка обновлений при запуске и раз в 24 часа; загрузка в фоне."
+    @Published var updateError: String?
 
     #if GUARD_E2E
     var e2eSystemProxyCapture: (() throws -> SystemProxy.Snapshot)?
@@ -800,6 +804,11 @@ final class GuardModel: ObservableObject {
     }
     func restart() {
         guard !restarting, let onRestart else { return }
+        guard canRestartGuard?() != false else {
+            operationFailure = "Перезапуск недоступен во время проверки, загрузки или установки обновления."
+            updateStatus = operationFailure!
+            return
+        }
         operationFailure = nil
         deepLinkInbox.clear()
         restarting = true
@@ -1228,6 +1237,21 @@ struct GuardView: View {
 
                     }
                 }
+                Surface {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("Обновления Guard").font(.system(size: 15, weight: .semibold))
+                            Spacer()
+                            Button("Проверить обновления…") { model.checkForUpdates?() }
+                                .disabled(model.restarting || model.checkForUpdates == nil)
+                        }
+                        Text(model.updateStatus).font(.system(size: 12))
+                            .foregroundStyle(model.updateError == nil ? GuardPalette.secondary : GuardPalette.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Установка запрашивает подтверждение, завершает Claude и перезапускает только Guard. Claude автоматически не запускается; пароль не наследуется. Профиль и диагностика сохраняются.")
+                            .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 VStack(alignment: .leading, spacing: 8) {
                     Label(model.networkBarrier && model.barrierActive ? "Системный kill switch активен" : "Упрощённая защита — системный барьер не активен", systemImage: model.networkBarrier && model.barrierActive ? "checkmark.shield" : "info.circle")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(model.networkBarrier && model.barrierActive ? GuardPalette.accent : GuardPalette.warning)
@@ -1285,13 +1309,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
     private var restartedProcess: Process?
+    private var updateController: GuardUpdateController?
 
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls { model.deepLinkInbox.accept(url.absoluteString) }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if GUARD_UPDATE_TEST
+        if GuardUpdateTest.finishInstalledProbeIfRequested() { return }
+        #endif
         model.onRestart = { [weak self] in self?.restartApplication() }
+        model.canRestartGuard = { [weak self] in self?.updateController?.canRestartGuard ?? true }
+        model.checkForUpdates = { [weak self] in self?.updateController?.checkForUpdates() }
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 850),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Claude Proxy Guard"
@@ -1307,6 +1337,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stop.target = self; menu.addItem(stop)
         let restart = NSMenuItem(title: "Перезапустить Guard", action: #selector(restartGuard), keyEquivalent: "")
         restart.target = self; menu.addItem(restart)
+        let updates = NSMenuItem(title: "Проверить обновления…", action: #selector(checkUpdates), keyEquivalent: "")
+        updates.target = self; menu.addItem(updates)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -1314,6 +1346,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let root = NSMenuItem(); appMenu.addItem(root)
         let submenu = NSMenu(); root.submenu = submenu
         submenu.addItem(NSMenuItem(title: "О Claude Proxy Guard", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
+        let updateItem = NSMenuItem(title: "Проверить обновления…", action: #selector(checkUpdates), keyEquivalent: "")
+        updateItem.target = self; submenu.addItem(updateItem)
         submenu.addItem(.separator())
         submenu.addItem(NSMenuItem(title: "Скрыть Claude Proxy Guard", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
         let hideOthers = NSMenuItem(title: "Скрыть остальные", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
@@ -1336,10 +1370,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMenu.addItem(NSMenuItem(title: "Все окна — на передний план", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
         NSApplication.shared.windowsMenu = windowMenu
         NSApplication.shared.mainMenu = appMenu
+        updateController = GuardUpdateController(model: model)
     }
 
     @objc func showWindow() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     @objc func stopGuard() { model.stop() }
+    @objc func checkUpdates() { updateController?.checkForUpdates() }
     @objc func restartGuard() {
         guard !model.restarting else { return }
         if model.monitoring || model.claudeRunning || model.busy {
@@ -1348,12 +1384,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.restart()
     }
     private func restartApplication() {
+        guard updateController?.canRestartGuard != false else {
+            model.restartFailed("Сначала завершите или отмените обновление.")
+            return
+        }
         model.shutdown()
         do {
             guard let executable = Bundle.main.executableURL else { throw GuardError.message("Не найдено приложение для перезапуска.") }
             restartedProcess = try GuardRelauncher.launch(executable: executable)
             NSApp.terminate(nil)
         } catch { model.restartFailed("Не удалось перезапустить Guard: \(error.localizedDescription)") }
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard updateController?.prepareForTermination() != false else { return .terminateCancel }
+        model.shutdown()
+        return .terminateNow
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showWindow(); return true }
@@ -1365,6 +1410,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct Main {
     @MainActor static func main() {
         signal(SIGPIPE, SIG_IGN)
+        #if GUARD_UPDATE_TEST
+        GuardUpdateTest.prepareProcessEnvironment()
+        #endif
         let application = NSApplication.shared
         let delegate = AppDelegate()
         application.delegate = delegate

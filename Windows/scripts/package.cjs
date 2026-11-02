@@ -28,6 +28,9 @@ async function main() {
   }
   delete pkg.devDependencies; delete pkg.scripts; delete pkg.engines; delete pkg.private;
   await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify(pkg, null, 2));
+  await fs.copyFile(path.join(root, 'package-lock.json'), path.join(stage, 'package-lock.json'));
+  execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: stage, stdio: 'inherit' });
+  await fs.rm(path.join(stage, 'package-lock.json'));
   await fs.cp(path.join(root, 'src'), path.join(stage, 'src'), { recursive: true });
   await fs.mkdir(path.join(stage, 'resources'), { recursive: true });
   await fs.copyFile(path.join(project, 'Resources', 'RuntimeBootstrap.cjs'), path.join(stage, 'resources', 'RuntimeBootstrap.cjs'));
@@ -78,7 +81,7 @@ async function main() {
       extraResource.push(toolsOutput, policyOutput);
     }
   }
-  // Runtime dependencies are Node built-ins; no profiles, test hooks or Claude binaries are staged.
+  // Only locked production dependencies are staged; no profiles, test hooks or Claude binaries.
   const results = await packager({ dir: stage, name: 'Claude Proxy Guard', platform, arch, electronVersion, electronZipDir,
     out: path.join(root, 'dist'), overwrite: true, asar: true, prune: false, extraResource,
     appBundleId: 'local.proxyguard.gate-claude', appCopyright: 'Copyright 2026 gate-claude contributors',

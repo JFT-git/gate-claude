@@ -3,7 +3,12 @@
 import argparse,hashlib,json,pathlib,re
 p=argparse.ArgumentParser();p.add_argument('directory',type=pathlib.Path);p.add_argument('--commit',required=True);a=p.parse_args()
 if not re.fullmatch('[0-9a-f]{40}',a.commit):raise SystemExit('Expected full source commit')
-patterns=[r'ClaudeProxyGuard-Windows-\d+\.\d+\.\d+-x64(?:-Setup\.exe|\.zip)',r'ClaudeProxyGuard-macOS-\d+\.\d+\.\d+-universal\.(?:zip|dmg)',r'(?:macos|windows)-build-status\.json',r'(?:ui|release)-validation\.json']
+patterns=[
+ r'ClaudeProxyGuard-Windows-\d+\.\d+\.\d+-x64(?:-Setup\.exe(?:\.blockmap)?|\.zip)',
+ r'ClaudeProxyGuard-macOS-\d+\.\d+\.\d+-universal\.(?:zip|dmg)',
+ r'latest\.yml(?:\.sig)?',r'appcast\.xml(?:\.sig)?',
+ r'(?:macos|windows)-build-status\.json',r'(?:ui|release)-validation\.json'
+]
 files=[]
 for f in sorted(a.directory.iterdir()):
  if f.is_symlink() or not f.is_file():raise SystemExit('Only regular artifacts accepted: '+f.name)

@@ -26,6 +26,7 @@ const DESTINATIONS = Object.freeze(['claude.ai', 'api.anthropic.com']);
 class GuardController extends EventEmitter {
   constructor(root, resources, options = {}) {
     super(); this.codeCleanups = new WeakMap(); this.codeStatePreparations = new WeakMap();
+    this.pendingOperations = new Set(); this.startTask = null; this.shutdownFailed = false;
     this.destinationPolicies = new Map(); this.destinationRequests = new Map(); this.probeFailures = new Map();
     this.deepLinks = new DeepLinkInbox({
       active: () => !this.policy?.blocked && !!this.policy?.pinned && ['starting', 'running', 'rechecking'].includes(this.state) && !!this.host && this.host.exitCode == null && !this.host.killed && !!this.channel && !this.channel.closed,
@@ -98,7 +99,19 @@ class GuardController extends EventEmitter {
     if (this.state !== 'rechecking') this.status(label + (value.total > 1 ? ' · ' + value.done + ' / ' + value.total : '') + '…');
   }
   deliverDeepLink(url) { return this.deepLinks.accept(url); }
-  async start(input) {
+  track(operation) {
+    const task = Promise.resolve(operation);
+    this.pendingOperations.add(task);
+    task.finally(() => { this.pendingOperations.delete(task); }).catch(() => {});
+    return task;
+  }
+  start(input) {
+    const task = Promise.resolve().then(() => this.startSession(input));
+    this.startTask = task;
+    task.finally(() => { if (this.startTask === task) this.startTask = null; }).catch(() => {});
+    return task;
+  }
+  async startSession(input) {
     this.policy.assertAvailable();
     if (this.state !== 'idle') throw Error('Guard уже работает.');
     const settings = validateSettings(input); this.settings = settings;
@@ -235,7 +248,7 @@ class GuardController extends EventEmitter {
       finally { this.fencePending = false; }
       if (!active()) {
         try { await fence.close(); await this.cleanupCodeProfile(code); }
-        catch { this.log('Ограничения Windows и профиль Code сохранены: завершение защищённой сессии не подтверждено.', 'warning'); }
+        catch { this.shutdownFailed = true; this.log('Ограничения Windows и профиль Code сохранены: завершение защищённой сессии не подтверждено.', 'warning'); }
         return;
       }
       this.fence = fence;
@@ -380,6 +393,7 @@ class GuardController extends EventEmitter {
     }
     if (!this.codeCleanups.has(code)) {
       const cleanup = Promise.resolve().then(() => code.cleanupProfile()).catch(() => {
+        this.shutdownFailed = true;
         this.log('Не удалось удалить временный профиль AppContainer Code. Рабочая папка сохранена.', 'warning');
       });
       this.codeCleanups.set(code, cleanup);
@@ -395,6 +409,8 @@ class GuardController extends EventEmitter {
     const header = Buffer.alloc(4); header.writeUInt32LE(body.length);
     const child = spawn(code.hostPath, ['--prepare-state'], { cwd: code.stateRoot, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const preparation = { closed: false, cleanupRequested: false };
+    preparation.closedTask = new Promise(resolve => { preparation.confirmClosed = resolve; });
+    this.track(preparation.closedTask);
     this.codeStatePreparations.set(code, preparation); this.codeStateHost = child;
     return new Promise((resolve, reject) => {
       let stdout = Buffer.alloc(0), failure, settled = false, killTimer;
@@ -422,8 +438,8 @@ class GuardController extends EventEmitter {
       child.stderr.resume();
       child.on('error', fail); child.stdin.on('error', fail);
       child.once('close', status => {
-        preparation.closed = true;
-        if (preparation.cleanupRequested) void this.cleanupCodeProfile(code);
+        preparation.closed = true; preparation.confirmClosed();
+        if (preparation.cleanupRequested) void this.track(this.cleanupCodeProfile(code)).catch(() => {});
         if (settled) return;
         if (failure || status !== 0) { finish(failure || Error('Не удалось безопасно подготовить постоянное состояние Claude Code.')); return; }
         try {
@@ -715,14 +731,18 @@ class GuardController extends EventEmitter {
     const closeFence = async () => {
       if (fence) {
         try { await fence.close(); await this.cleanupCodeProfile(code); }
-        catch { this.log('Ограничения Windows и профиль Code сохранены: завершение защищённой копии не подтверждено.', 'warning'); }
+        catch { this.shutdownFailed = true; this.log('Ограничения Windows и профиль Code сохранены: завершение защищённой копии не подтверждено.', 'warning'); }
       } else if (unusedCode) await this.cleanupCodeProfile(code);
     };
+    const drain = () => { this.track(closeFence()).catch(() => { this.shutdownFailed = true; }); };
     if (host) {
       host.stdin.end(); const timer = setTimeout(() => host.kill(), 1000); timer.unref();
-      if (host.exitCode != null || host.signalCode != null) { clearTimeout(timer); closeFence(); }
-      else host.once('exit', () => { clearTimeout(timer); closeFence(); });
-    } else closeFence();
+      const exited = new Promise(resolve => {
+        if (host.exitCode != null || host.signalCode != null) { clearTimeout(timer); resolve(); }
+        else host.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+      this.track(exited.then(drain));
+    } else drain();
     this.inspector = null; this.channel = null; this.relay = null;
     if (this.settings) this.settings.password = ''; this.settings = null; this.verified = null; this.exitCode = null;
   }
@@ -738,6 +758,17 @@ class GuardController extends EventEmitter {
     if (hadSession) this.policy.block(); this.teardown();
     this.state = blocked || hadSession ? 'blocked' : 'idle';
     this.status(this.state === 'blocked' ? 'Сессия закрыта. Для нового подключения перезапустите Guard.' : 'Остановлено.');
+  }
+  async quiesce() {
+    if (NetworkFence.approvalPending) return false;
+    this.stop();
+    if (this.startTask) { try { await this.startTask; } catch {} }
+    while (this.pendingOperations.size) {
+      const operations = [...this.pendingOperations];
+      await Promise.allSettled(operations);
+      if (NetworkFence.approvalPending) return false;
+    }
+    return !this.shutdownFailed && !NetworkFence.approvalPending && !this.fencePending && !this.codePreparationPending && !this.codeStateHost && !this.host;
   }
 }
 module.exports = { GuardController };

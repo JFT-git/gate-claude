@@ -1,7 +1,7 @@
 {
   "name": "gate-claude",
   "productName": "Claude Proxy Guard",
-  "version": "0.6.16",
+  "version": "0.7.0",
   "description": "Independent guarded network companion for an installed Claude Desktop",
   "author": "gate-claude contributors",
   "license": "MIT",
@@ -17,9 +17,15 @@
   },
   "devDependencies": {
     "@electron/packager": "20.3.0",
-    "electron": "44.9.2"
+    "electron": "44.9.2",
+    "electron-builder": "26.18.0"
   },
   "engines": {
     "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11",
+    "js-yaml": "4.3.2",
+    "semver": "7.7.3"
   }
 }

@@ -2,16 +2,19 @@
 // Source-match check for the cross-built Windows artifact; not a runtime test.
 const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process'),assert=require('node:assert/strict'),crypto=require('node:crypto');
 const repo=path.resolve(__dirname,'../..'),dist=path.resolve(process.argv[2]||path.join(repo,'Windows/dist/Claude Proxy Guard-win32-x64'));
-const commit=process.argv[3]||'HEAD';const git=(...args)=>cp.execFileSync('git',['-C',repo,...args]);
+const commit=process.argv[3]||'HEAD',working=commit==='WORKING_TREE';const git=(...args)=>cp.execFileSync('git',['-C',repo,...args]);
+const readSource=file=>working?fs.readFileSync(path.join(repo,file)):git('show',commit+':'+file);
+function sourceFiles(directory){if(!working)return git('ls-tree','-r','--name-only',commit,directory).toString().trim().split('\n');const files=[];for(const entry of fs.readdirSync(path.join(repo,directory),{withFileTypes:true,recursive:true})){const file=path.join(entry.parentPath,entry.name);if(entry.isFile())files.push(path.relative(repo,file).split(path.sep).join('/'));}return files.sort();}
 const sha=b=>crypto.createHash('sha256').update(b).digest('hex');
 const {parseArchive}=require('../../Windows/src/asar.cjs');const bytes=fs.readFileSync(path.join(dist,'resources/app.asar'));const asar=parseArchive(bytes),leaves=[];
 (function walk(node,prefix=''){for(const [name,value]of Object.entries(node.files||{})){const file=prefix+name;if(value.files)walk(value,file+'/');else{assert(!value.link&&!value.unpacked);leaves.push(file);}}})(asar.header);
-const source=git('ls-tree','-r','--name-only',commit,'Windows/src').toString().trim().split('\n');
-for(const file of source)assert.deepEqual(asar.read(file.slice(8)),git('show',commit+':'+file),file);
-assert.equal(leaves.length,source.length+2);assert.deepEqual(leaves.filter(x=>!x.startsWith('src/')).sort(),['LICENSE','package.json']);
-const product=JSON.parse(asar.read('package.json'));assert.equal(product.version,JSON.parse(git('show',commit+':Windows/package.json')).version);assert.equal(product.scripts,undefined);assert.equal(product.devDependencies,undefined);
+const source=sourceFiles('Windows/src');
+for(const file of source)assert.deepEqual(asar.read(file.slice(8)),readSource(file),file);
+assert(leaves.every(file=>file.startsWith('src/')||file.startsWith('node_modules/')||file==='LICENSE'||file==='package.json'));assert.deepEqual(leaves.filter(x=>!x.startsWith('src/')&&!x.startsWith('node_modules/')).sort(),['LICENSE','package.json']);
+const product=JSON.parse(asar.read('package.json')),sourceProduct=JSON.parse(readSource('Windows/package.json')),lock=JSON.parse(readSource('Windows/package-lock.json'));assert.equal(product.version,sourceProduct.version);assert.deepEqual(product.dependencies,sourceProduct.dependencies);assert.equal(product.scripts,undefined);assert.equal(product.devDependencies,undefined);
+let productionPackages=0;for(const [name,descriptor]of Object.entries(lock.packages)){if(!name||descriptor.dev===true)continue;const staged=JSON.parse(asar.read(name+'/package.json'));assert.equal(staged.version,descriptor.version,name);productionPackages++;}assert(productionPackages>0);assert(!leaves.includes('node_modules/electron-builder/package.json'));assert(!leaves.includes('node_modules/electron/package.json'));assert(!fs.existsSync(path.join(dist,'resources/app-update.yml')));
 const pins=require('../windows/cross-build-pins.json');for(const [name,digest]of Object.entries(pins.sha256))assert.equal(sha(fs.readFileSync(path.join(dist,'resources',name))),digest,name);
-assert.deepEqual(fs.readFileSync(path.join(dist,'resources/RuntimeBootstrap.cjs')),git('show',commit+':Resources/RuntimeBootstrap.cjs'));
-const docs=git('ls-tree','-r','--name-only',commit,'docs').toString().trim().split('\n');for(const file of ['README.md','SECURITY.md','CHANGELOG.md',...docs])assert.deepEqual(fs.readFileSync(path.join(dist,'Documentation',file)),git('show',commit+':'+file));
+assert.deepEqual(fs.readFileSync(path.join(dist,'resources/RuntimeBootstrap.cjs')),readSource('Resources/RuntimeBootstrap.cjs'));
+const docs=sourceFiles('docs');for(const file of ['README.md','SECURITY.md','CHANGELOG.md',...docs])assert.deepEqual(fs.readFileSync(path.join(dist,'Documentation',file)),readSource(file));
 let files=0;function inventory(dir){for(const entry of fs.readdirSync(dir,{withFileTypes:true})){assert(!entry.isSymbolicLink());assert(!/^(?:Profile|settings\.json|ip-memory\.json|diagnostics\.json|\.env(?:\..*)?|node_modules|test|Tests|work)$/i.test(entry.name),entry.name);assert(!/\.(?:pem|pfx|p12|key)$/i.test(entry.name),entry.name);if(entry.isDirectory())inventory(path.join(dir,entry.name));else files++;}}inventory(dist);
-console.log(JSON.stringify({status:'PASS',mode:'SOURCE_MATCH_NOT_WINDOWS_EXECUTION',sourceCommit:git('rev-parse',commit).toString().trim(),version:product.version,sourceFiles:source.length,packageFiles:files,asarSHA256:sha(bytes),nativeAndCodeToolsPins:'MATCH',testHooksOrProfilesStaged:false}));
+console.log(JSON.stringify({status:'PASS',mode:'SOURCE_MATCH_NOT_WINDOWS_EXECUTION',sourceCommit:working?'WORKING_TREE':git('rev-parse',commit).toString().trim(),version:product.version,sourceFiles:source.length,packageFiles:files,asarSHA256:sha(bytes),nativeAndCodeToolsPins:'MATCH',productionPackages,portableUpdaterConfig:false,testHooksOrProfilesStaged:false}));

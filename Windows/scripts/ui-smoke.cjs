@@ -6,11 +6,13 @@ const out=path.resolve(process.env.GATE_UI_TEST_OUT||path.join(os.tmpdir(),'gate
 const userData=fs.mkdtempSync(path.join(os.tmpdir(),'gate-ui-fixture-'));app.setPath('userData',userData);
 const calls={},checks=[];let win,heldStart,holdStart=false,failRestart=false,fixtureIP=null,cancelReset=true;
 let service={schema:1,available:false,state:'unavailable',actions:[]};
+let update={state:'idle',supported:true,reason:'',version:null,progress:null,error:null};
 const state=phase=>({state:phase,message:'Тест интерфейса · '+phase,savedIP:fixtureIP});
 const settings={mode:'network',claudeSource:'auto',interval:5,timezone:'Europe/Amsterdam',language:'en-US',captureBodies:false,codeEnabled:false};
 ipcMain.handle('fixture:call',async(_event,name)=>{
  calls[name]=(calls[name]||0)+1;
- if(name==='init')return{version:'0.6.9 · UI fixture',settings,state:state('idle'),protocol:{skipped:true},logs:[],records:[]};
+ if(name==='init')return{version:'0.6.9 · UI fixture',settings,state:state('idle'),protocol:{skipped:true},update,logs:[],records:[]};
+ if(name==='updateCheck'||name==='updateInstall')return update;
  if(name==='serviceStatus')return service;
  if(name==='serviceOperation')throw Error('No real service exists in this fixture');
  if(name==='find')return{status:'found',path:'C:\\Fixture\\Claude.exe',message:'Тестовый путь; Claude не запускается'};
@@ -35,6 +37,14 @@ app.whenReady().then(async()=>{
  await check('unavailable service never presents install or running success',async()=>{assert.equal(await js(`document.getElementById('serviceActions').hidden`),true);assert.match(await js(`document.getElementById('serviceMessage').textContent`),/недоступна/);});
  await check('three main buttons share one row and equal dimensions',async()=>{const b=await buttons();for(const id of ['stop','restart'])for(const key of ['y','width','height'])assert.ok(Math.abs(b.start.rect[key]-b[id].rect[key])<1,`${id}:${key}`);assert.equal(b.start.disabled,false);assert.equal(b.stop.disabled,true);});
  await check('no external scripts, styles, images or privileged renderer APIs',async()=>{assert.equal(await js(`typeof require`),'undefined');assert.equal(await js(`typeof window.guard.serviceStatus`),'function');assert.equal(await js(`Array.from(document.querySelectorAll('[src],[href]')).filter(e=>/^https?:/.test(e.getAttribute('src')||e.getAttribute('href'))).length`),0);});
+ await check('update progress, explicit confirmation, errors and portable refusal',async()=>{
+   update={state:'available',supported:true,version:'0.7.0',progress:0};await emit({type:'update',data:update});assert.match(await js(`document.getElementById('updateMessage').textContent`),/0\.7\.0/);assert.equal(await js(`document.getElementById('updateInstall').hidden`),true);
+   update={...update,state:'downloading',progress:42.5};await emit({type:'update',data:update});assert.equal(await js(`document.getElementById('updateProgress').value`),42.5);assert.equal(await js(`document.getElementById('updateCheck').disabled`),true);
+   update={...update,state:'downloaded',progress:100};await emit({type:'update',data:update});await js(`document.getElementById('updateInstall').click()`);assert.equal(await js(`document.getElementById('updateConfirm').hidden`),false);assert.equal(calls.updateInstall||0,0);assert.match(await js(`document.getElementById('updateConfirmText').textContent`),/CodeState, Workspace, settings\.json и ip-memory\.json/);
+   await js(`document.getElementById('updateConfirmNo').click()`);assert.equal(calls.updateInstall||0,0);await js(`document.getElementById('updateInstall').click();document.getElementById('updateConfirmYes').click()`);await wait(`document.getElementById('updateConfirm').hidden`);assert.equal(calls.updateInstall,1);
+   update={state:'error',supported:true,error:'Сеть недоступна; Guard продолжает работу.'};await emit({type:'update',data:update});assert.match(await js(`document.getElementById('updateMessage').textContent`),/Guard продолжает/);assert.equal(await js(`document.getElementById('updateCheck').disabled`),false);
+   update={state:'idle',supported:false,reason:'portable'};await emit({type:'update',data:update});assert.equal(await js(`document.getElementById('updateCheck').disabled`),true);assert.match(await js(`document.getElementById('updateMessage').textContent`),/ZIP-сборке/);
+ });
  await check('persistent IP is visible at startup; canceled reset keeps it and active sessions refuse reset',async()=>{
    assert.equal(await js(`document.getElementById('resetIP').disabled`),true);
    fixtureIP='203.0.113.7';await emit({type:'state',data:state('idle')});

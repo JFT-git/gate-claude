@@ -270,9 +270,25 @@ test('gate closes first, and the AppContainer profile is deleted only after host
   c.fenceClosePending.resolve(); await until(() => c.cleanups === 1);
   assert.ok(c.events.indexOf('fence-drained') < c.events.indexOf('profile-cleanup'));
 });
+test('update quiesce awaits host exit, fence drain and Code profile cleanup', async t => {
+  const c = await fixture(t); c.holdHostExit = true; c.fenceClosePending = deferred(); await c.controller.start(input);
+  let settled = false; const quiesced = c.controller.quiesce().then(value => { settled = true; return value; });
+  await turn(); assert.equal(settled, false); assert.equal(c.cleanups, 0);
+  c.host.finish(0); await until(() => c.events.includes('fence-close-begin')); assert.equal(settled, false);
+  c.fenceClosePending.resolve(); assert.equal(await quiesced, true); assert.equal(c.cleanups, 1); assert.equal(c.controller.pendingOperations.size, 0);
+});
 test('unconfirmed native drain retains the AppContainer profile and never reopens its gate', async t => {
   const c = await fixture(t); c.fenceCloseError = true; await c.controller.start(input); c.controller.stop(); await turn(); await turn();
   assert.equal(c.gate.closed, true); assert.equal(c.cleanups, 0); assert.equal(c.controller.state, 'blocked');
+});
+test('update quiesce refuses installation after an unconfirmed native drain', async t => {
+  const c = await fixture(t); c.fenceCloseError = true; await c.controller.start(input);
+  assert.equal(await c.controller.quiesce(), false); assert.equal(c.controller.shutdownFailed, true); assert.equal(c.cleanups, 0);
+});
+test('update quiesce refuses installation when unused Code profile cleanup fails', async t => {
+  const c = await fixture(t); c.controller.codePrepared = c.code; c.controller.state = 'running';
+  c.code.cleanupProfile = async () => { throw Error('fixture cleanup failure'); };
+  assert.equal(await c.controller.quiesce(), false); assert.equal(c.controller.shutdownFailed, true);
 });
 test('a missing CodeHost or unsupported Code source refuses Code startup before WFP and runtime launch', async t => {
   const c = await fixture(t); c.filesError = true; await c.controller.start(input);
@@ -368,6 +384,14 @@ test('state-helper cancellation settles within a bound while retaining its profi
   c.prepareProcess.finish(125); await until(() => c.cleanups === 1);
   assert.ok(c.events.indexOf('state-helper-closed') < c.events.indexOf('profile-cleanup'));
   c.controller.stop(); await turn(); assert.equal(c.cleanups, 1);
+});
+
+test('update quiesce waits for late Code helper close and deferred profile cleanup', { timeout: 5000 }, async t => {
+  const c = await fixture(t); c.holdStatePreparation = true; c.ignoreStateKill = true;
+  const starting = c.controller.start(input); await until(() => c.preparePacket);
+  let settled = false; const quiesced = c.controller.quiesce().then(value => { settled = true; return value; });
+  await starting; await turn(); assert.equal(settled, false); assert.equal(c.cleanups, 0);
+  c.prepareProcess.finish(125); assert.equal(await quiesced, true); assert.equal(c.cleanups, 1);
 });
 
 test('a helper error without close is bounded and cannot trigger profile cleanup while the helper survives', { timeout: 5000 }, async t => {

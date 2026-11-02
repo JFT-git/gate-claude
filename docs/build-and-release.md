@@ -9,25 +9,30 @@
 ## Windows
 
 ```powershell
-.\packaging\windows\package.ps1 -CodeToolsDir C:\verified\CodeTools -InnoCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' -ArtifactDir C:\fresh\release
+$env:GUARD_WINDOWS_UPDATE_PRIVATE_KEY='C:\secure\guard-windows-ed25519.pem'
+.\packaging\windows\package.ps1 -CodeToolsDir C:\verified\CodeTools -ArtifactDir C:\fresh\release
 ```
 
-InnoCompiler необязателен: без него создаётся только ZIP, статус установщика — NOT_BUILT. Комплекты CodeTools обязательны для полного Code-релиза. Их готовит `Windows/scripts/prepare-code-tools.cjs` из закреплённых исходников Git/PowerShell и bootstrap; произвольный ZIP не принимается. Native-компиляция использует существующие исходники, движок не подменяется.
+Приватный Ed25519-ключ должен находиться только во внешнем защищённом хранилище и соответствовать публичному ключу в `Windows/src/updater.cjs`. Скрипт собирает portable ZIP, per-user NSIS Setup, `.blockmap`, `latest.yml` и detached `latest.yml.sig`, затем вычисляет SHA-256. Изменение `latest.yml` после подписи запрещено: metadata нужно создать и подписать заново. Не публикуйте новый Setup/blockmap с metadata от другой сборки.
 
-На macOS Windows ZIP можно собрать существующим `Windows/scripts/package.cjs` с `--host`, `--fence`, `--code-host`, `--code-tools-dir` и при необходимости `--electron-zip-dir`. Помощники должны соответствовать опубликованным исходникам и хешам; отсутствие Windows-компилятора нельзя замаскировать чужим бинарником. Проверяйте source commit, byte-match ASAR и хеши helper/sidecar.
+Комплекты CodeTools обязательны для полного Code-релиза. Их готовит `Windows/scripts/prepare-code-tools.cjs` из закреплённых исходников Git/PowerShell и bootstrap; произвольный ZIP не принимается. Native-компиляция использует существующие исходники, движок не подменяется. Проверяйте source commit, production dependencies, byte-match ASAR и хеши helper/sidecar.
 
-`Guard.iss` устанавливает только приложение: `PrivilegesRequired=lowest`, каталог пользователя, без HKLM/SCM/служб/драйверов и без автоматического запуска. Он не завершает принудительно активную защищённую сессию. Перед обновлением/удалением пользователь должен выполнить штатную остановку и закрыть Guard. Профиль и документы не удаляются. Удаление собственных HKCU регистраций условно по marker и полному пути EXE; чужая установка не затрагивается.
+NSIS устанавливает только приложение для текущего пользователя в `%LOCALAPPDATA%\Programs\Claude Proxy Guard`, без службы и без удаления Application Data. Он не должен завершать активную защищённую сессию: updater сначала запрашивает подтверждение и дожидается shutdown. Удаление собственных HKCU регистраций условно по marker и полному пути EXE; чужая установка не затрагивается. Миграция с Inno Setup и installed A→B проверяются на настоящей Windows.
 
-Подпись Authenticode не настроена. Неподписанный Setup.exe может вызвать предупреждение ОС; успешная компиляция установщика не означает успешную установку, удаление или прохождение SmartScreen.
+Authenticode по-прежнему не настроена. Подпись update metadata подтверждает происхождение обновления относительно закреплённого ключа, но не является подписью издателя Windows. Неподписанный Setup.exe может вызвать предупреждение ОС; успешная компиляция не означает успешную установку, удаление, differential download или прохождение SmartScreen.
 
 ## macOS
 
 ```sh
 bash test.sh
-bash packaging/macos/package.sh /absolute/path/to/fresh-release
+bash packaging/macos/appcast.sh /absolute/path/to/fresh-release
 ```
 
-`build.sh` компилирует обе архитектуры и применяет ad-hoc codesign. Пакетный скрипт проверяет lipo/codesign, создаёт ZIP, DMG, SHA-256 и build-status. Секретов Developer ID/notarytool и настроенного Apple-профиля в workflow нет. Developer ID и нотариализация не выполняются и не заявляются. Для подписанного релиза нужен отдельный проверенный канал подписания; ключи не коммитятся и не копируются в артефакты.
+`build.sh` компилирует обе архитектуры, встраивает закреплённый Sparkle 2.10.1 и применяет ad-hoc codesign к приложению и вложенным компонентам. `package.sh` создаёт ZIP, DMG и SHA-256; `appcast.sh` дополнительно создаёт подписанный `appcast.xml` и проверяет ZIP/feed. Для обычной сборки без release feed по-прежнему используется `packaging/macos/package.sh`.
+
+Sparkle EdDSA-ключ создаётся официальным `generate_keys` и хранится в macOS Keychain. Публичный ключ находится в `Info.plist`; приватный ключ не коммитится и не копируется в артефакты. Перед публикацией нужно проверить доступ к ключу и наличие его независимой резервной копии. `sparkle:version` должна совпадать с монотонным `CFBundleVersion`. Не изменяйте ZIP или appcast после подписи.
+
+Developer ID и нотариализация не выполняются и не заявляются. Sparkle EdDSA защищает обновления, но не заменяет подпись издателя Apple и не устраняет предупреждения Gatekeeper.
 
 ## Проверки
 
@@ -42,10 +47,10 @@ bash packaging/macos/package.sh /absolute/path/to/fresh-release
 
 Шаблоны находятся в `packaging/workflows`. Они не исполняются автоматически из этой папки. Для активации maintainer переносит их в `.github/workflows`, проверяет permissions и разрешает добавление workflow. Текущий OAuth-доступ ранее отклонил изменение активных workflow из-за отсутствующего `workflow` scope; обойти это скрытой активацией нельзя.
 
-Mac workflow собирает universal ZIP/DMG и прогоняет локальные тесты. Windows workflow требует существующий публичный release tag этого репозитория с CodeTools assets и ожидаемый SHA-256 policy, компилирует приложение и при наличии ISCC — установщик, запускает UI-smoke и публикует только разрешённые артефакты. Никакие `.env`, PFX, пользовательские профили или account logs не загружаются.
+Mac workflow собирает universal ZIP/DMG и прогоняет локальные тесты, но не подписывает appcast без отдельно настроенного Sparkle key import. Windows workflow требует CodeTools и секрет `GUARD_WINDOWS_UPDATE_PRIVATE_KEY_PEM`; ключ записывается только во временный файл runner и не входит в upload-artifact. Workflow собирает NSIS, blockmap, `latest.yml` и `latest.yml.sig`, запускает UI-smoke и публикует только разрешённые артефакты. Пользовательские профили, account logs и приватные ключи не загружаются.
 
 ## Публикация
 
-Сначала зафиксируйте версии, changelog и commit. Создайте артефакты в свежем output, проверьте manifest/SHA-256, архитектуры, отсутствие данных профиля, ASAR source match, подписи и реальные статусы тестов. `packaging/scripts/release-manifest.py` создаёт allowlisted отчёт и SHA-256; приватные fixture и raw traffic не прикладываются.
+Сначала зафиксируйте версии, changelog и commit. Создайте артефакты в свежем output, проверьте manifest/SHA-256, архитектуры, отсутствие данных профиля, ASAR source match, вложенные подписи, Ed25519/EdDSA metadata и реальные статусы тестов. `packaging/scripts/release-manifest.py` создаёт allowlisted отчёт и SHA-256; приватные fixture и raw traffic не прикладываются.
 
-Подготовьте draft release и приложите ZIP/DMG/Setup, только если они действительно созданы, и checksum-файлы. Недоступный установщик, неподтверждённый UAC/сервис, Windows runtime, Intel runtime и notarization отмечаются NOT RUN/NOT CONFIGURED. Не заменяйте результаты предыдущей версии новым PASS. Публикация предварительной сборки не делает её стабильной.
+Подготовьте draft release и приложите ZIP/DMG/Setup, Windows blockmap, signed `latest.yml` и macOS `appcast.xml` только из одной проверенной сборки. Не загружайте приватные ключи. Недоступные installed A→B, differential download, Windows runtime/UAC, Intel runtime и notarization отмечаются NOT RUN/NOT CONFIGURED. Не заменяйте результаты предыдущей версии новым PASS. Публикация предварительной сборки не делает её стабильной.

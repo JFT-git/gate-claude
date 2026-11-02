@@ -10,6 +10,7 @@ shell-check() { # name expected actual
 xcrun swiftc -swift-version 5 -target "$TEST_ARCH-apple-macosx13.0" -module-cache-path "$CACHE" -parse-as-library -framework Network \
   Source/Core.swift Source/Policy.swift Tests/RelayTests.swift -o .build/RelayTests
 python3 Tests/run.py
+python3 Tests/update_metadata_test.py
 xcrun swiftc -swift-version 5 -target "$TEST_ARCH-apple-macosx13.0" -module-cache-path "$CACHE" -parse-as-library -framework Network \
   Source/Core.swift Source/Policy.swift Tests/IPMemoryTests.swift -o .build/IPMemoryTests
 .build/IPMemoryTests

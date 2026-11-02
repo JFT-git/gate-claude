@@ -11,7 +11,7 @@ APP="$ROOT/Claude Proxy Guard.app"
 ZIP="$OUT/ClaudeProxyGuard-macOS-$VERSION-universal.zip"
 DMG="$OUT/ClaudeProxyGuard-macOS-$VERSION-universal.dmg"
 if [[ -e "$ZIP" || -e "$DMG" ]]; then echo 'Use a fresh output directory.' >&2; exit 1; fi
-for BINARY in ClaudeProxyGuard GuardHost; do
+for BINARY in ClaudeProxyGuard GuardHost GuardDrop; do
   ARCHS="$(lipo -archs "$APP/Contents/MacOS/$BINARY")"
   [[ "$ARCHS" == "x86_64 arm64" || "$ARCHS" == "arm64 x86_64" ]] || { echo "Unexpected architectures: $ARCHS" >&2; exit 1; }
 done

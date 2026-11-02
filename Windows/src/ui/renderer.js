@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const VM = window.GuardViewModel;
 const fields = ['mode','claudeSource','claudePath','host','port','username','password','timezone','language','interval','captureBodies','codeEnabled'];
 const records = new Map(), pending = new Set();
-let selected = '', state = { state: 'idle' }, ready = false, finding = false, discoveryGeneration = 0, operationSerial = 0, serviceSnapshot;
+let selected = '', state = { state: 'idle' }, ready = false, finding = false, discoveryGeneration = 0, operationSerial = 0, serviceSnapshot, updateSnapshot;
 const node = (tag, text, cls) => { const result = document.createElement(tag); result.textContent = text; if (cls) result.className = cls; return result; };
 function failure(message) { $('errorText').textContent = message; $('errorBanner').hidden = false; }
 function lastOperation(label, result, kind = 'info') {
@@ -34,6 +34,10 @@ function refreshControls() {
   for (const [id, key] of [['protocolSettings','protocolSettings'],['protocolCheck','protocolCheck'],['codeWorkspace','workspace'],['serviceRefresh','service']]) { $(id).disabled = !ready || pending.has(key); $(id).setAttribute('aria-busy', String(pending.has(key))); }
   for (const button of document.querySelectorAll('[data-service]')) button.disabled = pending.has('service') || VM.service(serviceSnapshot).busy;
   $('serviceActivity').hidden = !pending.has('service') && !VM.service(serviceSnapshot).busy;
+  const updateBusy = ['checking','downloading','installing'].includes(updateSnapshot?.state);
+  $('updateCheck').disabled = !ready || !updateSnapshot?.supported || updateBusy || pending.has('updateCheck');
+  $('updateInstall').disabled = updateSnapshot?.state !== 'downloaded' || pending.has('updateInstall');
+  $('updateConfirmYes').disabled = updateSnapshot?.state !== 'downloaded' || pending.has('updateInstall');
 }
 function showState(value) {
   if (!value || !['idle','checking','starting','running','rechecking','blocked'].includes(value.state)) return;
@@ -86,6 +90,27 @@ function showService(value) {
   for (const button of document.querySelectorAll('[data-service]')) { button.hidden = !presentation.actions.includes(button.dataset.service); button.disabled = presentation.busy || pending.has('service'); }
   $('serviceRefresh').disabled = pending.has('service');
   $('serviceActivity').hidden = !pending.has('service') && !presentation.busy;
+}
+function showUpdate(value) {
+  if (!value || !['idle','checking','available','downloading','downloaded','installing','error'].includes(value.state)) return;
+  updateSnapshot = value; document.body.dataset.updateState = value.state;
+  const labels = { idle: 'Актуальная версия', checking: 'Проверка', available: 'Доступно', downloading: 'Загрузка', downloaded: 'Готово', installing: 'Установка', error: 'Ошибка' };
+  const messages = {
+    idle: value.checkedAt ? 'Новых стабильных обновлений нет. Следующая автоматическая проверка — через 24 часа.' : 'Стабильные обновления проверяются при запуске и каждые 24 часа.',
+    checking: 'Проверяем стабильный выпуск и подпись метаданных GitHub…',
+    available: 'Доступна версия ' + value.version + '. Начинаем фоновую загрузку.',
+    downloading: 'Загружаем проверенное обновление' + (value.progress == null ? '…' : ' · ' + value.progress + '%'),
+    downloaded: 'Версия ' + value.version + ' загружена. Перед установкой потребуется ваше подтверждение.',
+    installing: 'Останавливаем Claude и завершаем операции Guard перед установкой…',
+    error: value.error || 'Обновление недоступно. Работа Guard не прервана.'
+  };
+  if (!value.supported) messages.idle = value.reason === 'portable' ? 'Автообновление недоступно в переносной ZIP-сборке. Используйте установщик новой стабильной версии.' : 'Автообновление доступно только в установленной Windows-сборке.';
+  $('updateState').textContent = value.supported ? labels[value.state] : 'Недоступно'; $('updateState').dataset.state = value.state;
+  $('updateMessage').textContent = messages[value.state];
+  $('updateProgress').hidden = value.state !== 'downloading'; $('updateProgress').value = value.progress || 0;
+  $('updateInstall').hidden = value.state !== 'downloaded';
+  if (value.state !== 'downloaded') hideUpdateConfirm();
+  refreshControls();
 }
 async function refreshService() {
   if (pending.has('service')) return;
@@ -160,6 +185,16 @@ $('restart').addEventListener('click',()=>{
 $('restartConfirmYes').addEventListener('click',performRestart);
 $('restartConfirmNo').addEventListener('click',()=>{hideRestartConfirm();});
 $('restartConfirm').addEventListener('keydown',event=>{if(event.key==='Escape')hideRestartConfirm();});
+function hideUpdateConfirm(){
+  if($('updateConfirm').hidden)return;
+  if($('updateConfirm').contains(document.activeElement))$('updateInstall').focus();
+  $('updateConfirm').hidden=true;
+}
+$('updateCheck').addEventListener('click',()=>{if(!$('updateCheck').disabled)void perform('updateCheck','Проверка обновления',async()=>{const result=await window.guard.updateCheck();if(result?.state)showUpdate(result);return result;},'проверка завершена');});
+$('updateInstall').addEventListener('click',()=>{if(updateSnapshot?.state!=='downloaded')return;$('updateConfirm').hidden=false;$('updateConfirmYes').focus();});
+$('updateConfirmYes').addEventListener('click',()=>{if(updateSnapshot?.state!=='downloaded'){hideUpdateConfirm();return;}hideUpdateConfirm();void perform('updateInstall','Установка обновления',async()=>{const result=await window.guard.updateInstall();if(result?.state)showUpdate(result);return result;},'установщик запущен');});
+$('updateConfirmNo').addEventListener('click',hideUpdateConfirm);
+$('updateConfirm').addEventListener('keydown',event=>{if(event.key==='Escape')hideUpdateConfirm();});
 $('choose').addEventListener('click',()=>{if(!VM.controls(state,[...pending],ready).settings)return;void perform('choose','Выбор Claude',async()=>{
   const result=await window.guard.choose();if(!result?.error&&result){discoveryGeneration++;finding=false;$('claudeSource').value='manual';$('claudePath').value=result;$('claudeStatus').textContent='Путь выбран вручную';document.body.dataset.discoveryDone='true';}return result;
 },result=>result?'путь выбран':'выбор отменён');});
@@ -179,13 +214,13 @@ for(const button of document.querySelectorAll('[data-service]'))button.addEventL
   void perform('service','Управление службой',()=>window.guard.serviceOperation(action),'ответ получен').then(result=>{if(result&&!result.error)showService(result);else if(serviceSnapshot)showService(serviceSnapshot);});
 });
 const unsubscribe=window.guard.subscribe(event=>{
-  if(event.type==='protocol')showProtocol(event.data);if(event.type==='state')showState(event.data);if(event.type==='log')log(event.data);if(event.type==='record')record(event.data);if(event.type==='discovery')discovered(event.data);if(event.type==='service')showService(event.data);
+  if(event.type==='protocol')showProtocol(event.data);if(event.type==='state')showState(event.data);if(event.type==='log')log(event.data);if(event.type==='record')record(event.data);if(event.type==='discovery')discovered(event.data);if(event.type==='service')showService(event.data);if(event.type==='update')showUpdate(event.data);
   if(event.type==='clear'){records.clear();selected='';$('detail').replaceChildren(node('p','Выберите запрос для просмотра.','empty'));renderRecords();}
 });
 window.addEventListener('beforeunload',()=>{unsubscribe?.();clearTimeout(renderTimer);},{once:true});
 window.guard.init().then(data=>{
   if(data?.error){failure(data.error);$('state').textContent='Не удалось открыть Guard';return;}
-  $('version').textContent=data.version;showProtocol(data.protocol);
+  $('version').textContent=data.version;showProtocol(data.protocol);showUpdate(data.update||{state:'idle',supported:false,reason:'unavailable'});
   for(const id of fields){if(id==='password')continue;if($(id).type==='checkbox')$(id).checked=data.settings[id]===true;else if(data.settings[id]!==undefined)$(id).value=data.settings[id];}
   ready=true;showState(data.state);data.logs.forEach(log);data.records.forEach(record);document.body.dataset.ready='true';
   if($('claudeSource').value==='auto')void findClaude();else{$('claudeStatus').textContent='Путь выбран вручную';document.body.dataset.discoveryDone='true';refreshControls();}

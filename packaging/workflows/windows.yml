@@ -53,12 +53,21 @@ jobs:
         working-directory: Windows
         env:
           GATE_UI_TEST_OUT: ${{ runner.temp }}/guard-ui
-      - name: Native compile, portable and optional installer
+      - name: Prepare external update signing key
         shell: pwsh
+        env:
+          UPDATE_KEY_PEM: ${{ secrets.GUARD_WINDOWS_UPDATE_PRIVATE_KEY_PEM }}
         run: |
-          $compiler='C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          $ErrorActionPreference='Stop'
+          if([string]::IsNullOrWhiteSpace($env:UPDATE_KEY_PEM)){throw 'Update signing secret is required'}
+          $path=Join-Path $env:RUNNER_TEMP 'guard-windows-update-ed25519.pem'
+          [IO.File]::WriteAllText($path,$env:UPDATE_KEY_PEM,[Text.UTF8Encoding]::new($false))
+      - name: Native compile, portable, NSIS and signed update metadata
+        shell: pwsh
+        env:
+          GUARD_WINDOWS_UPDATE_PRIVATE_KEY: ${{ runner.temp }}/guard-windows-update-ed25519.pem
+        run: |
           $args=@{CodeToolsDir=(Join-Path $env:RUNNER_TEMP 'guard-code-tools');ArtifactDir=(Join-Path $env:RUNNER_TEMP 'guard-release')}
-          if(Test-Path -LiteralPath $compiler){$args.InnoCompiler=$compiler}
           & ./packaging/windows/package.ps1 @args
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -67,6 +76,9 @@ jobs:
           path: |
             ${{ runner.temp }}/guard-release/ClaudeProxyGuard-Windows-*.zip
             ${{ runner.temp }}/guard-release/ClaudeProxyGuard-Windows-*-Setup.exe
+            ${{ runner.temp }}/guard-release/ClaudeProxyGuard-Windows-*-Setup.exe.blockmap
+            ${{ runner.temp }}/guard-release/latest.yml
+            ${{ runner.temp }}/guard-release/latest.yml.sig
             ${{ runner.temp }}/guard-release/*.sha256
             ${{ runner.temp }}/guard-release/windows-build-status.json
             ${{ runner.temp }}/guard-ui/ui-validation.json

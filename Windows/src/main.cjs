@@ -12,12 +12,13 @@ const { takeDeepLinkFromArgv, LINK_REFUSED } = require('./deep-link.cjs');
 const { ensureGuardProtocolRegistration, SETTINGS_URL } = require('./protocol-registration.cjs');
 const { ServiceIntegration } = require('./service-integration.cjs');
 const { resetIPWithConfirmation } = require('./ip-reset.cjs');
+const { WindowsUpdater } = require('./updater.cjs');
 
 app.setName('Claude Proxy Guard');
 app.setAppUserModelId?.('local.proxyguard.gate-claude');
 if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
-  let window, controller, protocolState, earlyLinkRefused = false, resettingIP = false;
+  let window, controller, updater, protocolState, earlyLinkRefused = false, resettingIP = false;
   const receiveDeepLink = argv => {
     const link = takeDeepLinkFromArgv(argv);
     if (!link.hadLink) return;
@@ -52,6 +53,13 @@ else {
         return window.getNativeWindowHandle();
       }
     });
+    if (!process.argv.includes('--smoke-test')) {
+      const autoUpdater = require('electron-updater').autoUpdater;
+      autoUpdater.setFeedURL({ provider: 'github', owner: 'JFT-git', repo: 'gate-claude', channel: 'latest' });
+      updater = new WindowsUpdater({ autoUpdater, currentVersion: app.getVersion(), platform: process.platform, isPackaged: app.isPackaged,
+        configurationPresent: fs.existsSync(path.join(resources, 'app-update.yml')), portable: Boolean(process.env.PORTABLE_EXECUTABLE_FILE), quiesce: () => controller.quiesce() });
+      updater.on('state', value => send('update', value));
+    }
     const checkProtocol = async () => {
       protocolState = await ensureGuardProtocolRegistration(app, { smokeTest: process.argv.includes('--smoke-test') });
       send('protocol', protocolState); return protocolState;
@@ -69,8 +77,10 @@ else {
     });
     handle('init', async () => {
       const value = settings();
-      return { version: app.getVersion(), settings: value, protocol: protocolState, state: controller.snapshot(), logs: controller.events, records: [...traffic.values()] };
+      return { version: app.getVersion(), settings: value, protocol: protocolState, state: controller.snapshot(), update: updater?.snapshot(), logs: controller.events, records: [...traffic.values()] };
     });
+    handle('updateCheck', () => updater?.check());
+    handle('updateInstall', confirmed => updater?.install(confirmed));
     let finding;
     const findClaude = () => {
       if (!finding) finding = discoverClaude().finally(() => { finding = null; });
@@ -147,6 +157,7 @@ else {
     window.webContents.session.setPermissionCheckHandler(() => false);
     window.webContents.on('render-process-gone', () => { controller.block('Окно Guard аварийно завершилось.'); app.quit(); });
     await window.loadFile(path.join(__dirname, 'ui', 'index.html'));
+    if (!process.argv.includes('--smoke-test')) updater.start();
     if (process.argv.includes('--smoke-test')) {
       const proof = await window.webContents.executeJavaScript(`new Promise(resolve => {
         const started = Date.now();
@@ -187,7 +198,7 @@ else {
     dialog.showErrorBox('Claude Proxy Guard', safeError(error)); app.exit(1);
   });
   app.on('second-instance', (_event, argv) => { receiveDeepLink(argv); if (window) { if (window.isMinimized()) window.restore(); window.show(); window.focus(); } });
-  app.on('before-quit', () => controller?.stop());
+  app.on('before-quit', () => { updater?.dispose(); controller?.stop(); });
   app.on('window-all-closed', () => app.quit());
   const powerBlock = () => { if (controller && !['idle', 'blocked'].includes(controller.state)) controller.revalidate('Сон или пробуждение компьютера. Проверяем прежний IP.'); };
   app.whenReady().then(() => { powerMonitor.on('suspend', powerBlock); powerMonitor.on('resume', powerBlock); });

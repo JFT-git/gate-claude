@@ -113,12 +113,16 @@ command = async message => {
     sandbox = scratch / "claude.sb"
     sandbox.write_text("\n".join(policy) + "\n")
     swift_sources = sorted(str(p) for p in (project / "Source").glob("*.swift"))
+    sparkle = project / ".build/Sparkle-2.10.1"
+    if not (sparkle / "Sparkle.framework").exists():
+        subprocess.run(["bash", "build.sh"], cwd=project, check=True)
     helper, executable = scratch / "GuardHost", scratch / "InstalledE2E"
     subprocess.run(["xcrun", "clang", "-O2", "-DGUARD_HOST_TEST", str(project / "Source/GuardHost.c"), "-o", str(helper)], check=True)
     native_arch = subprocess.check_output(["/usr/bin/uname", "-m"], text=True).strip()
     subprocess.run(["xcrun", "swiftc", "-swift-version", "5", "-target", native_arch + "-apple-macosx13.0",
                     "-module-cache-path", str(scratch / "ModuleCache"), "-D", "PREVIEW", "-D", "GUARD_E2E", "-parse-as-library",
-                    "-framework", "SwiftUI", "-framework", "AppKit", "-framework", "Network", *swift_sources,
+                    "-F", str(sparkle), "-framework", "SwiftUI", "-framework", "AppKit", "-framework", "Network", "-framework", "Sparkle",
+                    "-Xlinker", "-rpath", "-Xlinker", str(sparkle), *swift_sources,
                     str(project / "Tests/InstalledE2E.swift"), "-o", str(executable)], check=True)
     stream_closed = threading.Event()
     requests, destinations = [], []
