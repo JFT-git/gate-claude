@@ -13,6 +13,8 @@ test('NSIS remains per-user x64 with preserved data, blockmaps and the existing 
   const config = require('../../packaging/windows/electron-builder.cjs');
   const inno = fs.readFileSync(path.join(root, 'packaging/windows/Guard.iss'), 'utf8');
   assert.equal(config.appId, 'local.proxyguard.gate-claude'); assert.match(inno, /AppId=local\.proxyguard\.gate-claude/);
+  assert.equal(config.extraMetadata.name, 'Claude Proxy Guard');
+  assert.match(inno, /DefaultDirName=\{localappdata\}\\Programs\\Claude Proxy Guard/);
   assert.equal(config.nsis.oneClick, true); assert.equal(config.nsis.perMachine, false); assert.equal(config.nsis.allowElevation, false);
   assert.equal(config.nsis.deleteAppDataOnUninstall, false); assert.equal(config.nsis.differentialPackage, true);
   assert.deepEqual(config.win.target, [{ target: 'nsis', arch: ['x64'] }]);

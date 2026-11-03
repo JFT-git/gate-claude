@@ -11,10 +11,10 @@ const { parseArchive } = require('./asar.cjs');
 const { findManagedCliSDK, SDK_SHA256 } = require('./managed-cli-patch.cjs');
 const { createPreparationProgress } = require('./preparation-progress.cjs');
 const MAX_CLI_BYTES = 512 * 1024 * 1024;
-const SOURCE_POLICY = Object.freeze({ desktopVersion: '3.1623.0', codeVersion: '2.1.304', platform: 'win32-x64',
+const SOURCE_POLICY = Object.freeze({ desktopVersion: '1.44121.2', codeVersion: '2.1.304', platform: 'win32-x64',
   compressedSize: 104965652, compressedSHA256: 'aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81',
   executableSize: 293227168, executableSHA256: '019e5174d5d954585edb1a946fe280e44a973050b4897034adf0e16306f85fdd',
-  sdkSHA256: SDK_SHA256, mainFile: '.vite/build/index.chunk-7dsQFims.js', mainSHA256: '403a7d93388a723d2c0688cea83861ecfbe7e08caa63c6701bcd49684100c348' });
+  sdkSHA256: SDK_SHA256, mainFile: '.vite/build/index.chunk-BHbE7U4N.js', mainSHA256: 'dfe50aee8e72e608a3cc7b73b8f4e528bc486d403470d49e2dc353d9163a83be' });
 const fail = () => Error('Не удалось безопасно подготовить Claude Code. Исходная версия или файлы не подтверждены.');
 function validatePE(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length < 256 || bytes.length > MAX_CLI_BYTES || bytes.readUInt16LE(0) !== 0x5a4d) throw fail();

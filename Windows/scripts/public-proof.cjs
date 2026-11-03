@@ -16,7 +16,7 @@ for (const [key, value] of Object.entries(expected)) { assert.equal(sent[key], v
 const publicProof = {
   result: 'PASS', platform: source.platform === 'win32' ? 'Windows x64' : 'macOS',
   test: 'official local Claude, isolated profile, synthetic local TLS fixture',
-  sourceVersion: source.sourceVersion || '3.1623.0',
+  sourceVersion: source.sourceVersion || '1.44121.2',
   rendererProfile: expected,
   capturedHTTP: { method: capture.method, url: capture.url, status: capture.status,
     acceptLanguage: /accept-language:\s*en-US\b/i.test(capture.requestHeaders) ? 'en-US' : 'unconfirmed',

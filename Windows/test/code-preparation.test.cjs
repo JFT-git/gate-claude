@@ -25,7 +25,7 @@ async function fixture(t) {
 }
 
 test('production source policy pins signed Desktop, original SDK/main, compressed size and complete checksum', () => {
-  assert.ok(Object.isFrozen(SOURCE_POLICY)); assert.equal(SOURCE_POLICY.desktopVersion, '3.1623.0'); assert.equal(SOURCE_POLICY.codeVersion, '2.1.304'); assert.equal(SOURCE_POLICY.compressedSize, 104965652); assert.equal(SOURCE_POLICY.compressedSHA256, 'aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81'); assert.equal(SOURCE_POLICY.sdkSHA256, require('../src/managed-cli-patch.cjs').SDK_SHA256); assert.equal(SOURCE_POLICY.mainSHA256, '403a7d93388a723d2c0688cea83861ecfbe7e08caa63c6701bcd49684100c348');
+  assert.ok(Object.isFrozen(SOURCE_POLICY)); assert.equal(SOURCE_POLICY.desktopVersion, '1.44121.2'); assert.equal(SOURCE_POLICY.codeVersion, '2.1.304'); assert.equal(SOURCE_POLICY.compressedSize, 104965652); assert.equal(SOURCE_POLICY.compressedSHA256, 'aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81'); assert.equal(SOURCE_POLICY.sdkSHA256, require('../src/managed-cli-patch.cjs').SDK_SHA256); assert.equal(SOURCE_POLICY.mainSHA256, 'dfe50aee8e72e608a3cc7b73b8f4e528bc486d403470d49e2dc353d9163a83be');
 });
 test('prepares one hash-addressed native CLI, persistent workspace and exact vendor request mapping', async t => {
   const f = await fixture(t), code = await f.prepare(), executableSHA = sha(pe());

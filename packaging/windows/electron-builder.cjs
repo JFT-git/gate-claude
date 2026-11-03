@@ -4,6 +4,7 @@ const path = require('node:path');
 module.exports = {
   appId: 'local.proxyguard.gate-claude',
   productName: 'Claude Proxy Guard',
+  extraMetadata: { name: 'Claude Proxy Guard' },
   directories: { output: process.env.GUARD_WINDOWS_ARTIFACT_DIR },
   publish: { provider: 'github', owner: 'JFT-git', repo: 'gate-claude', channel: 'latest' },
   win: { target: [{ target: 'nsis', arch: ['x64'] }] },

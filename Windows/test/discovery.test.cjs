@@ -4,8 +4,8 @@ const assert = require('node:assert/strict');
 const { packageCandidates, selectCandidate } = require('../src/discovery.cjs');
 
 test('WindowsApps comes from package manifest without enumerating the protected root', async () => {
-  const root = 'C:\\Program Files\\WindowsApps\\Claude_3.1623.0.0_x64__fixture';
-  const candidates = packageCandidates([{ location: root, version: '3.1623.0.0', executables: ['app\\Claude.exe', 'app\\resources\\claude-ssh-askpass.exe'] }]);
+  const root = 'C:\\Program Files\\WindowsApps\\Claude_1.44121.2.0_x64__fixture';
+  const candidates = packageCandidates([{ location: root, version: '1.44121.2.0', executables: ['app\\Claude.exe', 'app\\resources\\claude-ssh-askpass.exe'] }]);
   assert.equal(candidates[0].path, root + '\\app\\Claude.exe');
   assert.equal(candidates[0].kind, 'msix');
   assert.equal(candidates.filter(x => /askpass/i.test(x.path)).length, 0);

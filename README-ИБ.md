@@ -8,7 +8,7 @@
 
 Guard — независимое приложение для запуска собственной локальной копии установленного Claude Desktop, проверки выходного IP, управления локальным шлюзом и просмотра доступных веб-запросов. Не связано с Anthropic. Claude Desktop и учётная запись устанавливаются/создаются отдельно; vendor runtime не включён в дистрибутив Guard.
 
-Поддерживаются Windows 10/11 x64 и macOS 13+ universal arm64/x86_64. Linux и отдельная Windows ARM64-сборка не заявлены. Windows-режим Claude Code закреплён на Desktop 3.1623.0 и CLI 2.1.304; native Git HTTPS и PowerShell поддерживаются в предусмотренной изоляции, Git Bash и Git SSH — нет.
+Поддерживаются Windows 10/11 x64 и macOS 13+ universal arm64/x86_64. Linux и отдельная Windows ARM64-сборка не заявлены. Windows-режим Claude Code закреплён на Desktop 1.44121.2 и CLI 2.1.304; native Git HTTPS и PowerShell поддерживаются в предусмотренной изоляции, Git Bash и Git SSH — нет.
 
 Guard изменяет ASAR **собственной копии** Claude и её профиль. Исходная подпись Anthropic не удостоверяет модифицированную копию. Язык и часовой пояс применяются к контекстам Claude; системные язык и часовой пояс ОС не меняются.
 

@@ -133,7 +133,7 @@ async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gate-code-controller-'));
   const c = { events: [], processes: [], assetCalls: 0, fileCalls: 0, fenceCalls: 0, hostSpawns: 0, ipChecks: 0, cleanups: 0 };
   c.assetPath = path.join(root, 'CodeAssets', 'a'.repeat(64), 'win32-x64.zst');
-  c.runtime = { executable: 'C:\\Guard\\Runtime-' + 'a'.repeat(24) + '\\Claude.exe', profile: 'C:\\Guard\\Profile', signature: 'Valid', version: '3.1623.0' };
+  c.runtime = { executable: 'C:\\Guard\\Runtime-' + 'a'.repeat(24) + '\\Claude.exe', profile: 'C:\\Guard\\Profile', signature: 'Valid', version: '1.44121.2' };
   c.code = {
     hostPath: 'C:\\GuardApp\\resources\\CodeHost.exe', stateRoot: 'C:\\Guard\\CodeState', workspaceRoot: 'C:\\Guard\\CodeState\\Workspace', runtimeExecutable: c.runtime.executable,
     containerName: 'gate-code-' + 'a'.repeat(24), containerSid: 'S-1-15-2-1-2-3-4-5-6-7',
