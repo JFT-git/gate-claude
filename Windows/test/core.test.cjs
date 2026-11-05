@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const { once, EventEmitter } = require('node:events');
+const { performance } = require('node:perf_hooks');
 const fs = require('node:fs');
 const path = require('node:path');
 const { IPPolicy, canonicalIP, validateSettings } = require('../src/policy.cjs');
@@ -130,6 +131,18 @@ test('shared renderer locale is allowed only with mandatory actual en-US and tim
   const proof = once(inspector, 'verified'); await inspector.start(); channel.emit('event', 'Target.attachedToTarget', { sessionId: 'page1' }, '');
   assert.equal((await proof)[0].locale, 'en-US'); assert.equal(inspector.running, true);
   channel.emit('event', 'Target.detachedFromTarget', { sessionId: 'page1' }, ''); assert.equal(inspector.running, true);
+});
+test('inspector deadlines preserve their exact remaining active time across freeze', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 0 });
+  t.mock.method(performance, 'now', () => Date.now());
+  const channel = new MockChannel(profile), inspector = new Inspector(channel, profile, true); t.after(() => inspector.stop());
+  channel.command = async method => method === 'Browser.getVersion' ? { userAgent: 'fixture' } : {};
+  await inspector.start(); channel.emit('event', 'Target.attachedToTarget', { sessionId: 'frozen-page' }, '');
+  for (let index = 0; index < 20; index++) await Promise.resolve();
+  t.mock.timers.tick(2000); channel.emit('freeze', true);
+  t.mock.timers.tick(30000); assert.equal(inspector.running, true);
+  channel.emit('freeze', false); t.mock.timers.tick(22999); assert.equal(inspector.running, true);
+  t.mock.timers.tick(1); assert.equal(inspector.running, false);
 });
 for (const invalid of [{ locale: 'fr-FR' }, { locale: '' }, { language: 'ru-RU' }, { timezone: 'Europe/Moscow' }]) {
   test('wrong or unconfirmed profile fails closed: ' + JSON.stringify(invalid), async t => {

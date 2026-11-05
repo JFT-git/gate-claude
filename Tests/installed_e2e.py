@@ -116,6 +116,9 @@ command = async message => {
     sparkle = project / ".build/Sparkle-2.10.1"
     if not (sparkle / "Sparkle.framework").exists():
         subprocess.run(["bash", "build.sh"], cwd=project, check=True)
+    integrity = project / ".build/BarrierIntegrity.swift"
+    if integrity.exists():
+        swift_sources.append(str(integrity))
     helper, executable = scratch / "GuardHost", scratch / "InstalledE2E"
     subprocess.run(["xcrun", "clang", "-O2", "-DGUARD_HOST_TEST", str(project / "Source/GuardHost.c"), "-o", str(helper)], check=True)
     native_arch = subprocess.check_output(["/usr/bin/uname", "-m"], text=True).strip()
@@ -259,7 +262,17 @@ command = async message => {
         proof = json.loads(proof_path.read_text())
         proof["fixture"] = {"serverReceived": capture, "activeTLSStreamClosed": True,
                             "socksForwardedOnly": "claude.ai / challenges.cloudflare.com -> loopback TLS fixture; no real Anthropic or Cloudflare server contacted"}
+        crash_dir = scratch / "crash-while-frozen"
+        crash_dir.mkdir(mode=0o700)
+        crash_proof = crash_dir / "proof.json"
+        crashed = subprocess.run([str(executable), str(crash_dir), str(listener.getsockname()[1]), str(bootstrap),
+                                  str(sandbox), str(helper), str(crash_proof), "--freeze-crash"], timeout=90)
+        assert crashed.returncode == -9, "Guard did not terminate at the installed freeze checkpoint: " + str(crashed.returncode)
+        recovered = subprocess.run([str(executable), "--recover-frozen", str(crash_dir), str(crash_proof)], timeout=15)
+        assert recovered.returncode == 0, "New Guard did not clean the frozen installed runtime"
+        proof["crashWhileFrozen"] = json.loads(crash_proof.read_text())
         proof_path.write_text(json.dumps(proof, ensure_ascii=False, indent=2) + "\n")
+        print("PASS crash-while-frozen: new Guard removed the real Claude process group and crash record", flush=True)
         print("PASS fixture: Accept-Language=en-US; open TLS stream closed; no public connections forwarded", flush=True)
         print("Proof: " + str(proof_path), flush=True)
     finally:

@@ -148,8 +148,16 @@ final class ClaudeInspector: @unchecked Sendable {
     private var sessions: [String: UUID] = [:]
     private var contexts: [String: Set<Int>] = [:]
     private var verificationDeadlines: [String: DispatchWorkItem] = [:]
+    private var verificationRemaining: [String: TimeInterval] = [:]
+    private var verificationStarted: [String: TimeInterval] = [:]
     private var verifiedSessions = Set<String>()
     private var sessionDeadline: DispatchWorkItem?
+    private var sessionDeadlineRemaining: TimeInterval?
+    private var sessionDeadlineStarted: TimeInterval = 0
+    private var commandDeadlines: [Int: DispatchWorkItem] = [:]
+    private var commandRemaining: [Int: TimeInterval] = [:]
+    private var commandStarted: [Int: TimeInterval] = [:]
+    private var processFrozen = false
     var onRecord: ((TrafficRecord) -> Void)?
     var onStatus: ((String) -> Void)?
     var onNotice: ((String) -> Void)?
@@ -158,6 +166,37 @@ final class ClaudeInspector: @unchecked Sendable {
 
     init(input: FileHandle, output: FileHandle, profile: LaunchProfile, captureBodies: Bool) {
         self.input = input; self.output = output; self.profile = profile; self.captureBodies = captureBodies
+    }
+
+    func setFrozen(_ frozen: Bool) {
+        queue.sync { changeFrozen(frozen) }
+    }
+
+    private func changeFrozen(_ frozen: Bool) {
+        guard running, processFrozen != frozen else { return }
+        processFrozen = frozen
+        let now = ProcessInfo.processInfo.systemUptime
+        if frozen {
+            if let remaining = sessionDeadlineRemaining, sessionDeadline != nil {
+                sessionDeadlineRemaining = max(0, remaining - (now - sessionDeadlineStarted))
+                sessionDeadline?.cancel(); sessionDeadline = nil
+            }
+            for (session, remaining) in Array(verificationRemaining) where verificationDeadlines[session] != nil {
+                verificationRemaining[session] = max(0, remaining - (now - (verificationStarted[session] ?? now)))
+                verificationDeadlines.removeValue(forKey: session)?.cancel()
+            }
+            for (id, remaining) in Array(commandRemaining) where commandDeadlines[id] != nil {
+                commandRemaining[id] = max(0, remaining - (now - (commandStarted[id] ?? now)))
+                commandDeadlines.removeValue(forKey: id)?.cancel()
+            }
+        } else {
+            if let remaining = sessionDeadlineRemaining { armSessionDeadline(delay: remaining) }
+            for (session, remaining) in Array(verificationRemaining) {
+                guard let generation = sessions[session] else { continue }
+                armVerificationDeadline(session, generation: generation, delay: remaining)
+            }
+            for (id, remaining) in Array(commandRemaining) where pending[id] != nil { scheduleCommandTimeout(id: id, delay: remaining) }
+        }
     }
 
     func start() {
@@ -185,15 +224,22 @@ final class ClaudeInspector: @unchecked Sendable {
                     guard let self else { return }
                     guard case .success = result else { self.fatal("Не удалось подключить диагностику страниц Claude."); return }
                     self.emitStatus("Диагностика подключена; ожидаем страницу Claude")
-                    let deadline = DispatchWorkItem { [weak self] in
-                        guard let self, self.verifiedSessions.isEmpty else { return }
-                        self.fatal("За 25 секунд не удалось проверить язык и таймзону веб-страницы Claude.")
-                    }
-                    self.sessionDeadline = deadline
-                    self.queue.asyncAfter(deadline: .now() + 25, execute: deadline)
+                    self.armSessionDeadline(delay: 25)
                 }
             }
         }
+    }
+
+    private func armSessionDeadline(delay: TimeInterval) {
+        sessionDeadline?.cancel()
+        sessionDeadlineRemaining = delay; sessionDeadlineStarted = ProcessInfo.processInfo.systemUptime
+        guard !processFrozen else { sessionDeadline = nil; return }
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self, self.verifiedSessions.isEmpty else { return }
+            self.fatal("За 25 секунд не удалось проверить язык и таймзону веб-страницы Claude.")
+        }
+        sessionDeadline = deadline
+        queue.asyncAfter(deadline: .now() + delay, execute: deadline)
     }
 
     private var attachParameters: [String: Any] {
@@ -203,10 +249,10 @@ final class ClaudeInspector: @unchecked Sendable {
 
     func stop() {
         queue.sync {
-            running = false; sessionDeadline?.cancel()
+            running = false; sessionDeadline?.cancel(); sessionDeadline = nil; sessionDeadlineRemaining = nil
             closeReader()
             for deadline in verificationDeadlines.values { deadline.cancel() }
-            verificationDeadlines.removeAll()
+            verificationDeadlines.removeAll(); verificationRemaining.removeAll(); verificationStarted.removeAll()
             failPending("Диагностика остановлена.")
             records.removeAll(); order.removeAll(); earlyRequestHeaders.removeAll()
             try? input.close()
@@ -239,6 +285,8 @@ final class ClaudeInspector: @unchecked Sendable {
             let packet = Data(buffer[..<delimiter]); buffer.removeSubrange(...delimiter)
             guard let message = try? JSONSerialization.jsonObject(with: packet) as? [String: Any] else { continue }
             if let id = message["id"] as? Int, let callback = pending.removeValue(forKey: id) {
+                commandDeadlines.removeValue(forKey: id)?.cancel()
+                commandRemaining.removeValue(forKey: id); commandStarted.removeValue(forKey: id)
                 if let error = message["error"] as? [String: Any] {
                     callback(.failure(GuardError.message(error["message"] as? String ?? "CDP method unavailable")))
                 }
@@ -259,13 +307,24 @@ final class ClaudeInspector: @unchecked Sendable {
             var data = try JSONSerialization.data(withJSONObject: object)
             data.append(0); pending[id] = completion
             try input.write(contentsOf: data)
-            queue.asyncAfter(deadline: .now() + 6) { [weak self] in
-                self?.pending.removeValue(forKey: id)?(.failure(GuardError.message("CDP timeout")))
-            }
+            scheduleCommandTimeout(id: id, delay: 6)
         } catch {
             pending.removeValue(forKey: id)
             completion(.failure(error)); fatal("Не удалось передать команду диагностики Claude.")
         }
+    }
+
+    private func scheduleCommandTimeout(id: Int, delay: TimeInterval) {
+        commandDeadlines.removeValue(forKey: id)?.cancel()
+        commandRemaining[id] = delay; commandStarted[id] = ProcessInfo.processInfo.systemUptime
+        guard !processFrozen else { return }
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self, self.pending[id] != nil else { return }
+            self.commandDeadlines.removeValue(forKey: id); self.commandRemaining.removeValue(forKey: id); self.commandStarted.removeValue(forKey: id)
+            self.pending.removeValue(forKey: id)?(.failure(GuardError.message("CDP timeout")))
+        }
+        commandDeadlines[id] = deadline
+        queue.asyncAfter(deadline: .now() + delay, execute: deadline)
     }
 
     private func configure(session: String) {
@@ -323,17 +382,25 @@ final class ClaudeInspector: @unchecked Sendable {
     private func retire(_ session: String) {
         sessions.removeValue(forKey: session); contexts.removeValue(forKey: session); verifiedSessions.remove(session)
         verificationDeadlines.removeValue(forKey: session)?.cancel()
+        verificationRemaining.removeValue(forKey: session); verificationStarted.removeValue(forKey: session)
     }
     private func verifyBeforeDeadline(_ session: String, generation: UUID) {
+        armVerificationDeadline(session, generation: generation, delay: 25)
+    }
+    private func armVerificationDeadline(_ session: String, generation: UUID, delay: TimeInterval) {
         verificationDeadlines.removeValue(forKey: session)?.cancel()
+        verificationRemaining[session] = delay; verificationStarted[session] = ProcessInfo.processInfo.systemUptime
+        guard !processFrozen else { return }
         let deadline = DispatchWorkItem { [weak self] in
             guard let self, self.running, self.sessions[session] == generation, !self.verifiedSessions.contains(session) else { return }
             self.fatal("За 25 секунд не удалось подтвердить профиль активной страницы Claude.")
         }
         verificationDeadlines[session] = deadline
-        queue.asyncAfter(deadline: .now() + 25, execute: deadline)
+        queue.asyncAfter(deadline: .now() + delay, execute: deadline)
     }
     private func failPending(_ message: String) {
+        for deadline in commandDeadlines.values { deadline.cancel() }
+        commandDeadlines.removeAll(); commandRemaining.removeAll(); commandStarted.removeAll()
         let callbacks = Array(pending.values); pending.removeAll()
         for callback in callbacks { callback(.failure(GuardError.message(message))) }
     }
@@ -381,7 +448,9 @@ final class ClaudeInspector: @unchecked Sendable {
                     self.fatal("Профиль страницы не применён: \(tz), язык \(lang), локаль \(locale). Claude остановлен."); return
                 }
                 self.verifiedSessions.insert(session); self.sessionDeadline?.cancel()
+                self.sessionDeadline = nil; self.sessionDeadlineRemaining = nil
                 self.verificationDeadlines.removeValue(forKey: session)?.cancel()
+                self.verificationRemaining.removeValue(forKey: session); self.verificationStarted.removeValue(forKey: session)
                 self.emitStatus("Проверено в странице: \(tz) · \(lang)")
                 let verified = VerifiedProfile(sessionID: session, timezone: tz, language: lang,
                                                url: TrafficSanitizer.safeURL(value["url"] as? String ?? ""),
@@ -499,10 +568,10 @@ final class ClaudeInspector: @unchecked Sendable {
     private func emitNotice(_ text: String) { let callback = onNotice; DispatchQueue.main.async { callback?(text) } }
     private func fatal(_ text: String) {
         guard running else { return }
-        running = false; sessionDeadline?.cancel()
+        running = false; sessionDeadline?.cancel(); sessionDeadline = nil; sessionDeadlineRemaining = nil
         closeReader()
         for deadline in verificationDeadlines.values { deadline.cancel() }
-        verificationDeadlines.removeAll(); failPending(text)
+        verificationDeadlines.removeAll(); verificationRemaining.removeAll(); verificationStarted.removeAll(); failPending(text)
         let callback = onFatal
         DispatchQueue.main.async { callback?(text) }
     }

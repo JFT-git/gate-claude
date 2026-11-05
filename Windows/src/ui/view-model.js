@@ -17,6 +17,18 @@
       primary: has('stop') || has('restart') ? null : phase === 'blocked' ? 'restart' : active.includes(phase) || has('start') ? 'stop' : 'start'
     };
   }
+  function process(value) {
+    if (!value?.processFrozen) {
+      const labels = { idle: 'Не запущены', checking: 'Ожидают запуска', starting: 'Запускаются', running: 'Работают', rechecking: 'Работают', blocked: 'Остановлены' };
+      return { key: 'running', label: labels[value?.state] || labels.idle, secondsRemaining: 0, countdown: false,
+        hint: 'Состояние процессов подтверждается через Windows Job Object.' };
+    }
+    const labels = { freezing: 'Приостанавливаются', frozen: 'Приостановлены', thawing: 'Возобновляются', thawed: 'Возобновляются', closing: 'Завершаются' };
+    const key = Object.hasOwn(labels, value.processState) ? value.processState : 'freezing';
+    const secondsRemaining = Number.isSafeInteger(value.secondsRemaining) ? Math.max(0, Math.min(20, value.secondsRemaining)) : 0;
+    return { key, label: labels[key], secondsRemaining, countdown: true,
+      hint: key === 'closing' ? 'Guard возобновил процессы для корректного закрытия. Открытые потоки не восстанавливаются.' : 'Трафик и процессы остановлены до полной проверки прежнего IP. Дедлайн не продлевается.' };
+  }
   function service(value) {
     const labels = {
       not_installed: ['Не установлена', 'Для установки требуется системное подтверждение Windows.'],
@@ -31,5 +43,5 @@
     return { key: value.state, label: labels[value.state][0], message: labels[value.state][1],
       actions: Array.isArray(value.actions) ? value.actions.filter(x => ['install', 'start', 'stop', 'update', 'uninstall'].includes(x)) : [], busy: value.state === 'installing' };
   }
-  return Object.freeze({ controls, service });
+  return Object.freeze({ controls, process, service });
 });

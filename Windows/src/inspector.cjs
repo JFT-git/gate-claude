@@ -10,24 +10,57 @@ class Inspector extends EventEmitter {
   constructor(channel, profile, captureBodies) {
     super(); this.channel = channel; this.profile = profile; this.captureBodies = captureBodies;
     this.sessions = new Map(); this.records = new Map(); this.earlyHeaders = new Map(); this.running = true;
+    this.deadlineRemaining = null;
     channel.on('event', (method, params, sid) => this.event(method, params, sid));
     channel.on('fatal', reason => this.fatal(reason));
+    channel.on('freeze', frozen => this.setFrozen(frozen));
   }
   async start() {
     const version = await this.channel.command('Browser.getVersion'); this.userAgent = version.userAgent;
     if (!this.userAgent) throw Error('Claude не открыл диагностику.');
-    this.deadline = setTimeout(() => this.fatal('За 25 секунд не подтверждены язык и таймзона Claude.'), 25000);
+    this.armDeadline();
     await this.channel.command('Target.setAutoAttach', attachParameters);
   }
+  setFrozen(frozen) {
+    if (!this.running || this.frozen === frozen) return;
+    this.frozen = frozen;
+    const now = performance.now();
+    if (frozen) {
+      if (this.deadline) {
+        this.deadlineRemaining = Math.max(0, this.deadlineRemaining - (now - this.deadlineStarted));
+        clearTimeout(this.deadline); this.deadline = null;
+      }
+      for (const item of this.sessions.values()) {
+        if (!item.timer) continue;
+        item.remaining = Math.max(0, item.remaining - (now - item.started));
+        clearTimeout(item.timer); item.timer = null;
+      }
+    } else {
+      if (this.deadlineRemaining !== null) this.armDeadline(this.deadlineRemaining);
+      for (const [sid, item] of this.sessions) if (item.remaining !== null && item.remaining !== undefined) this.scheduleArm(sid, item, item.remaining);
+    }
+  }
+  armDeadline(delay = 25000) {
+    clearTimeout(this.deadline);
+    this.deadlineRemaining = delay; this.deadlineStarted = performance.now();
+    this.deadline = this.frozen ? null : setTimeout(() => {
+      if (this.running) this.fatal('За 25 секунд не подтверждены язык и таймзона Claude.');
+    }, delay);
+  }
   fatal(reason) { if (this.running) { this.running = false; this.clearTimers(); this.emit('fatal', reason); } }
-  clearTimers() { clearTimeout(this.deadline); for (const item of this.sessions.values()) clearTimeout(item.timer); }
+  clearTimers() {
+    clearTimeout(this.deadline); this.deadline = null; this.deadlineRemaining = null;
+    for (const item of this.sessions.values()) { clearTimeout(item.timer); item.timer = null; item.remaining = null; }
+  }
   stop() { this.running = false; this.clearTimers(); this.sessions.clear(); }
-  retire(sid) { const item = this.sessions.get(sid); if (item) clearTimeout(item.timer); this.sessions.delete(sid); }
-  arm(sid, item) {
-    clearTimeout(item.timer); item.verified = false;
-    item.timer = setTimeout(() => {
+  retire(sid) { const item = this.sessions.get(sid); if (item) { clearTimeout(item.timer); item.remaining = null; } this.sessions.delete(sid); }
+  arm(sid, item) { item.verified = false; this.scheduleArm(sid, item, 25000); }
+  scheduleArm(sid, item, delay) {
+    clearTimeout(item.timer);
+    item.remaining = delay; item.started = performance.now();
+    item.timer = this.frozen ? null : setTimeout(() => {
       if (this.running && this.sessions.get(sid) === item && !item.verified) this.fatal('Не подтверждён профиль активной страницы Claude.');
-    }, 25000);
+    }, delay);
   }
   async configure(sid) {
     if (this.sessions.has(sid) || !this.running) return;
@@ -68,7 +101,8 @@ class Inspector extends EventEmitter {
       else if (normalize(value.language) !== normalize(this.profile.language)) mismatch = 'renderer.navigator.language';
       else if (normalize(value.locale) !== normalize(this.profile.language)) mismatch = 'renderer.Intl.locale';
       if (mismatch) { this.fatal('Проверка профиля не пройдена: ' + mismatch + '.'); return; }
-      item.verified = true; clearTimeout(item.timer); clearTimeout(this.deadline);
+      item.verified = true; clearTimeout(item.timer); item.timer = null; item.remaining = null;
+      clearTimeout(this.deadline); this.deadline = null; this.deadlineRemaining = null;
       this.emit('verified', { sessionId: sid, timezone: value.timezone, language: value.language, locale: value.locale, url: S.safeURL(value.url) });
     } catch (error) {
       if (!this.running || this.sessions.get(sid) !== item || !item.contexts.has(id) || targetClosed(error) || /context/i.test(error.message)) return;

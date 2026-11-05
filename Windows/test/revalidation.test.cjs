@@ -194,13 +194,12 @@ test('changing or removing the captured system proxy permanently blocks a paused
     await assert.rejects(c.start({ mode: 'network' }), /перезапуска/);
   }
 });
-test('a system-proxy read failure keeps an unchanged session paused until a fresh complete check', async t => {
-  const c = await fixture(t), relay = c.relay, normal = c.networkProxyConfiguration;
+test('a system-proxy read failure closes immediately instead of freezing or retrying', async t => {
+  const c = await fixture(t), relay = c.relay;
   c.networkProxyConfiguration = async () => { throw Error('fixture registry timeout'); };
   await c.poll(c.epoch); clearTimeout(c.pollTimer);
-  assert.equal(c.state, 'rechecking'); assert.equal(relay.paused, true); assert.equal(c.policy.blocked, false);
-  c.networkProxyConfiguration = normal; await c.poll(c.epoch);
-  assert.equal(c.state, 'running'); assert.equal(relay.resumes, 1);
+  assert.equal(c.state, 'blocked'); assert.equal(relay.closed, true); assert.equal(c.policy.blocked, true);
+  assert.equal(c.processFrozen, false); assert.equal(relay.resumes, 0);
 });
 test('a system-proxy change at the end of a successful recheck cannot reopen traffic', async t => {
   const c = await fixture(t), relay = c.relay, normal = c.networkProxy; let reads = 0;
@@ -267,7 +266,7 @@ test('an event during an in-flight check discards that old result and never over
   const refreshing = c.poll(c.epoch); await until(() => checks === 2); second.resolve({ ip: pinned }); await refreshing;
   assert.equal(max, 1); assert.equal(relay.resumes, 1); assert.equal(c.state, 'running');
 });
-test('a valid changed IP kills the session immediately even while the route query is still pending', async t => {
+test('an unhosted changed IP blocks immediately even while the route query is still pending', async t => {
   const c = await fixture(t), relay = c.relay, route = deferred();
   c.routeFingerprint = () => route.promise; provider = async () => ({ ip: '203.0.113.8' });
   const pending = c.poll(c.epoch); await until(() => c.state === 'blocked');

@@ -68,6 +68,18 @@ app.whenReady().then(async()=>{
  await check('pending Windows approval prevents repeat restart',async()=>{assert.equal((await buttons()).restart.disabled,true);assert.equal(await js(`document.getElementById('approvalHint').hidden`),false);});
  await emit({type:'state',data:{...state('running'),profile:{timezone:'Europe/Amsterdam',language:'en-US',locale:'en-US'}}});
  await check('authoritative profile and running controls display',async()=>{assert.match(await js(`document.getElementById('profile').textContent`),/Amsterdam.*en-US/);assert.equal((await buttons()).stop.disabled,false);});
+ await check('freeze, thaw and close states expose process status and fixed countdown',async()=>{
+   for(const processState of ['freezing','frozen','thawing','closing']){
+     await emit({type:'state',data:{...state('rechecking'),country:'Нидерланды',exitIP:'203.0.113.7',processFrozen:true,processState,secondsRemaining:processState==='frozen'?19:20}});
+     assert.equal(await js(`document.getElementById('processStatus').dataset.state`),processState);
+     assert.equal(await js(`document.getElementById('processCountdown').hidden`),false);
+     assert.match(await js(`document.getElementById('processCountdown').textContent`),processState==='frozen'?/19 с/:/20 с/);
+     assert.match(await js(`document.getElementById('country').textContent`),/Нидерланды.*203\.0\.113\.7/);
+     assert.equal((await buttons()).stop.disabled,false);
+   }
+   await emit({type:'state',data:{...state('running'),processFrozen:false,processState:'running',secondsRemaining:0}});
+   assert.equal(await js(`document.getElementById('processCountdown').hidden`),true);
+ });
  await js(`document.getElementById('restart').click()`);
  await check('restart during active session requires inline confirmation before IPC',async()=>{assert.equal(calls.restart||0,0);assert.equal(await js(`document.getElementById('errorBanner').hidden`),true);assert.equal(await js(`document.getElementById('restartConfirm').hidden`),false);assert.equal(await js(`document.activeElement.id`),'restartConfirmYes');});
  await emit({type:'state',data:{...state('running'),profile:{timezone:'Europe/Amsterdam',language:'en-US',locale:'en-US'}}});
@@ -92,6 +104,18 @@ app.whenReady().then(async()=>{
  await check('200 percent zoom stacks controls without text overflow',async()=>{assert.equal(await js(`document.documentElement.scrollWidth<=window.innerWidth`),true);const b=await buttons();assert.ok(b.restart.rect.y>b.start.rect.y+10,'buttons must stack at 200 percent zoom');assert.ok(Math.abs(b.start.rect.width-b.restart.rect.width)<2,'stacked buttons share width');const leak=await js(`(()=>{const btn=document.getElementById('restart').getBoundingClientRect();const span=document.getElementById('restart').querySelector('span').getBoundingClientRect();return span.left>=btn.left-1&&span.right<=btn.right+1&&span.top>=btn.top-1&&span.bottom<=btn.bottom+1})()`);assert.ok(leak,'label stays inside button bounds');});
  await js(`document.getElementById('sessionActions').scrollIntoView({block:'center'})`);
  fs.writeFileSync(path.join(out,'windows-ui-200-percent.png'),(await win.webContents.capturePage()).toPNG());
+ win.webContents.setZoomFactor(1);
+ await emit({type:'state',data:{...state('rechecking'),processFrozen:true,processState:'frozen',secondsRemaining:7,country:'Нидерланды',exitIP:'203.0.113.7'}});
+ for(const width of [420,320]){
+   win.setSize(width,850);await new Promise(r=>setTimeout(r,80));
+   await check(width+'px frozen layout has no horizontal or countdown overflow',async()=>{
+     assert.equal(await js(`document.documentElement.scrollWidth<=window.innerWidth`),true);
+     const bounds=await js(`(()=>{const r=document.getElementById('processCountdown').getBoundingClientRect();return{left:r.left,right:r.right,width:window.innerWidth}})()`);
+     assert.ok(bounds.left>=0&&bounds.right<=bounds.width+1,JSON.stringify(bounds));
+     assert.match(await js(`document.getElementById('processCountdown').textContent`),/7 с/);
+   });
+ }
+ fs.writeFileSync(path.join(out,'windows-ui-frozen-320.png'),(await win.webContents.capturePage()).toPNG());
  assert.deepEqual(consoleErrors,[]);
  fs.writeFileSync(path.join(out,'ui-validation.json'),JSON.stringify({schema:1,mode:'REAL_RENDERER_TEST_ONLY_IPC',engineTests:'NOT_RUN_BY_THIS_HARNESS',platform:process.platform,electron:process.versions.electron,checks},null,2)+'\n');
  console.log(JSON.stringify({status:'PASS',checks:checks.length,out}));win.destroy();app.exit(0);

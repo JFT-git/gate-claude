@@ -1,7 +1,7 @@
 'use strict';
 const {test}=require('node:test');const assert=require('node:assert/strict');
 const {ServiceIntegration,STATES,validateStatus}=require('../src/service-integration.cjs');
-const {controls,service}=require('../src/ui/view-model.js');
+const {controls,process,service}=require('../src/ui/view-model.js');
 const snapshot=(state,actions=[])=>({schema:1,available:true,state,version:'1.0.0',actions});
 test('production has no service and cannot report installation success',async()=>{
  const api=new ServiceIntegration();assert.equal((await api.status()).available,false);
@@ -35,4 +35,13 @@ test('session controls preserve stop during startup and require restart after bl
  const blocked=controls({state:'blocked'});assert.equal(blocked.start,false);assert.equal(blocked.restart,true);assert.equal(blocked.primary,'restart');
  assert.equal(controls({state:'starting',windowsApprovalPending:true}).restart,false);
  for(const pending of ['start','stop','restart'])assert.equal(controls({state:'idle'},[pending]).restart,false);
+});
+test('process presentation exposes fixed-deadline freeze, thaw and close states',()=>{
+ assert.deepEqual(process({state:'running'}).secondsRemaining,0);
+ for(const processState of ['freezing','frozen','thawing','closing']){
+  const value=process({state:'rechecking',processFrozen:true,processState,secondsRemaining:19});
+  assert.equal(value.key,processState);assert.equal(value.secondsRemaining,19);assert.equal(value.countdown,true);
+ }
+ assert.equal(process({state:'rechecking',processFrozen:true,processState:'invalid',secondsRemaining:500}).secondsRemaining,20);
+ assert.equal(process({state:'blocked',processFrozen:false}).countdown,false);
 });

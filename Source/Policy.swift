@@ -113,7 +113,17 @@ struct SessionPolicy {
         suspended = false
     }
 
-    mutating func verifyDestination(hostname: String, ip: String, countryCode: String) throws {
+    mutating func verifyRecoverable(_ ip: String) throws {
+        guard !requiresRestart else { throw GuardError.message("Перезапустите Guard для новой сессии.") }
+        let canonical = try IPIdentity.canonical(ip)
+        guard let baseline = pinnedIP else { throw GuardError.message("Исходный IP не подтверждён.") }
+        guard canonical == baseline else {
+            throw GuardError.message("Внешний IP временно не совпадает с закреплённым. Повторяем проверку прежнего адреса.")
+        }
+        suspended = false
+    }
+
+    mutating func verifyDestination(hostname: String, ip: String, countryCode: String, recoverableMismatch: Bool = false) throws {
         guard !requiresRestart, pinnedIP != nil, IPChecker.destinationHosts.contains(hostname) else { throw GuardError.message("Исходный маршрут не подтверждён.") }
         let canonical = try IPIdentity.canonical(ip)
         guard countryCode.range(of: "^[A-Z]{2}$", options: .regularExpression) != nil else { throw GuardError.message("Страна маршрута Claude не определена.") }
@@ -122,9 +132,11 @@ struct SessionPolicy {
             latch(reason); throw GuardError.message(reason)
         }
         guard canonical == pinnedIP else {
+            if recoverableMismatch { throw GuardError.message("Маршрут Claude временно вышел через другой IP. Повторяем проверку.") }
             latch(IPMemory.mismatch); throw GuardError.message(IPMemory.mismatch)
         }
         if let baseline = destinationPins[hostname], baseline != canonical {
+            if recoverableMismatch { throw GuardError.message("Маршрут Claude временно изменился. Повторяем проверку прежнего адреса.") }
             let reason = "Внешний IP маршрута Claude изменился: \(baseline) → \(canonical). Перезапустите Guard."
             latch(reason); throw GuardError.message(reason)
         }

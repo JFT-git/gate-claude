@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const { once } = require('node:events');
+const { performance } = require('node:perf_hooks');
 const { Channel } = require('../src/channel.cjs');
 
 const encode = value => Buffer.from(JSON.stringify(value) + '\0');
@@ -136,4 +137,28 @@ test('intentional close rejects pending commands and marks the channel closed', 
   f.channel.close(); await rejected; await turn();
   assert.equal(f.channel.closed, true); assert.equal(f.channel.pending.size, 0);
   await assert.rejects(f.channel.command('Fixture.after-close'), /Канал/);
+});
+
+test('CDP deadlines pause while frozen and a late reply is accepted after thaw', { timeout: 5000 }, async t => {
+  const f = await fixture(t), peer = await f.authenticate();
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 0 });
+  t.mock.method(performance, 'now', () => Date.now());
+  const data = once(peer, 'data'), pending = f.channel.command('Fixture.frozen');
+  const message = JSON.parse((await data)[0].toString().replace(/\0$/, ''));
+  f.channel.setFrozen(true); t.mock.timers.tick(20000);
+  assert.equal(f.channel.pending.has(message.id), true);
+  f.channel.setFrozen(false); peer.write(encode({ id: message.id, result: { survived: true } }));
+  assert.deepEqual(await pending, { survived: true });
+});
+
+test('CDP timeout retains only the active-time budget across a long freeze', { timeout: 5000 }, async t => {
+  const f = await fixture(t); await f.authenticate();
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 0 });
+  t.mock.method(performance, 'now', () => Date.now());
+  const pending = f.channel.command('Fixture.frozen'), rejection = assert.rejects(pending, /CDP timeout/);
+  const id = [...f.channel.pending.keys()][0];
+  t.mock.timers.tick(2000); f.channel.setFrozen(true); t.mock.timers.tick(30000);
+  assert.equal(f.channel.pending.has(id), true);
+  f.channel.setFrozen(false); t.mock.timers.tick(3999); assert.equal(f.channel.pending.has(id), true);
+  t.mock.timers.tick(1); await rejection; assert.equal(f.channel.pending.size, 0);
 });

@@ -23,7 +23,7 @@ function refreshControls() {
   const activity = pending.has('restart') ? 'Перезапускаем Guard. Ожидаем новое окно…' : pending.has('stop') ? 'Передаём команду остановки…' : pending.has('start') && state.state === 'idle' ? 'Запрос запуска отправлен. Проверяем настройки и установленный Claude…' : state.message || 'Ожидаем ответ контроллера…';
   $('activityText').textContent = activity; $('activity').setAttribute('aria-valuetext', activity);
   $('approvalHint').hidden = state.windowsApprovalPending !== true;
-  $('actionReason').textContent = state.windowsApprovalPending ? 'Ответьте на системный запрос Windows. Перезапуск станет доступен после ответа.' : state.state === 'blocked' ? 'Сессия закрыта. Для новой проверки перезапустите Guard; пароль прокси нужно будет ввести заново.' : c.progress ? 'Запуск и повторные проверки можно остановить. Повторный запуск во время выполнения недоступен.' : state.state === 'running' ? 'Claude запущен. Остановка закроет сессию; перезапуск заново откроет Guard.' : 'Запуск проверяет подключение. Перезапуск заново открывает Guard и закрывает его сессию Claude.';
+  $('actionReason').textContent = state.windowsApprovalPending ? 'Ответьте на системный запрос Windows. Перезапуск станет доступен после ответа.' : state.state === 'blocked' ? 'Сессия закрыта. Для новой проверки перезапустите Guard; пароль прокси нужно будет ввести заново.' : state.processFrozen ? 'Можно остановить сессию сейчас. Автоматическое возобновление возможно только после полной проверки; дедлайн не продлевается.' : c.progress ? 'Запуск и повторные проверки можно остановить. Повторный запуск во время выполнения недоступен.' : state.state === 'running' ? 'Claude запущен. Остановка закроет сессию; перезапуск заново откроет Guard.' : 'Запуск проверяет подключение. Перезапуск заново открывает Guard и закрывает его сессию Claude.';
   const socks = $('mode').value === 'socks5';
   $('proxyFields').hidden = !socks; $('networkHint').hidden = socks;
   for (const id of ['host','port','username','password']) $(id).disabled = !c.settings || !socks;
@@ -43,7 +43,13 @@ function showState(value) {
   if (!value || !['idle','checking','starting','running','rechecking','blocked'].includes(value.state)) return;
   if (['idle','blocked'].includes(value.state) && value.state !== state.state) hideRestartConfirm();
   const previous = state; state = value; document.body.dataset.state = value.state;
-  $('state').textContent = ({ idle: 'Готов к запуску', checking: 'Проверка подключения', starting: 'Запуск и проверка Claude', running: 'Claude под защитой Guard', rechecking: 'Трафик приостановлен', blocked: 'Сессия закрыта' })[value.state];
+  const presentation = VM.process(value); document.body.dataset.processState = presentation.key;
+  const title = ({ idle: 'Готов к запуску', checking: 'Проверка подключения', starting: 'Запуск и проверка Claude', running: 'Claude под защитой Guard', rechecking: 'Трафик приостановлен', blocked: 'Сессия закрыта' })[value.state];
+  $('state').textContent = value.processFrozen ? ({ freezing: 'Приостановка Claude', frozen: 'Claude приостановлен', thawing: 'Возобновление Claude', thawed: 'Возобновление Claude', closing: 'Завершение Claude' })[presentation.key] : title;
+  $('processState').textContent = presentation.label; $('processStatus').dataset.state = presentation.key;
+  $('processCountdown').hidden = !presentation.countdown; $('processCountdown').textContent = presentation.countdown ? 'Закрытие через ' + presentation.secondsRemaining + ' с' : '';
+  $('processCountdown').setAttribute('aria-label', presentation.countdown ? 'До закрытия Claude осталось ' + presentation.secondsRemaining + ' секунд' : '');
+  $('processHint').textContent = presentation.hint;
   $('message').textContent = value.message || 'Выберите подключение и запустите проверку.'; $('lamp').className = 'lamp ' + value.state;
   $('country').textContent = value.country ? value.country + ' · ' + (value.exitIP || 'IP закреплён') : 'IP не закреплён';
   $('savedIP').textContent = value.ipMemoryError || (value.savedIP ? 'Разрешён только IP: ' + value.savedIP : 'Адрес ещё не сохранён. Он будет закреплён после успешной проверки подключения.');

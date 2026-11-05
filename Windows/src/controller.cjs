@@ -22,6 +22,9 @@ const { CodeGate } = require('./code-gate.cjs');
 const { randomBytes } = require('node:crypto');
 const { DeepLinkInbox, messages: linkMessages } = require('./deep-link.cjs');
 const DESTINATIONS = Object.freeze(['claude.ai', 'api.anthropic.com']);
+const FREEZE_LIMIT_MS = 20000;
+const FREEZE_RETRY_MS = 1000;
+const FREEZE_CLOSE_MS = 5000;
 
 class GuardController extends EventEmitter {
   constructor(root, resources, options = {}) {
@@ -36,12 +39,20 @@ class GuardController extends EventEmitter {
     });
     this.fenceOwnerWindow = options.ownerWindow;
     this.root = root; this.resources = resources; this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
+    this.processFrozen = false; this.processState = 'running'; this.freezeDeadline = null; this.freezeWanted = false;
+    this.hostCommands = new Map(); this.hostCommandID = 0;
     this.ipMemory = new IPMemory(root); this.savedIP = null; this.ipMemoryError = '';
     try { this.savedIP = this.ipMemory.load(); } catch (error) { this.ipMemoryError = error.message; }
     try { this.events = JSON.parse(fs.readFileSync(path.join(root, 'diagnostics.json'), 'utf8')).slice(-80); } catch {}
   }
   status(message) { this.message = message; this.emit('state', this.snapshot()); }
-  snapshot() { return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null, country: this.country || '', exitIP: this.policy.pinned || '', savedIP: this.savedIP, ipMemoryError: this.ipMemoryError, windowsApprovalPending: NetworkFence.approvalPending }; }
+  snapshot() {
+    const secondsRemaining = this.processFrozen && this.freezeDeadline !== null ? Math.max(0, Math.ceil((this.freezeDeadline - performance.now()) / 1000)) : 0;
+    return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null,
+      country: this.country || '', exitIP: this.policy.pinned || '', savedIP: this.savedIP, ipMemoryError: this.ipMemoryError,
+      processFrozen: this.processFrozen, processState: this.processFrozen ? this.processState : 'running', secondsRemaining,
+      windowsApprovalPending: NetworkFence.approvalPending };
+  }
   canResetIP() { return ['idle', 'blocked'].includes(this.state) && !NetworkFence.approvalPending && !this.fencePending && !this.codePreparationPending; }
   resetIP() {
     if (!this.canResetIP()) throw Error('Сначала остановите сессию Claude и дождитесь завершения запуска.');
@@ -104,6 +115,137 @@ class GuardController extends EventEmitter {
     this.pendingOperations.add(task);
     task.finally(() => { this.pendingOperations.delete(task); }).catch(() => {});
     return task;
+  }
+  liveHost(host = this.host) {
+    return !!host && host.exitCode == null && host.signalCode == null && !host.killed && !!host.stdin && !host.stdin.destroyed;
+  }
+  canFreezeProcess() { return !!this.verified && this.liveHost() && !!this.relay && !this.relay.closed && !this.policy.blocked; }
+  resolveHostCommand(message) {
+    const key = message.freezeAck !== undefined ? 'freezeAck' : message.thawAck !== undefined ? 'thawAck' : null;
+    if (!key) return false;
+    const id = message[key], entry = this.hostCommands.get(id);
+    if (!entry || entry.command !== key.slice(0, -3)) return true;
+    this.hostCommands.delete(id); clearTimeout(entry.timer);
+    if (message.ok !== true || !Number.isSafeInteger(message.count) || message.count < 0 || message.count > 4096) entry.reject(Error('GuardHost rejected the process state change.'));
+    else entry.resolve({ count: message.count });
+    return true;
+  }
+  rejectHostCommands(host = null) {
+    for (const [id, entry] of this.hostCommands) {
+      if (host && entry.host !== host) continue;
+      clearTimeout(entry.timer); this.hostCommands.delete(id); entry.reject(Error('GuardHost command cancelled.'));
+    }
+  }
+  hostCommand(command, host = this.host) {
+    if (!this.liveHost(host)) return Promise.reject(Error('GuardHost is not running.'));
+    const id = ++this.hostCommandID;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.hostCommands.delete(id); reject(Error('GuardHost command timed out.')); }, 1500);
+      this.hostCommands.set(id, { host, command, resolve, reject, timer });
+      host.stdin.write(command + ' ' + id + '\n', error => {
+        if (!error || !this.hostCommands.has(id)) return;
+        clearTimeout(timer); this.hostCommands.delete(id); reject(error);
+      });
+    });
+  }
+  clearProcessFreeze() {
+    clearTimeout(this.freezeTimeout); clearInterval(this.freezeTicker);
+    this.processFrozen = false; this.processState = 'running'; this.freezeDeadline = null; this.freezeWanted = false; this.freezeClosing = null;
+  }
+  requestProcessFreeze() {
+    if (!this.canFreezeProcess() || this.freezeClosing) return false;
+    const epoch = this.epoch, host = this.host; this.freezeWanted = true;
+    this.channel?.setFrozen?.(true);
+    if (!this.processFrozen) {
+      this.processFrozen = true; this.processState = 'freezing'; this.freezeDeadline = performance.now() + FREEZE_LIMIT_MS;
+      this.freezeTimeout = setTimeout(() => this.closeFrozenSession(epoch, host), FREEZE_LIMIT_MS);
+      this.freezeTicker = setInterval(() => { if (this.epoch === epoch && this.processFrozen) this.status(this.message); }, 1000);
+    }
+    if (this.processState === 'thawing') return true;
+    if (this.processState === 'frozen' || this.processState === 'freezing' && this.freezeTask) return true;
+    this.processState = 'freezing';
+    const operation = (async () => {
+      try {
+        await this.hostCommand('freeze', host);
+        if (this.epoch !== epoch || this.host !== host) return false;
+        this.freezeWanted = false; if (!this.freezeClosing) this.processState = 'frozen';
+        this.status(this.message); return true;
+      } catch {
+        if (this.epoch === epoch && this.host === host) this.block('Windows не подтвердила приостановку процессов Claude. Сессия закрыта.');
+        return false;
+      } finally { if (this.freezeTask === operation) this.freezeTask = null; }
+    })();
+    this.freezeTask = operation; this.track(operation); return true;
+  }
+  async thawProcess(epoch) {
+    if (!this.processFrozen) return this.epoch === epoch && !this.freezeClosing;
+    if (this.freezeTask) {
+      const pending = this.freezeTask, completed = await pending;
+      if (this.epoch !== epoch) return false;
+      if (this.processState === 'thawed') return completed && !this.freezeWanted;
+      if (!completed) return false;
+    }
+    if (this.processState === 'thawed') {
+      if (this.freezeWanted && !this.freezeClosing) { this.requestProcessFreeze(); return false; }
+      return true;
+    }
+    if (this.processState !== 'frozen' && !(this.freezeClosing && this.processState === 'closing')) return false;
+    const host = this.host;
+    if (!this.liveHost(host)) return false;
+    this.freezeWanted = false;
+    if (!this.freezeClosing) this.processState = 'thawing';
+    const operation = (async () => {
+      try {
+        await this.hostCommand('thaw', host);
+        if (this.epoch !== epoch || this.host !== host) return false;
+        this.channel?.setFrozen?.(false);
+        if (!this.freezeClosing) this.processState = 'thawed';
+        if (this.freezeWanted && !this.freezeClosing) { this.requestProcessFreeze(); return false; }
+        this.status(this.message); return true;
+      } catch {
+        if (this.epoch === epoch && this.host === host) this.block('Windows не подтвердила возобновление процессов Claude. Сессия закрыта.');
+        return false;
+      } finally { if (this.freezeTask === operation) this.freezeTask = null; }
+    })();
+    this.freezeTask = operation; this.track(operation); return operation;
+  }
+  async resumeValidatedSession(epoch, revision) {
+    const valid = () => this.epoch === epoch && (this.revalidationRevision || 0) === revision && !this.policy.blocked && !!this.relay && !this.freezeClosing;
+    if (!valid() || !await this.thawProcess(epoch) || !valid() || this.freezeWanted) return false;
+    try { this.relay.resume(); }
+    catch { if (valid()) this.block('Не удалось возобновить защищённый шлюз. Сессия закрыта.'); return false; }
+    if (!valid()) { this.relay?.pause(); return false; }
+    this.clearProcessFreeze(); return true;
+  }
+  closeFrozenSession(epoch, host) {
+    if (this.epoch !== epoch || this.host !== host || !this.processFrozen || this.freezeClosing) return;
+    const closing = { epoch, host }, started = performance.now(), thawPending = this.processState === 'thawing' && this.freezeTask;
+    this.freezeClosing = closing;
+    this.freezeWanted = false; this.processState = 'closing'; this.revalidationRevision = (this.revalidationRevision || 0) + 1;
+    clearTimeout(this.pollTimer);
+    this.status('Сеть не подтверждена за 20 секунд. Возобновляем процессы и закрываем Claude…');
+    const operation = (async () => {
+      const active = () => this.epoch === epoch && this.host === host && this.freezeClosing === closing;
+      const thawed = thawPending ? await thawPending : await this.thawProcess(epoch);
+      if (!active()) return;
+      if (thawed && this.channel && !this.channel.closed && this.liveHost(host)) {
+        const exited = this.liveHost(host) ? new Promise(resolve => host.once('exit', resolve)) : Promise.resolve();
+        let timer;
+        try {
+          try { void this.channel.command('Browser.close').catch(() => {}); } catch {}
+          const remaining = Math.max(0, FREEZE_CLOSE_MS - (performance.now() - started));
+          await Promise.race([exited, new Promise(resolve => { timer = setTimeout(resolve, remaining); })]);
+        } finally { clearTimeout(timer); }
+      }
+      if (active()) this.block('Сеть не подтверждена за 20 секунд. Claude закрыт; открытые потоки не восстанавливаются.');
+    })();
+    this.track(operation);
+  }
+  hostedIPMismatch(reason) {
+    if (this.canFreezeProcess() || this.processFrozen && this.liveHost()) {
+      this.pauseForRevalidation(reason + ' Проверяем соединение с приостановленными процессами.');
+    } else this.block(reason + ' Сессия закрыта до перезапуска Guard.');
+    return false;
   }
   start(input) {
     const task = Promise.resolve().then(() => this.startSession(input));
@@ -298,15 +440,24 @@ class GuardController extends EventEmitter {
           ...(codeConfig ? { code: codeConfig } : {}) }) });
       this.host = spawn(path.join(this.resources, 'GuardHost.exe'), [this.runtime.executable, '--user-data-dir=' + this.runtime.profile, '--lang=' + settings.language], { env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
       let output = '';
-      this.host.stdout.on('data', chunk => {
+      const host = this.host;
+      host.stdout.on('data', chunk => {
         output = (output + chunk).slice(-8192); let end;
         while ((end = output.indexOf('\n')) >= 0) {
           const line = output.slice(0, end); output = output.slice(end + 1);
-          try { const message = JSON.parse(line); if (message.pid) this.runtimePID = message.pid; if (message.exitCode != null) this.exitCode = message.exitCode; } catch {}
+          try {
+            const message = JSON.parse(line);
+            if (this.resolveHostCommand(message)) continue;
+            if (this.host === host && message.pid) this.runtimePID = message.pid;
+            if (this.host === host && message.exitCode != null) this.exitCode = message.exitCode;
+          } catch {}
         }
       });
-      this.host.once('error', () => { if (active()) this.block('Не удалось запустить Windows Job Object helper.'); });
-      this.host.once('exit', code => { if (active()) this.block('Claude завершился. Код: ' + (this.exitCode ?? code ?? 'неизвестен') + '.'); });
+      host.once('error', () => { this.rejectHostCommands(host); if (active()) this.block('Не удалось запустить Windows Job Object helper.'); });
+      host.once('exit', code => {
+        this.rejectHostCommands(host);
+        if (active() && this.freezeClosing?.host !== host) this.block('Claude завершился. Код: ' + (this.exitCode ?? code ?? 'неизвестен') + '.');
+      });
       this.host.stdin.on('error', () => {});
       const heartbeat = () => { if (this.host && !this.host.stdin.destroyed) this.host.stdin.write('ping\n'); };
       heartbeat(); this.heartbeatTimer = setInterval(heartbeat, 1000);
@@ -371,7 +522,8 @@ class GuardController extends EventEmitter {
       }
       if (!this.publishLocalAddresses(localPin)) continue;
       this.route = afterRoute; this.fingerprint = afterInterfaces;
-      this.relay.resume(); if (this.state === 'rechecking') this.state = 'checking';
+      if (!await this.resumeValidatedSession(epoch, revision)) return false;
+      if (this.state === 'rechecking') this.state = 'checking';
       this.schedulePoll(epoch, this.settings.interval * 1000);
       return true;
     }
@@ -499,7 +651,7 @@ class GuardController extends EventEmitter {
     let current; const started = performance.now();
     try { current = await this.networkProxyConfiguration(); }
     catch (error) {
-      if (active()) { this.reportProbeFailure('proxy', error, performance.now() - started); this.pauseForRevalidation('Не удалось подтвердить настройки прокси Windows. Повторяем проверку.', false); }
+      if (active()) { this.reportProbeFailure('proxy', error, performance.now() - started); this.block('Не удалось подтвердить настройки прокси Windows. Сессия закрыта.'); }
       return false;
     }
     if (!active()) return false;
@@ -539,15 +691,12 @@ class GuardController extends EventEmitter {
           if (String(result.country_code || '').toUpperCase() === 'RU') this.block('Маршрут Claude вышел через RU. Сессия закрыта до перезапуска Guard.');
           throw Error('Invalid destination country');
         }
-        if (ip !== this.policy.pinned) { this.block('Внешний IP маршрута Claude изменился. ' + MISMATCH); return false; }
+        if (ip !== this.policy.pinned) return this.hostedIPMismatch('Внешний IP маршрута Claude изменился. ' + MISMATCH);
         if (pin) this.destinationPolicies.set(hostname, policy);
         else {
           const pinned = this.destinationPolicies.get(hostname);
           if (!pinned) throw Error('Destination is not pinned');
-          if (pinned.pinned !== ip) {
-            this.block('Внешний IP маршрута Claude изменился. Сессия закрыта до перезапуска Guard.');
-            return false;
-          }
+          if (pinned.pinned !== ip) return this.hostedIPMismatch('Внешний IP маршрута Claude изменился.');
           pinned.check(ip);
         }
         return true;
@@ -568,7 +717,7 @@ class GuardController extends EventEmitter {
       const ip = canonicalIP(result?.ip);
       if (net.isIP(ip) !== net.isIP(this.policy.pinned)) throw Error('Unexpected IP family');
       if (ip !== this.policy.pinned) {
-        this.block('Внешний IP изменился. Сессия закрыта до перезапуска Guard.');
+        this.hostedIPMismatch('Внешний IP изменился. ' + MISMATCH);
         return null;
       }
       this.policy.check(ip); return ip;
@@ -611,17 +760,18 @@ class GuardController extends EventEmitter {
   }
   schedulePoll(epoch, delay) {
     clearTimeout(this.pollTimer);
-    if (this.epoch !== epoch || this.policy.blocked || !this.relay) return;
+    if (this.epoch !== epoch || this.policy.blocked || !this.relay || this.freezeClosing) return;
     this.pollTimer = setTimeout(() => this.poll(epoch), Math.max(0, delay));
   }
   pauseForRevalidation(reason, invalidate = true) {
-    if (!this.relay || !this.policy.pinned || this.policy.blocked || ['idle', 'blocked'].includes(this.state)) return false;
+    if (!this.relay || !this.policy.pinned || this.policy.blocked || this.freezeClosing || ['idle', 'blocked'].includes(this.state)) return false;
     if (invalidate) this.revalidationRevision = (this.revalidationRevision || 0) + 1;
     this.relay.pause();
     setPinnedLocalAddresses(null);
     if (this.state !== 'rechecking') this.log(reason, 'warning');
     this.state = 'rechecking';
-    this.status(reason + ' Трафик приостановлен до подтверждения прежнего IP.');
+    const frozen = this.requestProcessFreeze();
+    this.status(reason + (frozen ? ' Процессы Claude приостанавливаются на время проверки.' : ' Трафик приостановлен до подтверждения прежнего IP.'));
     return true;
   }
   revalidate(reason = 'Повторная проверка закреплённого IP.') {
@@ -630,7 +780,7 @@ class GuardController extends EventEmitter {
     return this.poll(this.epoch);
   }
   poll(epoch) {
-    if (this.epoch !== epoch || this.policy.blocked || !this.relay) return Promise.resolve();
+    if (this.epoch !== epoch || this.policy.blocked || !this.relay || this.freezeClosing) return Promise.resolve();
     if (this.checkTask) {
       const task = this.checkTask;
       return task.epoch === epoch ? task.promise : task.promise.then(() => this.poll(epoch));
@@ -654,7 +804,7 @@ class GuardController extends EventEmitter {
         }
         if (!active()) return;
       }
-      // Validate an IP result as soon as it arrives; a slow route query cannot delay a confirmed kill.
+      // Validate an IP result immediately; a slow route query cannot delay the protective response.
       const address = this.checkCurrentIP(epoch, relayPort, checkToken);
       const destinations = this.queryDestinations(epoch, relayPort, checkToken);
       const proxy = this.confirmNetworkProxy(epoch);
@@ -700,7 +850,7 @@ class GuardController extends EventEmitter {
       if (!this.publishLocalAddresses(localPin)) return;
       if (this.state === 'rechecking') {
         this.route = route.value; this.fingerprint = after;
-        this.relay.resume();
+        if (!await this.resumeValidatedSession(epoch, task.revision)) return;
         this.state = this.verified ? 'running' : 'starting';
         void this.deepLinks.flush();
         this.log('Прежний внешний IP подтверждён. Соединение возобновлено.');
@@ -711,8 +861,8 @@ class GuardController extends EventEmitter {
     }).finally(() => {
       if (this.checkTask === task) this.checkTask = null;
       if (!active()) return;
-      const changed = task.revision !== (this.revalidationRevision || 0);
-      this.schedulePoll(epoch, changed ? 0 : Math.max(0, this.settings.interval * 1000 - (performance.now() - task.started)));
+      const changed = task.revision !== (this.revalidationRevision || 0), elapsed = performance.now() - task.started;
+      this.schedulePoll(epoch, this.processFrozen ? Math.max(0, FREEZE_RETRY_MS - elapsed) : changed ? 0 : Math.max(0, this.settings.interval * 1000 - elapsed));
     });
     this.checkTask = task; return task.promise;
   }
@@ -723,6 +873,7 @@ class GuardController extends EventEmitter {
     this.cancelCodeState?.();
     this.deepLinkReady = false; this.deepLinks.clear();
     this.epoch++; clearInterval(this.networkTimer); clearInterval(this.heartbeatTimer); clearTimeout(this.pollTimer);
+    this.clearProcessFreeze(); this.rejectHostCommands(); this.freezeTask = null;
     this.inspector?.stop(); this.channel?.close(); this.relay?.close();
     // EOF makes GuardHost close its job. Force-terminating the helper also closes its job handle.
     const host = this.host, fence = this.fence, code = this.codePrepared;
@@ -736,7 +887,8 @@ class GuardController extends EventEmitter {
     };
     const drain = () => { this.track(closeFence()).catch(() => { this.shutdownFailed = true; }); };
     if (host) {
-      host.stdin.end(); const timer = setTimeout(() => host.kill(), 1000); timer.unref();
+      try { host.stdin.end(); } catch {}
+      const timer = setTimeout(() => host.kill(), 1000); timer.unref();
       const exited = new Promise(resolve => {
         if (host.exitCode != null || host.signalCode != null) { clearTimeout(timer); resolve(); }
         else host.once('exit', () => { clearTimeout(timer); resolve(); });

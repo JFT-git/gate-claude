@@ -140,13 +140,201 @@ import Darwin
         split.check(andLaunch: false)
         expect(await wait { split.requiresRestart }, "a different destination exit blocks the session")
         expect(saved() == nil, "split route cannot save a first pin")
+        let initialTransient = model("203.0.113.7")
+        initialTransient.e2ePublicCheck = { _ in throw GuardError.message("controlled initial probe failure") }
+        initialTransient.check(andLaunch: false)
+        expect(await wait { !initialTransient.busy } && !initialTransient.monitoring && initialTransient.e2eRelayPort == nil,
+               "initial pin failure blocks immediately without entering freeze recovery")
         try? Data("{broken".utf8).write(to: file)
         let corrupt = model("203.0.113.7"); var checked = false
         corrupt.e2eInitialCheck = { _ in checked = true; throw GuardError.message("unexpected probe") }
         corrupt.check(andLaunch: false)
         expect(await wait { !corrupt.busy } && !checked && !corrupt.allowed, "invalid memory blocks before a network probe")
         corrupt.resetIP(); expect(saved() == nil, "explicit reset recovers a damaged memory file")
-        for value in [first, same, changed, reset, split, corrupt] { value.shutdown() }
+        for value in [first, same, changed, reset, split, initialTransient, corrupt] { value.shutdown() }
+    }
+
+    final class FrozenFixture {
+        var now: TimeInterval = 100
+        var signals: [Int32] = []
+        var failSignal: Int32?
+        var ip = "203.0.113.7"
+        var failProbe = false
+        var holdProbe = false
+        var pending: CheckedContinuation<String, Error>?
+        var sample: RuntimeProcessSample?
+
+        func identity() -> RuntimeIdentity {
+            RuntimeIdentity(ownerPID: 50, ownerUID: 501, pid: 400, pgid: 400, startTime: 1234,
+                            path: "/tmp/guard-model/Claude.app", frozen: false)
+        }
+
+        func system() -> ProcessSystem {
+            sample = RuntimeProcessSample(uid: 501, pgid: 400, startTime: 1234,
+                                          path: "/tmp/guard-model/Claude.app/Contents/MacOS/Claude")
+            var system = ProcessSystem()
+            system.currentPID = { 50 }
+            system.currentUID = { 501 }
+            system.currentPGID = { 100 }
+            system.barrierGID = { 380 }
+            system.sample = { [weak self] _ in self?.sample }
+            system.members = { [weak self] _ in self?.sample == nil ? [] : [400] }
+            system.send = { [weak self] pid, signal in
+                guard let self else { return false }
+                self.signals.append(signal)
+                return self.failSignal != signal && pid == -400
+            }
+            system.exists = { _ in false }
+            return system
+        }
+    }
+
+    @MainActor static func frozenModel(root: URL, fixture: FrozenFixture, name: String) async -> GuardModel {
+        let model = GuardModel(diagnosticsURL: root.appendingPathComponent(name + ".jsonl"),
+                               processSystem: fixture.system(),
+                               crashStoreURL: root.appendingPathComponent(name + "-crash.json"),
+                               monotonicNow: { fixture.now })
+        model.e2eRuntimeRoot = root; model.useProxy = false; model.interval = 30
+        model.e2eSystemProxyCapture = { try SystemProxy.parse("<dictionary> {\n}") }
+        model.e2eCapturedPin = SOCKSRelay.LocalPin(v4: "192.0.2.10", v6: nil)
+        model.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "NL", date: Date()) }
+        model.e2ePublicCheck = { _ in
+            if fixture.holdProbe { return try await withCheckedThrowingContinuation { fixture.pending = $0 } }
+            if fixture.failProbe { throw GuardError.message("controlled transient failure") }
+            return fixture.ip
+        }
+        model.check(andLaunch: false)
+        expect(await wait { model.allowed }, name + " starts a verified session")
+        do { try model.e2eInstallRuntime(fixture.identity()) }
+        catch { expect(false, name + " installs test runtime identity") }
+        model.lastVerifiedProfile = VerifiedProfile(sessionID: "fixture", timezone: "Europe/Amsterdam",
+                                                    language: "en-US", url: "https://claude.ai/", locale: "en-US")
+        return model
+    }
+
+    @MainActor static func verifyProcessFreezing(root: URL) async {
+        let earlyFixture = FrozenFixture()
+        let early = await frozenModel(root: root, fixture: earlyFixture, name: "freeze-unverified")
+        early.lastVerifiedProfile = nil
+        earlyFixture.ip = "203.0.113.8"
+        early.e2eVerifyNow()
+        expect(await wait { early.requiresRestart }, "an unverified runtime IP mismatch remains an immediate block")
+        expect(earlyFixture.signals == [SIGKILL] && early.processState == .stopped,
+               "an unverified runtime is never frozen or allowed to resume")
+        early.shutdown()
+
+        let fixture = FrozenFixture()
+        let model = await frozenModel(root: root, fixture: fixture, name: "freeze")
+        fixture.failProbe = true
+        model.e2eVerifyNow()
+        expect(await wait { model.processState == .frozen }, "transient failure pauses relay then stops captured Claude group")
+        expect(fixture.signals == [SIGSTOP] && model.e2eFreezeDeadline == 120 && model.freezeRemaining == 20,
+               "freeze starts with one STOP and a fixed twenty-second deadline")
+        fixture.now = 101
+        model.e2eFreezeTick()
+        expect(model.freezeRemaining == 19, "freeze countdown reports nineteen seconds after one second")
+        model.e2eNetworkChanged()
+        expect(model.e2eFreezeDeadline == 120 && fixture.signals == [SIGSTOP],
+               "repeated failures neither extend deadline nor repeat STOP")
+        fixture.failProbe = false
+        expect(await wait { model.allowed && model.processState == .running },
+               "full validation unlocks relay then resumes Claude")
+        expect(fixture.signals == [SIGSTOP, SIGCONT] && model.freezeRemaining == nil,
+               "successful validation sends identity-checked CONT and clears freeze state")
+
+        fixture.failProbe = true
+        model.e2eVerifyNow()
+        expect(await wait { model.processState == .frozen }, "second transient failure freezes the same runtime")
+        fixture.failProbe = false; fixture.holdProbe = true
+        expect(await wait { fixture.pending != nil }, "late-response fixture holds revalidation in flight")
+        model.stop()
+        let stoppedSignals = fixture.signals
+        fixture.holdProbe = false
+        fixture.pending?.resume(returning: fixture.ip); fixture.pending = nil
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        expect(!model.allowed && !model.monitoring && fixture.signals == stoppedSignals,
+               "stop invalidates generation and a late response cannot revive Claude")
+        expect(stoppedSignals.last == SIGKILL && model.processState == .stopped,
+               "manual stop kills a stopped security-session runtime without unverified continuation")
+        model.shutdown()
+
+        let timeoutFixture = FrozenFixture()
+        let timeout = await frozenModel(root: root, fixture: timeoutFixture, name: "freeze-timeout")
+        timeoutFixture.failProbe = true
+        timeout.e2eVerifyNow()
+        _ = await wait { timeout.processState == .frozen }
+        timeoutFixture.now = 119
+        timeout.e2eFreezeTick()
+        expect(timeout.freezeRemaining == 1 && !timeoutFixture.signals.contains(SIGTERM),
+               "nineteen seconds leaves one second without premature termination")
+        timeoutFixture.failProbe = false; timeoutFixture.holdProbe = true
+        _ = await wait { timeoutFixture.pending != nil }
+        timeoutFixture.now = 120
+        timeout.e2eFreezeTick()
+        expect(timeoutFixture.signals == [SIGSTOP, SIGTERM, SIGCONT] && timeout.processState == .draining,
+               "freeze timeout sends TERM then CONT and enters bounded graceful drain")
+        timeoutFixture.holdProbe = false
+        timeoutFixture.pending?.resume(returning: timeoutFixture.ip); timeoutFixture.pending = nil
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        expect(!timeout.allowed && !timeout.monitoring && !timeout.claudeRunning,
+               "late validation after timeout cannot reopen relay or runtime")
+        timeout.shutdown()
+        expect(timeoutFixture.signals.last == SIGKILL && timeout.processState == .stopped,
+               "shutdown finishes freeze drain with SIGKILL and normal cleanup")
+
+        let gracefulFixture = FrozenFixture()
+        let graceful = await frozenModel(root: root, fixture: gracefulFixture, name: "freeze-stop")
+        graceful.e2eBarrierProbe = .active
+        graceful.barrierArmed = true
+        gracefulFixture.failProbe = true
+        graceful.e2eVerifyNow()
+        _ = await wait { graceful.processState == .frozen }
+        graceful.stop()
+        expect(gracefulFixture.signals == [SIGSTOP, SIGCONT, SIGTERM],
+               "graceful stop continues a verified frozen group before TERM")
+        gracefulFixture.sample = nil
+        graceful.shutdown()
+        expect(graceful.processState == .stopped, "shutdown completes stopped-process drain state")
+
+        let mismatchFixture = FrozenFixture()
+        let mismatch = await frozenModel(root: root, fixture: mismatchFixture, name: "freeze-mismatch")
+        mismatchFixture.ip = "203.0.113.8"
+        mismatch.e2eVerifyNow()
+        expect(await wait { mismatch.processState == .frozen }, "post-verification IP mismatch enters the fixed freeze window")
+        expect(mismatchFixture.signals == [SIGSTOP] && !mismatch.requiresRestart,
+               "IP mismatch pauses and stops without an immediate permanent latch")
+        mismatchFixture.ip = "203.0.113.7"
+        expect(await wait { mismatch.allowed && mismatch.processState == .running },
+               "returning to the pinned IP during the window resumes the same runtime")
+        expect(mismatchFixture.signals == [SIGSTOP, SIGCONT], "IP mismatch recovery unlocks then continues once")
+        mismatch.shutdown()
+
+        let ruFixture = FrozenFixture()
+        let ru = await frozenModel(root: root, fixture: ruFixture, name: "freeze-ru")
+        ru.e2eDestinationCheck = { _ in ("203.0.113.7", "RU") }
+        ru.e2eVerifyNow()
+        expect(await wait { ru.requiresRestart }, "RU route remains an immediate block")
+        expect(ruFixture.signals == [SIGKILL] && ru.processState == .stopped,
+               "RU route kills immediately without freeze recovery")
+
+        let barrierFixture = FrozenFixture()
+        let barrier = await frozenModel(root: root, fixture: barrierFixture, name: "freeze-barrier")
+        barrier.e2eBarrierProbe = .active
+        barrier.barrierArmed = true
+        barrier.e2eBarrierProbe = .broken("controlled barrier loss")
+        barrier.e2eVerifyNow()
+        expect(await wait { barrier.requiresRestart }, "barrier loss remains an immediate block")
+        expect(barrierFixture.signals == [SIGKILL] && barrier.processState == .stopped,
+               "barrier loss kills stopped or running runtime without freeze delay")
+
+        let signalFixture = FrozenFixture()
+        let signalFailure = await frozenModel(root: root, fixture: signalFixture, name: "freeze-signal")
+        signalFixture.failProbe = true
+        signalFixture.failSignal = SIGSTOP
+        signalFailure.e2eVerifyNow()
+        expect(await wait { signalFailure.requiresRestart }, "STOP signal failure blocks the session")
+        expect(signalFailure.processState == .stopped && !signalFailure.allowed,
+               "signal failure cannot leave an apparently frozen active session")
     }
 
     @MainActor static func main() async {
@@ -156,6 +344,7 @@ import Darwin
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         await verifyPersistentIP(root: root)
+        await verifyProcessFreezing(root: root)
         let model = GuardModel(diagnosticsURL: root.appendingPathComponent("diagnostics.jsonl"))
         model.e2eRuntimeRoot = root // Prevent writing actual preferences.
         model.e2eSystemProxyCapture = { try SystemProxy.parse("<dictionary> {\n}") }
@@ -234,15 +423,28 @@ import Darwin
         proxyModel.check(andLaunch: false)
         expect(await wait { proxyModel.allowed }, "static system proxy is pinned at session start")
         proxyReadFails = true; proxyModel.e2eVerifyNow()
-        expect(await wait { proxyModel.e2eSuspended && !proxyModel.allowed }, "proxy read failure pauses traffic for revalidation")
-        expect(!proxyModel.requiresRestart, "proxy read failure does not latch a confirmed change")
+        expect(await wait { proxyModel.requiresRestart && !proxyModel.allowed }, "proxy read failure immediately closes the verified session")
+        expect(!proxyModel.monitoring && proxyModel.e2eRelayPort == nil, "proxy channel failure closes the relay without freeze recovery")
         proxyReadFails = false
-        expect(await wait { proxyModel.allowed }, "unchanged proxy after read recovery resumes traffic")
-        proxyHost = "second.example"; proxyModel.e2eVerifyNow()
-        expect(await wait { proxyModel.requiresRestart }, "changed pinned proxy fingerprint requires restart")
-        expect(!proxyModel.allowed && !proxyModel.monitoring && proxyModel.e2eRelayPort == nil, "confirmed proxy change closes the session relay")
-        proxyModel.stop(); proxyModel.check(andLaunch: false)
-        expect(proxyModel.requiresRestart && !proxyModel.allowed, "manual stop cannot clear the proxy-change latch")
+        proxyModel.e2eVerifyNow()
+        expect(!proxyModel.allowed && proxyModel.requiresRestart, "proxy failure cannot be revived by a later successful read")
+
+        let proxyChange = GuardModel(diagnosticsURL: root.appendingPathComponent("proxy-change-diagnostics.jsonl"))
+        proxyChange.e2eRuntimeRoot = root; proxyChange.useProxy = false
+        proxyChange.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "NL", date: Date()) }
+        proxyChange.e2ePublicCheck = { _ in "203.0.113.7" }
+        proxyHost = "first.example"
+        proxyChange.e2eSystemProxyCapture = {
+            try SystemProxy.parse("<dictionary> {\nSOCKSEnable : 1\nSOCKSProxy : \(proxyHost)\nSOCKSPort : 1080\n}")
+        }
+        defer { proxyChange.shutdown() }
+        proxyChange.check(andLaunch: false)
+        expect(await wait { proxyChange.allowed }, "second static proxy session starts for mismatch coverage")
+        proxyHost = "second.example"; proxyChange.e2eVerifyNow()
+        expect(await wait { proxyChange.requiresRestart }, "changed pinned proxy fingerprint requires restart")
+        expect(!proxyChange.allowed && !proxyChange.monitoring && proxyChange.e2eRelayPort == nil, "confirmed proxy change closes the session relay")
+        proxyChange.stop(); proxyChange.check(andLaunch: false)
+        expect(proxyChange.requiresRestart && !proxyChange.allowed, "manual stop cannot clear the proxy-change latch")
 
         // PG-01: without an active packet-filter barrier the session must fail closed.
         let barrierModel = GuardModel(diagnosticsURL: root.appendingPathComponent("barrier-diagnostics.jsonl"))

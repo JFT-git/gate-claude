@@ -7,9 +7,16 @@ import Darwin
 /// late completions: a stale cleanup must not clear a newer drain's state.
 private struct RuntimeDrain {
     let id = UUID()
-    let process: Process
-    let group: Int32?
+    let process: Process?
+    let identity: RuntimeIdentity
     let path: String
+    let deadline: TimeInterval
+}
+
+private struct ImmediateSessionError: LocalizedError {
+    let reason: String
+    init(_ reason: String) { self.reason = reason }
+    var errorDescription: String? { reason }
 }
 
 @MainActor
@@ -56,9 +63,15 @@ final class GuardModel: ObservableObject {
     @Published var showLog = false
     @Published var traffic: [TrafficRecord] = []
     @Published var selectedTrafficID: String?
+    @Published var processState: GuardProcessState = .stopped
+    @Published var freezeRemaining: Int?
     private var relay: SOCKSRelay?
     private var relayPort: UInt16?
     private var process: Process?
+    private var runtimeIdentity: RuntimeIdentity?
+    private var freezeSession: FreezeSession?
+    private var freezeTimeout: DispatchWorkItem?
+    private var freezeTicker: Timer?
     private var timer: Timer?
     private var inspector: ClaudeInspector?
     private var networkWatcher: LocalNetworkWatcher?
@@ -69,6 +82,10 @@ final class GuardModel: ObservableObject {
     private var localBaseline = Set<String>()
     private var policy = SessionPolicy()
     private let ipMemory: IPMemory
+    private let processSystem: ProcessSystem
+    private let crashStore: RuntimeCrashStore
+    private let monotonicNow: () -> TimeInterval
+    private var signaler: ProcessSignaler { ProcessSignaler(system: processSystem) }
     @Published private(set) var savedIP: String?
     @Published private(set) var ipMemoryError: String?
     var canResetIP: Bool { !busy && !monitoring && !claudeRunning && !restarting && runtimeDrain == nil && (savedIP != nil || ipMemoryError != nil) }
@@ -82,7 +99,7 @@ final class GuardModel: ObservableObject {
     private let diagnostics: GuardDiagnostics
     private var childBundleURL: URL?
     private var deepLinkReady: Bool {
-        allowed && !policy.suspended && !sleeping && !restarting && !requiresRestart &&
+        allowed && !policy.suspended && !sleeping && !restarting && !requiresRestart && freezeSession == nil &&
         claudeRunning && process?.isRunning == true && lastVerifiedProfile != nil && childBundleURL != nil
     }
     lazy var deepLinkInbox: DeepLinkInbox = {
@@ -133,11 +150,21 @@ final class GuardModel: ObservableObject {
     var e2eOnVerified: ((VerifiedProfile) -> Void)?
     var e2eInspector: ClaudeInspector? { inspector }
     var e2eRelayPort: UInt16? { relayPort }
-    var e2eProcessID: Int32? { process?.processIdentifier }
+    var e2eProcessID: Int32? { runtimeIdentity?.pid ?? process?.processIdentifier }
+    var e2eRuntimeIdentity: RuntimeIdentity? { runtimeIdentity }
+    var e2eFreezeDeadline: TimeInterval? { freezeSession?.deadline }
     var e2eSuspended: Bool { policy.suspended }
     func e2eVerifyNow() { verifyPinnedIP(andLaunch: false) }
     func e2eNetworkChanged() { networkChanged("Изменение тестовой сети") }
     func e2ePowerChanged(sleeping: Bool) { powerChanged(sleeping: sleeping) }
+    func e2eFreezeTick() { updateFreezeCountdown() }
+    func e2eInstallRuntime(_ identity: RuntimeIdentity) throws {
+        runtimeIdentity = identity
+        activePath = identity.path
+        claudeRunning = true
+        processState = .running
+        try crashStore.write(identity)
+    }
     #endif
 
     /// Tests never enter the privileged chain unless they explicitly pin a probe.
@@ -201,7 +228,8 @@ final class GuardModel: ObservableObject {
     }
 
 
-    init(diagnosticsURL: URL? = nil, ipMemoryURL: URL? = nil) {
+    init(diagnosticsURL: URL? = nil, ipMemoryURL: URL? = nil, processSystem: ProcessSystem = .live,
+         crashStoreURL: URL? = nil, monotonicNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         #if GUARD_E2E
         // Every existing fixture stays isolated; restart tests explicitly share a URL.
         let memoryURL = ipMemoryURL ?? FileManager.default.temporaryDirectory.appendingPathComponent("guard-ip-memory-" + UUID().uuidString + "/ip-memory.json")
@@ -210,6 +238,12 @@ final class GuardModel: ObservableObject {
         #endif
         ipMemory = IPMemory(url: memoryURL)
         diagnostics = GuardDiagnostics(url: diagnosticsURL)
+        self.processSystem = processSystem
+        self.monotonicNow = monotonicNow
+        crashStore = RuntimeCrashStore(url: crashStoreURL ?? diagnosticsURL.map {
+            $0.deletingLastPathComponent().appendingPathComponent("runtime-crash.json")
+        } ?? RuntimeCrashStore.defaultURL)
+        RuntimeCrashRecovery.clean(store: crashStore, system: processSystem)
         do { savedIP = try ipMemory.load() } catch { ipMemoryError = error.localizedDescription }
         previousStop = diagnostics.previousFailure()
         let d = UserDefaults.standard
@@ -310,7 +344,7 @@ final class GuardModel: ObservableObject {
                 } else { relay = SOCKSRelay(currentNetwork: true) }
                 relay.onFault = { [weak self] in
                     guard let self, self.operation == token else { return }
-                    self.networkChanged("Шлюз временно потерял соединение с прокси")
+                    self.block("Шлюз потерял защищённое соединение с прокси. Сессия закрыта.", latch: true)
                 }
                 relay.onTunnelEvent = { [weak self] host, port, sent, received, finished in
                     guard let self, self.operation == token else { return }
@@ -365,7 +399,7 @@ final class GuardModel: ObservableObject {
                     return
                 }
                 relay.setPinnedFamily(policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
-                if !relay.unlock() { throw GuardError.message("Локальный шлюз уже закрыт.") }
+                if !relay.unlock() { throw ImmediateSessionError("Локальный шлюз уже закрыт.") }
                 allowed = true; monitoring = true; busy = false
                 phase = "Постоянный IP подтверждён"
                 detail = watchPublicIP ? "Внешний IP: каждые \(interval) с. Изменение сети приостанавливает шлюз до повторной проверки IP." : "Изменение локальной сети приостанавливает шлюз для проверки IP. Периодические проверки отключены."
@@ -374,10 +408,7 @@ final class GuardModel: ObservableObject {
                 if launch { attemptLaunch() }
             } catch {
                 guard operation == token else { return }
-                if policy.pinnedIP != nil, !policy.requiresRestart {
-                    monitoring = true
-                    verifyPinnedIP(andLaunch: launch, pauseReason: error.localizedDescription)
-                } else { block(error.localizedDescription, latch: policy.requiresRestart) }
+                block(error.localizedDescription, latch: policy.requiresRestart || error is ImmediateSessionError)
             }
         }
     }
@@ -386,45 +417,39 @@ final class GuardModel: ObservableObject {
         guard !requiresRestart, policy.pinnedIP != nil else { return }
         launchAfterValidation = launchAfterValidation || launch
         if let pauseReason { suspendTraffic(pauseReason) }
-        guard revalidationTask == nil, !sleeping else { return }
+        guard revalidationTask == nil, !sleeping, !requiresRestart else { return }
         busy = true; let token = operation
         revalidationTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled, self.operation == token, !self.sleeping {
+                if self.expireFreezeIfNeeded() { return }
                 let revision = self.networkRevision
+                let freezeID = self.freezeSession?.id
                 do {
                     let wasSuspended = self.policy.suspended
-                    // A removed packet-filter barrier reopens direct egress for the
-                    // whole Claude tree. The tree must not keep running uncontained:
-                    // kill it immediately (no graceful window), then treat the loss
-                    // like a route change.
                     if self.barrierArmed, !self.currentBarrierProbe().active {
-                        self.stopOwnedClaude(graceful: false)
-                        self.barrierLaunched = false
-                        throw GuardError.message("Сетевой барьер отключён во время сессии. Claude остановлен.")
+                        self.block("Сетевой барьер отключён во время сессии. Claude остановлен.", latch: true)
+                        return
                     }
-                    // While the gate is paused after a network event, control probes
-                    // rebind freely; app traffic stays closed until the fresh proven
-                    // pin is installed. Routine periodic checks keep the pin: the
-                    // probes themselves run bound, so no unbound egress window opens.
                     if self.sessionNetworkMode, wasSuspended { self.relay?.resetLocalPinning() }
                     let actual = try await self.currentIPCheck(self.relayPort)
-                    guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
-                    // A response started before the most recent route event cannot reopen the gate.
+                    guard !Task.isCancelled, self.operation == token, !self.sleeping,
+                          self.freezeSession?.id == freezeID else { return }
                     guard revision == self.networkRevision else { continue }
-                    try self.policy.verify(actual)
+                    try self.verifyObservedIP(actual)
                     if wasSuspended { self.policy.suspend() }
                     try await self.verifyDestinations(operation: token)
-                    guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
+                    guard !Task.isCancelled, self.operation == token, !self.sleeping,
+                          self.freezeSession?.id == freezeID else { return }
                     guard revision == self.networkRevision else { continue }
                     try await self.confirmSystemProxy(operation: token)
-                    guard !Task.isCancelled, self.operation == token, !self.sleeping else { return }
+                    guard !Task.isCancelled, self.operation == token, !self.sleeping,
+                          self.freezeSession?.id == freezeID else { return }
                     guard revision == self.networkRevision else { continue }
-                    try self.policy.verify(actual)
+                    try self.verifyObservedIP(actual)
                     try self.persistIP(actual)
                     self.relay?.setPinnedFamily(self.policy.pinnedIP.map { $0.contains(":") ? .v6 : .v4 })
                     if self.sessionNetworkMode, wasSuspended, let relay = self.relay {
-                        // Re-pin from the addresses these very probes used, then open.
                         var captured = relay.capturedLocalAddresses()
                         #if GUARD_E2E
                         if captured == nil { captured = self.e2eCapturedPin }
@@ -434,16 +459,25 @@ final class GuardModel: ObservableObject {
                         }
                         relay.setPinnedLocalAddresses(captured)
                     }
-                    if wasSuspended, let relay = self.relay, !relay.unlock() {
-                        throw GuardError.message("Шлюз ожидает успешного контрольного подключения.")
+                    if wasSuspended || freezeID != nil, let relay = self.relay, !relay.unlock() {
+                        throw ImmediateSessionError("Локальный защищённый шлюз не удалось возобновить.")
+                    }
+                    if let session = self.freezeSession {
+                        guard session.id == freezeID else { return }
+                        try self.signaler.resume(session.identity)
+                        var resumed = session.identity
+                        resumed.frozen = false
+                        self.runtimeIdentity = resumed
+                        try self.crashStore.write(resumed)
+                        self.clearFreeze()
                     }
                     self.localBaseline = NetworkSnapshot.current()
                     if let last = self.report { self.report = IPReport(ip: actual, countryCode: last.countryCode, country: last.country, date: Date()) }
                     self.allowed = true; self.monitoring = true; self.busy = self.launchPending
                     self.phase = "Постоянный IP подтверждён"
                     if wasSuspended {
-                        self.detail = "Прежний внешний IP подтверждён. Шлюз возобновлён."
-                        self.appendLog("Повторная проверка подтвердила прежний IP; шлюз возобновлён.")
+                        self.detail = "Прежний внешний IP подтверждён. Шлюз и Claude возобновлены; новые потоки открываются заново."
+                        self.appendLog("Повторная проверка подтвердила прежний IP; шлюз и Claude возобновлены.")
                     }
                     self.revalidationTask = nil
                     let shouldLaunch = self.launchAfterValidation; self.launchAfterValidation = false
@@ -453,19 +487,21 @@ final class GuardModel: ObservableObject {
                     return
                 } catch {
                     guard !Task.isCancelled, self.operation == token else { return }
-                    // Close the gate before any further awaiting: a failing probe must
-                    // never leave the relay open while settings are being inspected.
                     self.relay?.pause()
-                    if self.policy.requiresRestart { self.block(error.localizedDescription, latch: true); return }
-                    // A failed IP/destination probe must not hide a confirmed proxy change.
-                    do { try await self.confirmSystemProxy(operation: token) }
-                    catch {
-                        guard !Task.isCancelled, self.operation == token else { return }
-                        if self.policy.requiresRestart { self.block(error.localizedDescription, latch: true); return }
+                    if error is ImmediateSessionError || error is ProcessSignalError || self.policy.requiresRestart {
+                        self.block(error.localizedDescription, latch: true)
+                        return
                     }
-                    guard !Task.isCancelled, self.operation == token else { return }
                     self.suspendTraffic(error.localizedDescription)
-                    do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
+                    guard !self.requiresRestart else { return }
+                    let delay = self.freezeSession.map {
+                        FreezeWindow.retryDelay(at: self.monotonicNow(), deadline: $0.deadline)
+                    } ?? FreezeWindow.retry
+                    if delay == 0 {
+                        if self.expireFreezeIfNeeded() { return }
+                    } else {
+                        do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
+                    }
                 }
             }
         }
@@ -473,11 +509,80 @@ final class GuardModel: ObservableObject {
 
     private func suspendTraffic(_ reason: String) {
         let firstPause = !policy.suspended
-        policy.suspend(); relay?.pause()
-        allowed = false; phase = "Шлюз приостановлен — проверяем IP"
-        detail = "\(reason). Новые запросы Claude закрыты до подтверждения прежнего IP."
+        policy.suspend()
+        relay?.pause()
+        allowed = false
         timer?.invalidate(); timer = nil; nextCheck = nil
-        if firstPause { appendLog("Шлюз приостановлен для повторной проверки IP: \(reason)") }
+        if claudeRunning, lastVerifiedProfile != nil, let identity = runtimeIdentity {
+            if freezeSession == nil {
+                do {
+                    inspector?.setFrozen(true)
+                    try signaler.stop(identity)
+                    var frozen = identity
+                    frozen.frozen = true
+                    runtimeIdentity = frozen
+                    try crashStore.write(frozen)
+                    let session = FreezeSession(deadline: monotonicNow() + FreezeWindow.duration, identity: frozen)
+                    freezeSession = session
+                    processState = .frozen
+                    freezeRemaining = FreezeWindow.duration > 0 ? Int(FreezeWindow.duration) : 0
+                    scheduleFreezeDeadline(session)
+                    appendLog("Claude заморожен на 20 секунд для повторной проверки IP: \(reason)")
+                } catch {
+                    block(error.localizedDescription, latch: true)
+                    return
+                }
+            }
+            phase = "Claude заморожен — проверяем IP"
+            detail = "\(reason). Активные потоки закрыты. До завершения: \(freezeRemaining ?? 0) с; крайний срок не продлевается."
+        } else {
+            phase = "Шлюз приостановлен — проверяем IP"
+            detail = "\(reason). Новые запросы Claude закрыты до подтверждения прежнего IP."
+            if firstPause { appendLog("Шлюз приостановлен для повторной проверки IP: \(reason)") }
+        }
+    }
+
+    private func scheduleFreezeDeadline(_ session: FreezeSession) {
+        freezeTimeout?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.freezeSession?.id == session.id else { return }
+                self.freezeExpired(session)
+            }
+        }
+        freezeTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + FreezeWindow.duration, execute: timeout)
+        freezeTicker?.invalidate()
+        let ticker = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updateFreezeCountdown() }
+        }
+        freezeTicker = ticker
+        RunLoop.main.add(ticker, forMode: .common)
+    }
+
+    private func updateFreezeCountdown() {
+        guard let session = freezeSession else { return }
+        freezeRemaining = FreezeWindow.remaining(at: monotonicNow(), deadline: session.deadline)
+        if freezeSession != nil {
+            detail = "Проверяем закреплённый IP. Активные потоки закрыты. До завершения: \(freezeRemaining ?? 0) с; крайний срок не продлевается."
+        }
+        _ = expireFreezeIfNeeded()
+    }
+
+    @discardableResult
+    private func expireFreezeIfNeeded() -> Bool {
+        guard let session = freezeSession, monotonicNow() >= session.deadline else { return false }
+        freezeExpired(session)
+        return true
+    }
+
+    private func clearFreeze() {
+        freezeTimeout?.cancel(); freezeTimeout = nil
+        freezeTicker?.invalidate(); freezeTicker = nil
+        freezeSession = nil
+        freezeRemaining = nil
+        inspector?.setFrozen(false)
+        processState = claudeRunning ? .running : .stopped
     }
 
     private func networkChanged(_ reason: String) {
@@ -542,7 +647,8 @@ final class GuardModel: ObservableObject {
             result = try await IPChecker.destinationTrace(relayPort: relayPort, token: relay.checkToken, hostname: host, family: policy.pinnedIP?.contains(":") == true ? 6 : 4)
             #endif
             guard operation == expected, !Task.isCancelled else { throw CancellationError() }
-            try policy.verifyDestination(hostname: host, ip: result.ip, countryCode: result.countryCode)
+            try policy.verifyDestination(hostname: host, ip: result.ip, countryCode: result.countryCode,
+                                         recoverableMismatch: claudeRunning && lastVerifiedProfile != nil && runtimeIdentity != nil)
         }
     }
 
@@ -560,9 +666,7 @@ final class GuardModel: ObservableObject {
         do { current = try await captureSystemProxy() }
         catch {
             guard operation == expected, !Task.isCancelled else { throw CancellationError() }
-            let reason = "Не удалось подтвердить настройки прокси macOS. Повторяем проверку."
-            suspendTraffic(reason)
-            throw GuardError.message(reason)
+            throw ImmediateSessionError("Не удалось подтвердить настройки прокси macOS. Сессия закрыта.")
         }
         guard operation == expected, !Task.isCancelled else { throw CancellationError() }
         if current.fingerprint != pinned.fingerprint {
@@ -583,6 +687,10 @@ final class GuardModel: ObservableObject {
         if let e2ePublicCheck { return try await e2ePublicCheck(port) }
         #endif
         return try await IPChecker.publicIP(relayPort: port, token: relay?.checkToken ?? "", pinnedIP: policy.pinnedIP)
+    }
+    private func verifyObservedIP(_ actual: String) throws {
+        if claudeRunning, lastVerifiedProfile != nil, runtimeIdentity != nil { try policy.verifyRecoverable(actual) }
+        else { try policy.verify(actual) }
     }
     private func attemptLaunch() {
         guard !busy, !requiresRestart else { return }
@@ -749,10 +857,32 @@ final class GuardModel: ObservableObject {
             }
         }
         try child.run()
-        childBundleURL = bundleURL
-        process = child; activePath = bundleURL.path; claudeRunning = true
-        inspector.start()
-        appendLog("Локальная копия Claude запущена: \(timezone) · \(language)")
+        process = child
+        activePath = bundleURL.path
+        do {
+            let identity = try ProcessSignaler.capture(visiblePID: child.processIdentifier,
+                                                       barrierLaunched: useBarrierChain,
+                                                       path: bundleURL.path, system: processSystem)
+            runtimeIdentity = identity
+            try crashStore.write(identity)
+            childBundleURL = bundleURL
+            claudeRunning = true
+            processState = .running
+            inspector.start()
+            appendLog("Локальная копия Claude запущена: \(timezone) · \(language) · PID \(identity.pid) · PGID \(identity.pgid)")
+        } catch {
+            child.terminationHandler = nil
+            if child.isRunning {
+                child.terminate()
+                kill(child.processIdentifier, SIGKILL)
+            }
+            sweepRuntimeApps(path: bundleURL.path)
+            process = nil
+            runtimeIdentity = nil
+            activePath = nil
+            childBundleURL = nil
+            throw error
+        }
     }
 
     private func writeBarrierEnvironment(_ environment: [String: String], to url: URL) throws {
@@ -818,15 +948,35 @@ final class GuardModel: ObservableObject {
         restarting = false; detail = message; appendLog(message)
         operationFailure = "Перезапуск: не удалось — " + message
     }
-    private func block(_ reason: String, manual: Bool = false, latch: Bool = false) {
+    private func freezeExpired(_ session: FreezeSession) {
+        guard freezeSession?.id == session.id else { return }
+        revalidationTask?.cancel(); revalidationTask = nil
+        freezeTimeout?.cancel(); freezeTimeout = nil
+        freezeTicker?.invalidate(); freezeTicker = nil
+        let reason = "Проверка IP не завершилась за 20 секунд. Claude завершается; профиль сохраняется."
+        do {
+            try signaler.terminateFrozen(session.identity)
+            var resumed = session.identity
+            resumed.frozen = false
+            runtimeIdentity = resumed
+            try? crashStore.write(resumed)
+        } catch {
+            try? signaler.kill(session.identity)
+            block(error.localizedDescription, latch: true)
+            return
+        }
+        freezeSession = nil
+        freezeRemaining = nil
+        processState = .draining
+        appendLog(reason)
+        block(reason, latch: true, freezeDrain: true)
+    }
+
+    private func block(_ reason: String, manual: Bool = false, latch: Bool = false, freezeDrain: Bool = false) {
         let failedLaunch = busy || launchPending || launchAfterValidation
         deepLinkInbox.clear()
         childBundleURL = nil
         password = ""
-        // A manual stop of a barrier-contained session may drain gracefully so
-        // Chromium can flush its profile; every security stop (route change,
-        // latch, barrier loss, crash) kills the tree immediately — while the
-        // barrier state is uncertain the tree must not get a window to run in.
         let contained = barrierArmed
         clearBarrierEnvironment(); barrierArmed = false
         sessionNetworkMode = false
@@ -840,11 +990,13 @@ final class GuardModel: ObservableObject {
         timer?.invalidate(); timer = nil; nextCheck = nil
         pathMonitor?.cancel(); pathMonitor = nil
         networkWatcher?.stop(); networkWatcher = nil
-        // Keep barrierLaunched until the tree is dead: stopOwnedClaude needs it to
-        // choose the process-group kill path for the sudo-launched chain.
-        stopOwnedClaude(graceful: manual && contained)
+        stopOwnedClaude(graceful: (manual && contained) || freezeDrain, terminationSent: freezeDrain)
         barrierLaunched = false
+        freezeTimeout?.cancel(); freezeTimeout = nil
+        freezeTicker?.invalidate(); freezeTicker = nil
+        freezeSession = nil; freezeRemaining = nil
         monitoring = false; allowed = false; busy = false
+        processState = runtimeDrain == nil ? .stopped : .draining
         if !requiresRestart { policy.manualStop() }
         phase = requiresRestart ? "Заблокировано до перезапуска Guard" : (manual ? "Остановлено" : "Доступ закрыт")
         detail = reason
@@ -855,96 +1007,80 @@ final class GuardModel: ObservableObject {
         }
         appendLog(reason)
     }
-    /// Force-terminates every GUI app whose executable lives under the runtime copy.
+
     private func sweepRuntimeApps(path: String) {
         for app in NSWorkspace.shared.runningApplications {
-            if let url = app.executableURL, url.standardizedFileURL.resolvingSymlinksInPath().path.hasPrefix(path + "/") { app.forceTerminate() }
+            if let url = app.executableURL, ProcessSignaler.path(url.path, belongsTo: path) { app.forceTerminate() }
         }
     }
-    /// Immediately kills a still-draining tree and finishes its cleanup. Used
-    /// when a security stop lands while an earlier graceful stop is draining:
-    /// once containment is in doubt the old tree loses the rest of its window.
+
     private func escalateDrain(_ pending: RuntimeDrain) {
-        if let group = pending.group { kill(-group, SIGKILL) }
-        if pending.process.isRunning { kill(pending.process.processIdentifier, SIGKILL) }
-        sweepRuntimeApps(path: pending.path)
+        do {
+            try signaler.kill(pending.identity)
+            crashStore.remove(matching: pending.identity)
+            if activePath == nil { sweepRuntimeApps(path: pending.path) }
+        } catch { appendLog(error.localizedDescription) }
         runtimeDrain = nil
     }
-    private func stopOwnedClaude(graceful: Bool) {
+
+    private func stopOwnedClaude(graceful: Bool, terminationSent: Bool = false) {
         if !graceful, let pending = runtimeDrain { escalateDrain(pending) }
         guard let path = activePath else { return }
         process?.terminationHandler = nil
-        if let process, process.isRunning {
-            let pid = process.processIdentifier
-            // Discover the runtime's process group BEFORE signalling anything:
-            // once the leader dies the parent relationship is gone. With the
-            // barrier the visible child is sudo and the runtime execs through
-            // GuardDrop and GuardHost into its own group led by sudo's only
-            // child; without it GuardHost itself leads an independent group.
-            var group: Int32?
-            if barrierLaunched {
-                group = childProcessGroup(of: pid)
-            } else if getpgid(pid) == pid {
-                group = pid // never signal our own group: only an independent one
-            }
-            if graceful {
-                // Chromium flushes cookies and localStorage asynchronously; an
-                // instant SIGKILL discards the freshly written session (the
-                // "log in every launch" symptom). Terminate politely first,
-                // give the tree a short grace window, then force-kill any
-                // survivor. Only used for contained sessions (manual stop with
-                // the barrier armed) — security stops kill immediately below.
-                if barrierLaunched { process.terminate() }
-                else if group != nil { kill(-pid, SIGTERM) }
-                else { process.terminate() }
-                let draining = process
-                let record = RuntimeDrain(process: draining, group: group, path: path)
+        let identity = runtimeIdentity
+        if graceful, let identity {
+            do {
+                var current = identity
+                if current.frozen, !terminationSent {
+                    try signaler.resume(current)
+                    current.frozen = false
+                    runtimeIdentity = current
+                    try crashStore.write(current)
+                }
+                if !terminationSent { try signaler.terminate(current) }
+                if barrierLaunched { process?.terminate() }
+                let record = RuntimeDrain(process: process, identity: current, path: path,
+                                          deadline: ProcessInfo.processInfo.systemUptime + (terminationSent ? FreezeWindow.drain : 3))
                 runtimeDrain = record
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    for _ in 0..<30 where draining.isRunning { Thread.sleep(forTimeInterval: 0.1) }
-                    // Kill the group unconditionally: descendants must not escape
-                    // cleanup just because the tracked parent already exited.
-                    // kill on a dead group is a harmless ESRCH no-op.
-                    if let group { kill(-group, SIGKILL) }
-                    if draining.isRunning { kill(draining.processIdentifier, SIGKILL) }
+                    while ProcessInfo.processInfo.systemUptime < record.deadline,
+                          ProcessSignaler(system: self?.processSystem ?? .live).matchesLeader(record.identity) {
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                    var cleaned = false
+                    do {
+                        try ProcessSignaler(system: self?.processSystem ?? .live).kill(record.identity)
+                        cleaned = true
+                    } catch {}
                     DispatchQueue.main.async { [weak self] in
-                        // Complete only if this drain still owns the record: a
-                        // security stop may have escalated it, and a newer stop
-                        // may have replaced it.
                         guard let self, self.runtimeDrain?.id == record.id else { return }
-                        // A new launch may have started while draining; never
-                        // sweep a live session's runtime.
-                        if self.activePath == nil { self.sweepRuntimeApps(path: record.path) }
+                        if cleaned {
+                            self.crashStore.remove(matching: record.identity)
+                            if self.activePath == nil { self.sweepRuntimeApps(path: record.path) }
+                        }
                         self.runtimeDrain = nil
+                        self.processState = .stopped
                     }
                 }
-            } else {
-                // Security stop: the tree dies now. Containment may be gone or
-                // unproven, so no graceful window is afforded.
-                process.terminate()
-                if let group { kill(-group, SIGKILL) }
-                if process.isRunning { kill(pid, SIGKILL) }
+            } catch { appendLog(error.localizedDescription) }
+        } else if let identity {
+            if barrierLaunched, let process, process.isRunning { process.terminate() }
+            do {
+                try signaler.kill(identity)
+                crashStore.remove(matching: identity)
                 sweepRuntimeApps(path: path)
-            }
+            } catch { appendLog(error.localizedDescription) }
+        } else if let process, process.isRunning {
+            process.terminate()
+            kill(process.processIdentifier, SIGKILL)
+            sweepRuntimeApps(path: path)
         } else {
             sweepRuntimeApps(path: path)
         }
-        process = nil; activePath = nil; claudeRunning = false
-    }
-    /// Returns the process-group leader started under the given sudo process, or nil.
-    private func childProcessGroup(of sudoPID: Int32) -> Int32? {
-        let task = Process(), pipe = Pipe()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        task.arguments = ["-P", String(sudoPID)]
-        task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
-        do { try task.run() } catch { return nil }
-        // Drain stdout before waiting so a chatty child can never deadlock the pipe.
-        let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else { return nil }
-        guard let line = text.split(separator: "\n").first, let child = Int32(line), child > 1,
-              getpgid(child) == child else { return nil }
-        return child
+        process = nil
+        activePath = nil
+        claudeRunning = false
+        if runtimeDrain == nil { runtimeIdentity = nil }
     }
     func appendLog(_ text: String) {
         diagnostics.record("event", text)
@@ -975,13 +1111,9 @@ final class GuardModel: ObservableObject {
     }
     func shutdown() {
         stop()
-        // On app exit the background grace-killer dies with the process, so
-        // finish any graceful drain synchronously here: bounded wait, final
-        // kills, and the runtime-app sweep the queued callback cannot run.
-        // No runtime process may outlive Guard uncontained.
         if let pending = runtimeDrain {
-            let deadline = Date().addingTimeInterval(2.5)
-            while pending.process.isRunning, Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+            while ProcessInfo.processInfo.systemUptime < pending.deadline,
+                  signaler.matchesLeader(pending.identity) { Thread.sleep(forTimeInterval: 0.1) }
             escalateDrain(pending)
         }
     }
@@ -1006,7 +1138,7 @@ private final class PathSnapshotState: @unchecked Sendable {
 private struct Surface<Content: View>: View {
     @ViewBuilder let content: Content
     var body: some View {
-        content.padding(20).frame(maxWidth: .infinity, alignment: .leading)
+        content.padding(16).frame(maxWidth: .infinity, alignment: .leading)
             .background(GuardPalette.surface)
             .clipShape(RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(GuardPalette.border))
@@ -1039,48 +1171,70 @@ private func confirmResetIPDialog() -> Bool {
 struct GuardView: View {
     @ObservedObject var model: GuardModel
     @StateObject private var presentation = GuardPresentation()
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @Environment(\.guardReduceMotionOverride) private var reduceMotionOverride
+    private var reduceMotion: Bool { reduceMotionOverride ?? systemReduceMotion }
     private var statusColor: Color {
         if model.requiresRestart { return GuardPalette.danger }
         if model.allowed { return GuardPalette.accent }
-        if model.busy || model.monitoring { return GuardPalette.warning }
+        if model.busy || model.monitoring || model.processState == .frozen { return GuardPalette.warning }
         return GuardPalette.secondary
     }
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack(spacing: 14) {
-                    Image(systemName: "network.badge.shield.half.filled")
-                        .font(.system(size: 32, weight: .medium)).foregroundStyle(GuardPalette.accent)
-                        .frame(width: 58, height: 58).background(GuardPalette.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 17))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Claude Proxy Guard").font(.system(size: 25, weight: .semibold, design: .rounded))
-                        Text("Проверка IP перед запуском Claude").font(.system(size: 13)).foregroundStyle(GuardPalette.secondary)
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "network.badge.shield.half.filled")
+                            .font(.system(size: 24, weight: .medium)).foregroundStyle(GuardPalette.accent)
+                            .frame(width: 40, height: 40).background(GuardPalette.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+                        Text("Claude Proxy Guard").font(.system(size: 19, weight: .semibold, design: .rounded))
+                        Spacer()
+                        Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.8"))
+                            .font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
                     }
-                    Spacer()
-                    Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.8")).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
+                    Text("Проверка IP перед запуском Claude").font(.system(size: 12)).foregroundStyle(GuardPalette.secondary)
                 }
                 Surface {
-                    VStack(alignment: .leading, spacing: 14) {
-                        HStack(spacing: 9) {
-                            Circle().fill(statusColor).frame(width: 8, height: 8)
-                            Text(model.phase).font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(model.requiresRestart ? GuardPalette.danger : GuardPalette.text)
-                                .accessibilityAddTraits(.updatesFrequently)
-                            Spacer()
-                            if model.busy { ProgressView().controlSize(.small) }
-                        }
-                        if let report = model.report {
-                            HStack(alignment: .firstTextBaseline, spacing: 16) {
-                                Text(report.ip).font(.system(size: 25, weight: .medium, design: .monospaced)).textSelection(.enabled)
-                                Text("\(report.country) · \(report.countryCode)").font(.system(size: 13)).foregroundStyle(GuardPalette.secondary)
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(spacing: 12) {
+                            ZStack {
+                                Circle().fill(statusColor.opacity(0.12)).frame(width: 56, height: 56)
+                                Circle().stroke(statusColor, lineWidth: 1).frame(width: 56, height: 56)
+                                Image(systemName: model.processState == .frozen ? "pause.circle" : "checkmark.shield")
+                                    .font(.system(size: 25, weight: .medium)).foregroundStyle(statusColor)
                             }
-                        } else { Text("Внешний IP ещё не проверен").font(.system(size: 15, weight: .medium)).foregroundStyle(GuardPalette.secondary) }
+                            Text(model.phase).font(.system(size: 20, weight: .semibold))
+                                .foregroundStyle(model.requiresRestart ? GuardPalette.danger : GuardPalette.text)
+                                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                                .accessibilityAddTraits(.updatesFrequently)
+                            if model.busy {
+                                if reduceMotion {
+                                    Image(systemName: "hourglass").foregroundStyle(GuardPalette.secondary)
+                                        .accessibilityLabel("Проверка выполняется")
+                                } else { ProgressView().controlSize(.small) }
+                            }
+                            if let report = model.report {
+                                Text("\(report.country) · \(report.countryCode)").font(.system(size: 13, weight: .medium)).foregroundStyle(GuardPalette.secondary)
+                                Text(report.ip).font(.system(size: 19, weight: .medium, design: .monospaced)).textSelection(.enabled)
+                            } else { Text("Внешний IP ещё не проверен").font(.system(size: 13)).foregroundStyle(GuardPalette.secondary) }
+                            Label("Процесс: \(model.processState.title)", systemImage: model.processState == .running ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 12, weight: .semibold)).foregroundStyle(model.processState == .running ? GuardPalette.accent : statusColor)
+                                .accessibilityLabel("Состояние процесса Claude: \(model.processState.title)")
+                            if let remaining = model.freezeRemaining {
+                                Text(String(format: "00:%02d", remaining)).font(.system(size: 32, weight: .semibold, design: .monospaced))
+                                    .accessibilityLabel("До завершения Claude осталось \(remaining) секунд")
+                                    .accessibilityAddTraits(.updatesFrequently)
+                                ProgressView(value: Double(remaining), total: FreezeWindow.duration)
+                                    .progressViewStyle(.linear).frame(maxWidth: 240)
+                            }
+                        }.frame(maxWidth: .infinity)
                         Text(model.detail).font(.system(size: 12)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                             .accessibilityAddTraits(.updatesFrequently)
                         if model.requiresRestart {
                             Label("Нажмите «Перезапустить Guard» — пароль прокси нужно будет ввести снова.", systemImage: "exclamationmark.triangle.fill")
                                 .font(.system(size: 13, weight: .semibold)).foregroundStyle(GuardPalette.danger)
-                                .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(12).frame(maxWidth: .infinity, alignment: .leading)
                                 .background(GuardPalette.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                         }
                         if let previous = model.previousStop, !model.monitoring {
@@ -1090,7 +1244,7 @@ struct GuardView: View {
                             Text("Следующая проверка в \(next.formatted(date: .omitted, time: .standard))")
                                 .font(.system(size: 11, design: .monospaced)).foregroundStyle(GuardPalette.secondary)
                         }
-                        HStack(spacing: 8) {
+                        VStack(spacing: 8) {
                             Button { presentation.lastAction = "Запуск: запрос отправлен"; model.check(andLaunch: true) } label: {
                                 Label("Запустить", systemImage: "play")
                             }.buttonStyle(GuardActionStyle(primary: !model.claudeRunning && !model.busy && !model.requiresRestart))
@@ -1113,9 +1267,8 @@ struct GuardView: View {
                             .foregroundStyle(presentation.lastAction == model.operationFailure ? GuardPalette.danger : GuardPalette.secondary)
                             .accessibilityLabel("Последнее действие: \(presentation.lastAction)")
                             .accessibilityAddTraits(.updatesFrequently)
-                        HStack {
+                        VStack(alignment: .leading, spacing: 8) {
                             Label("Системная служба не используется", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(GuardPalette.secondary)
-                            Spacer()
                             Button("Показать файл журнала") { model.showLog = true; model.showDiagnostics() }.keyboardShortcut("l", modifiers: .command)
                         }
                     }
@@ -1148,7 +1301,7 @@ struct GuardView: View {
                                 field("Хост", placeholder: "127.0.0.1", value: $model.host)
                                 field("Порт", placeholder: "1080", value: $model.port).frame(width: 95)
                             }
-                            HStack(alignment: .top, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 12) {
                                 field("Логин, если нужен", placeholder: "Необязательно", value: $model.username)
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text("Пароль").font(.system(size: 11)).foregroundStyle(GuardPalette.secondary)
@@ -1197,13 +1350,13 @@ struct GuardView: View {
                 Surface {
                     VStack(alignment: .leading, spacing: 13) {
                         Text("Профиль Claude").font(.system(size: 15, weight: .semibold))
-                        HStack {
+                        VStack(alignment: .leading, spacing: 8) {
                             Picker("Часовой пояс", selection: $model.timezone) {
                                 ForEach(LaunchProfile.timezones, id: \.self) { Text($0).tag($0) }
                             }
                             Picker("Язык", selection: $model.language) {
                                 ForEach(LaunchProfile.languages, id: \.self) { Text($0).tag($0) }
-                            }.frame(width: 160)
+                            }
                         }
                         Label("Проверка профиля страницы и перехват включены", systemImage: "checkmark.shield").font(.system(size: 12))
                         Toggle("Показывать содержимое запросов и ответов", isOn: $model.captureBodies)
@@ -1218,7 +1371,7 @@ struct GuardView: View {
                         HStack {
                             Text("Claude Desktop").font(.system(size: 15, weight: .semibold))
                             Spacer()
-                            if model.claudeRunning { Label("Запущен", systemImage: "checkmark.circle.fill").foregroundStyle(GuardPalette.accent).font(.system(size: 11)) }
+                            if model.claudeRunning { Label(model.processState.title, systemImage: "checkmark.circle.fill").foregroundStyle(statusColor).font(.system(size: 11)) }
                         }
                         Text(model.runtimeStatus).font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                         HStack {
@@ -1239,9 +1392,8 @@ struct GuardView: View {
                 }
                 Surface {
                     VStack(alignment: .leading, spacing: 10) {
-                        HStack {
+                        VStack(alignment: .leading, spacing: 8) {
                             Text("Обновления Guard").font(.system(size: 15, weight: .semibold))
-                            Spacer()
                             Button("Проверить обновления…") { model.checkForUpdates?() }
                                 .disabled(model.restarting || model.checkForUpdates == nil)
                         }
@@ -1255,7 +1407,7 @@ struct GuardView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Label(model.networkBarrier && model.barrierActive ? "Системный kill switch активен" : "Упрощённая защита — системный барьер не активен", systemImage: model.networkBarrier && model.barrierActive ? "checkmark.shield" : "info.circle")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(model.networkBarrier && model.barrierActive ? GuardPalette.accent : GuardPalette.warning)
-                    Text("Начальная страна: ipwho.is; повторный IP: ipify. Подтверждённый новый IP завершает сессию. Ошибка проверки, смена маршрута или сон приостанавливают трафик; прежний подтверждённый IP восстанавливает доступ без перезапуска Claude. Публичный IP нельзя проверить локально за NAT. Активный барьер ограничивает весь процесс Claude локальным шлюзом; без него native, MCP и Cowork могут обходить прокси; CDP видит только доступные веб-контексты.")
+                    Text("Начальная страна: ipwho.is; повторный IP: ipify. Подтверждённый новый IP завершает сессию. Временная ошибка закрывает потоки и замораживает Claude максимум на 20 секунд; полная проверка прежнего IP возобновляет работу, а новые потоки открываются заново. Публичный IP нельзя проверить локально за NAT. Активный барьер ограничивает весь процесс Claude локальным шлюзом; без него native, MCP и Cowork могут обходить прокси; CDP видит только доступные веб-контексты.")
                         .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     DisclosureGroup("Журнал проверок", isExpanded: $model.showLog) {
                         VStack(alignment: .leading, spacing: 6) {
@@ -1265,9 +1417,9 @@ struct GuardView: View {
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
                     }.font(.system(size: 11)).padding(.top, 5)
                 }.padding(.horizontal, 4)
-            }.padding(28)
+            }.padding(16)
         }
-        .frame(minWidth: 620, idealWidth: 720, minHeight: 620, idealHeight: 900)
+        .frame(minWidth: 320, idealWidth: 400, maxWidth: 420, minHeight: 560, idealHeight: 820)
         .background(GuardPalette.background)
         .foregroundStyle(GuardPalette.text)
         .tint(GuardPalette.accent)
@@ -1277,6 +1429,9 @@ struct GuardView: View {
         }
         .onChange(of: model.requiresRestart) { blocked in
             if blocked && model.operationFailure == nil { Self.announce("Сессия закрыта. \(model.phase). Требуется перезапуск Guard.") }
+        }
+        .onChange(of: model.processState) { state in
+            if state == .frozen || state == .draining { Self.announce("Процесс Claude: \(state.title). \(model.detail)") }
         }
     }
 
@@ -1322,9 +1477,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onRestart = { [weak self] in self?.restartApplication() }
         model.canRestartGuard = { [weak self] in self?.updateController?.canRestartGuard ?? true }
         model.checkForUpdates = { [weak self] in self?.updateController?.checkForUpdates() }
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 850),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 820),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Claude Proxy Guard"
+        window.contentMinSize = NSSize(width: 320, height: 560)
+        window.contentMaxSize = NSSize(width: 420, height: CGFloat.greatestFiniteMagnitude)
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: GuardView(model: model))
         window.center(); showWindow()

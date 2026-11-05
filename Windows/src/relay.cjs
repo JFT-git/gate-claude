@@ -271,7 +271,11 @@ async function boundLookup(host, family, pin) {
       const address = match ? match[1] : server, port = match?.[2] ? Number(match[2]) : 53, transport = net.isIP(address);
       if (!transport || !pin['v' + transport] || mappedIPv4(address)) continue;
       return await new Promise((resolve, reject) => {
-        const socket = require('node:dgram').createSocket(transport === 4 ? 'udp4' : 'udp6');
+        const literalLookup = (name, options, callback) => {
+          if (name !== address) { callback(Error('Запрещён системный DNS вне закреплённого адреса.')); return; }
+          callback(null, address, transport);
+        };
+        const socket = require('node:dgram').createSocket({ type: transport === 4 ? 'udp4' : 'udp6', lookup: literalLookup });
         const id = randomBytes(2).readUInt16BE(), header = Buffer.alloc(12); header.writeUInt16BE(id); header.writeUInt16BE(0x100, 2); header.writeUInt16BE(1, 4);
         const tail = Buffer.from([0, 0, family === 4 ? 1 : 28, 0, 1]);
         const query = Buffer.concat([header, ...labels.map(x => Buffer.concat([Buffer.from([x.length]), Buffer.from(x)])), tail]);

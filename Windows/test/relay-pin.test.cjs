@@ -50,9 +50,9 @@ test('DNS timeout closes CONNECT without system lookup fallback', { timeout: 750
   const server = await dnsServer(t, () => {});
   pin(t, { v4: '127.0.0.1', v6: null, dnsServers: [server] });
   const relay = new NetworkRelay(); await relay.start(); t.after(() => relay.close()); relay.pinIPFamily(4); relay.unlock();
-  const dns = require('node:dns'), original = dns.lookup; let fallbacks = 0;
-  dns.lookup = () => { fallbacks++; throw Error('Unexpected system DNS'); }; t.after(() => { dns.lookup = original; });
-  await assert.rejects(connectTunnel(relay.port, 'timeout.invalid', 443)); assert.equal(fallbacks, 0);
+  const dns = require('node:dns'), original = dns.lookup; let fallbacks = 0; const stacks = [];
+  dns.lookup = () => { fallbacks++; stacks.push(new Error('Unexpected system DNS').stack); throw Error('Unexpected system DNS'); }; t.after(() => { dns.lookup = original; });
+  await assert.rejects(connectTunnel(relay.port, 'timeout.invalid', 443)); assert.equal(fallbacks, 0, stacks.join('\n'));
 });
 
 test('loopback control connections do not become egress pins', async t => {

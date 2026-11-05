@@ -192,7 +192,9 @@ if (process.platform === 'win32') app.setAppUserModelId('local.proxyguard.claude
   const guard = networkGuard ? `\n{const guardModule={exports:{}};(function(require,module){\n${networkGuard}\n})(require,guardModule);const installedGuard=guardModule.exports.installNetworkGuard(cfg);if(cfg.code){${managed}}}\n` : '';
   return Buffer.from(base.replace(original, replacement + guard)
     .replace(commandAnchor, runtimeDeepLinkSource() + commandAnchor + `
-  if (!m.sessionId && m.method === 'ProxyGuard.openDeepLink') {
+  if (!m.sessionId && m.method === 'Browser.close') {
+    result = {}; setImmediate(() => app.quit());
+  } else if (!m.sessionId && m.method === 'ProxyGuard.openDeepLink') {
     const response = await guardForwardDeepLink(m.params?.url, { app, profileReady: guardProfileReady, userData: cfg.userData, executable: process.execPath, cwd: path.dirname(process.execPath) });
     emit({ id: m.id, result: response }); return;
   }`)

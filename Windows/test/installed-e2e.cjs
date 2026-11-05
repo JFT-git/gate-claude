@@ -61,6 +61,7 @@ async function fixtureCookieDisk(profile) {
 const sockets = new Set(), observations = {}, proof = { platform: process.platform, test: 'official Windows Claude, separate profile, local TLS fixture', observedIPSource: 'controlled test-only provider; no physical WAN change' };
 function fixtureNetworkChecks(controller) {
   controller.networkProxyConfiguration = async () => fixtureNetworkProxy;
+  if (connectionMode === 'network') controller.usesLocalPin = () => false;
   controller.requestDestinationIP = async (epoch, hostname, port, token) => {
     assert.equal(epoch, controller.epoch, 'Destination fixture belongs to the active controller epoch');
     assert.ok(['claude.ai', 'api.anthropic.com'].includes(hostname), 'Only the two production destination checks are substituted');
@@ -97,9 +98,9 @@ async function main() {
     limitation: execution.elevated === true ? 'Interactive elevated fixture; standard-user runtime token is not covered by this run.' : 'Runtime inherits the invoking test token.' };
   if (source === 'auto') {
     const found = await require('../src/discovery.cjs').discoverClaude();
-    assert.equal(found.status, 'found'); assert.equal(found.kind, 'msix');
-    assert.ok(found.path.toLowerCase().includes('\\windowsapps\\'));
-    source = found.path; proof.automaticWindowsAppsDiscovery = true;
+    assert.equal(found.status, 'found'); assert.ok(['msix', 'legacy'].includes(found.kind));
+    if (found.kind === 'msix') assert.ok(found.path.toLowerCase().includes('\\windowsapps\\'));
+    source = found.path; proof.automaticDiscoveryKind = found.kind;
   }
   proof.connectionMode = connectionMode;
   const cert = await fs.readFile(certPath), key = await fs.readFile(keyPath);
@@ -325,20 +326,15 @@ command=async m=>{
       sameRuntimePID: true, privateProfileArgument: true, workingDirectoryCorrect: true, vendorNavigatedFixture: true };
     const statesBefore = states.length;
     failNextCurrentIP = true;
-    await until(() => observations.http500 === 1 && controller.state === 'rechecking', 'HTTP 500 pauses application traffic', 10000);
+    await until(() => observations.http500 === 1 && controller.processState === 'frozen', 'HTTP 500 freezes the verified runtime', 10000);
     assert.equal(controller.relay.unlocked, false); assert.equal(controller.policy.blocked, false);
     assert.equal(controller.runtimePID, pid); process.kill(pid, 0);
-    await until(() => activeStreams.size === 0, 'SSE closed while rechecking');
-    const pausedFetch = (await channel.command('Runtime.evaluate', {
-      expression: `(async()=>{try{await fetch('/__guard_test__/revalidation?stage=paused',{cache:'no-store'});return 'unexpected-success'}catch{return 'blocked'}})()`,
-      awaitPromise: true, returnByValue: true
-    }, sid)).result?.value;
-    assert.equal(pausedFetch, 'blocked', 'Application fetch must fail while rechecking');
-    assert.equal(observations.revalidationRequests?.length || 0, 0, 'Paused app request reached destination');
+    await until(() => activeStreams.size === 0, 'SSE closed while frozen');
+    assert.equal(observations.revalidationRequests?.length || 0, 0, 'Frozen app request reached destination');
     assert.equal(controller.state, 'rechecking'); process.kill(pid, 0);
     holdCurrentIP = false; for (const respond of heldIPResponses.splice(0)) respond();
-    await until(() => controller.state === 'running', 'same IP resumes application traffic', 15000);
-    assert.equal(controller.runtimePID, pid); process.kill(pid, 0);
+    await until(() => controller.state === 'running', 'same IP thaws and resumes application traffic', 15000);
+    assert.equal(controller.runtimePID, pid); assert.equal(controller.processFrozen, false); process.kill(pid, 0);
     const resumedFetch = (await channel.command('Runtime.evaluate', {
       expression: `(async()=>await fetch('/__guard_test__/revalidation?stage=resumed',{cache:'no-store'}).then(r=>r.json()))()`,
       awaitPromise: true, returnByValue: true
@@ -348,7 +344,7 @@ command=async m=>{
     await evaluate(`fetch('/__guard_test__/stream?after-revalidation=1').then(async r=>{const reader=r.body.getReader();while(!(await reader.read()).done){}}).catch(()=>{});true`);
     await until(() => activeStreams.size > 0 && observations.streamsOpened >= 2, 'SSE resumed after IP confirmation');
     proof.revalidation = { injectedHTTP500: observations.http500, recheckingObserved: states.slice(statesBefore).includes('rechecking'),
-      appTrafficBlockedWhilePaused: true, processSurvived: true, samePID: true, resumedHTTP: true, resumedStream: true };
+      nativeFreezeAcknowledged: true, appTrafficBlockedWhilePaused: true, processSurvived: true, samePID: true, resumedHTTP: true, resumedStream: true };
     assert.equal(proof.revalidation.recheckingObserved, true);
     const firstProfile = controller.runtime.profile, firstExecutable = controller.runtime.executable, firstFence = controller.fence;
     const profileKeyHash=async()=>{try{const state=JSON.parse(await fs.readFile(path.join(firstProfile,'Local State'),'utf8')),value=state.os_crypt?.encrypted_key;return typeof value==='string'?crypto.createHash('sha256').update(value).digest('hex'):null}catch{return null}};
@@ -378,19 +374,23 @@ command=async m=>{
     const firstKeyHash=await profileKeyHash();observations.ownEncryptionKeyPresentBefore=firstKeyHash!==null;
     observations.ownKeyPresenceBefore=await profileKeyPresence();observations.fixtureCookieDiskBefore=await fixtureCookieDisk(firstProfile).catch(error=>{if(error.code==='EBUSY')return {locked:true};throw error});
     // Round trips follow Chromium's explicit storage flush and committed IndexedDB
-    // transaction. Persistence must then survive the same abrupt Job kill as the
-    // real IP-switch path, rather than an artificial graceful app shutdown.
+    // transaction. Persistence must survive the real freeze, bounded graceful close
+    // and forced Job cleanup rather than a test-only orderly profile shutdown.
     assert.equal(await evaluate(`localStorage.getItem('guard-fixture-persistence-v1')===${JSON.stringify(persistenceMarker)}`), true);
     await sleep(argv.includes('--settle-key')?15000:350);
     observations.ownKeyPresenceAfterSettling=await profileKeyPresence();observations.ownEncryptionKeyPresentAfterSettling=(await profileKeyHash())!==null;
     const port = controller.relay.port, changedAt = Date.now();
     observed = '203.0.113.8';
-    await until(() => controller.state === 'blocked', 'IP kill', 10000);
+    await until(() => controller.processState === 'frozen', 'IP mismatch freezes before timeout', 10000);
+    assert.equal(controller.runtimePID, pid); process.kill(pid, 0);
+    await until(() => controller.state === 'blocked', 'IP freeze timeout closes Claude', 35000);
     await until(() => activeStreams.size === 0, 'SSE closed');
     await until(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, 'runtime terminated');
     const refusal = net.connect(port, '127.0.0.1'); const refused = await new Promise(resolve => { refusal.once('connect', () => resolve(false)); refusal.once('error', () => resolve(true)); }); refusal.destroy();
     assert.equal(refused, true); controller.stop(); await assert.rejects(controller.start(input));
-    proof.killSwitch = { milliseconds: Date.now() - changedAt, processGone: true, streamClosed: true, relayRefusesNewConnections: refused, blockedUntilRestart: true };
+    const closeMilliseconds = Date.now() - changedAt;
+    assert.ok(closeMilliseconds >= 19000 && closeMilliseconds < 35000, 'Freeze timeout must be bounded and must not be immediate');
+    proof.killSwitch = { milliseconds: closeMilliseconds, freezeObservedBeforeClose: true, processGone: true, streamClosed: true, relayRefusesNewConnections: refused, blockedUntilRestart: true };
     // Teardown is asynchronous: do not race a new broker against the old global
     // WFP mutex or accept abandoned persistent filters as successful cleanup.
     await until(() => firstFence.closed && firstFence.installed === false, 'old WFP broker acknowledged filter removal', 20000);

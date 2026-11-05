@@ -6,6 +6,12 @@ mkdir -p .build
 [ -f .build/BarrierIntegrity.swift ] || \
   printf '// Test stub - do not edit.\nenum BarrierIntegrity { static let guardDropSHA256 = "stub" }\n' > .build/BarrierIntegrity.swift
 [ -d .build/Sparkle-2.10.1/Sparkle.framework ] || bash build.sh
+[ -x .build/GuardHostTest ] || xcrun clang -O2 Source/GuardHost.c -o .build/GuardHostTest
+xcrun clang -O2 Tests/FreezeFixture.c -o .build/FreezeFixture
+xcrun swiftc -swift-version 5 -parse-as-library \
+  -target "$(uname -m)-apple-macosx13.0" -module-cache-path "${TMPDIR:-/tmp}/claude-proxyguard-tests" \
+  -framework Network Source/Core.swift Source/Policy.swift Source/ProcessFreeze.swift Tests/ProcessFreezeTests.swift -o .build/ProcessFreezeTests
+.build/ProcessFreezeTests "$PWD/.build/GuardHostTest" "$PWD/.build/FreezeFixture"
 xcrun swiftc -swift-version 5 -D PREVIEW -D GUARD_E2E -parse-as-library \
   -target "$(uname -m)-apple-macosx13.0" -module-cache-path "${TMPDIR:-/tmp}/claude-proxyguard-tests" \
   -F "$PWD/.build/Sparkle-2.10.1" -framework SwiftUI -framework AppKit -framework Network -framework Sparkle \

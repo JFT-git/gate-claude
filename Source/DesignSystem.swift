@@ -11,17 +11,17 @@ enum GuardPalette {
                            blue: CGFloat(hex & 255) / 255, alpha: 1)
         }))
     }
-    static let background = adaptive(0x0f1817, 0xf4f7f5)
-    static let surface = adaptive(0x142120, 0xffffff)
-    static let raised = adaptive(0x1a2a27, 0xeef3f0)
-    static let border = adaptive(0x354b42, 0xc3d2c9)
-    static let text = adaptive(0xe3ede9, 0x12211a)
-    static let secondary = adaptive(0xb9cbc3, 0x33473e)
-    static let muted = adaptive(0x9bb3a8, 0x4d635a)
-    static let accent = adaptive(0x9fe3bb, 0x1f7a4d)
-    static let onAccent = adaptive(0x0f2a1c, 0xffffff)
-    static let warning = adaptive(0xe6c46f, 0x8a6d1f)
-    static let danger = adaptive(0xf0a084, 0xb3261e)
+    static let background = adaptive(0x131715, 0xf4f5f2)
+    static let surface = adaptive(0x1b201d, 0xffffff)
+    static let raised = adaptive(0x212723, 0xf7f8f5)
+    static let border = adaptive(0x333b36, 0xd9dcd5)
+    static let text = adaptive(0xe8ece9, 0x1d2420)
+    static let secondary = adaptive(0xa2ada6, 0x59635d)
+    static let muted = adaptive(0x8f9b94, 0x59635d)
+    static let accent = adaptive(0x5cc4a6, 0x1f6f5c)
+    static let onAccent = adaptive(0x0d1a15, 0xffffff)
+    static let warning = adaptive(0xe6bd6a, 0x86570a)
+    static let danger = adaptive(0xf0988f, 0xa1342b)
 }
 
 
@@ -38,6 +38,17 @@ struct GuardActionStyle: ButtonStyle {
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(enabled && primary ? Color.clear : GuardPalette.border))
             .contentShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct GuardReduceMotionKey: EnvironmentKey {
+    static let defaultValue: Bool? = nil
+}
+
+extension EnvironmentValues {
+    var guardReduceMotionOverride: Bool? {
+        get { self[GuardReduceMotionKey.self] }
+        set { self[GuardReduceMotionKey.self] = newValue }
     }
 }
 

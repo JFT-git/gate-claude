@@ -32,6 +32,17 @@ import Darwin
             queue.asyncAfter(deadline: .now() + 2) { finish(true) }
         }
     }
+    static func processState(_ pid: Int32) throws -> String {
+        let process = Process(), output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-o", "stat=", "-p", String(pid)]
+        process.standardOutput = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw GuardError.message("Не удалось проверить состояние процесса Claude.") }
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     @MainActor static func main() async {
         signal(SIGPIPE, SIG_IGN)
         let args = CommandLine.arguments
@@ -43,15 +54,35 @@ import Darwin
             return
         }
         _ = NSApplication.shared
-        guard args.count == 7, let socksPort = UInt16(args[2]) else { exit(2) }
+        if args.count == 4, args[1] == "--recover-frozen" {
+            let root = URL(fileURLWithPath: args[2]), proofURL = URL(fileURLWithPath: args[3])
+            guard let data = try? Data(contentsOf: proofURL),
+                  let proof = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let pgid = (proof["pgid"] as? NSNumber)?.int32Value else { exit(2) }
+            let model = GuardModel(diagnosticsURL: root.appendingPathComponent("guard-diagnostics.jsonl"))
+            model.e2eRuntimeRoot = root.appendingPathComponent("Cache")
+            let processGroupGone = await wait(5) { kill(-pgid, 0) != 0 && errno == ESRCH }
+            let recordRemoved = !FileManager.default.fileExists(atPath: root.appendingPathComponent("runtime-crash.json").path)
+            let result = processGroupGone && recordRemoved
+            let recovered: [String: Any] = ["result": result ? "PASS" : "FAIL", "processGroupGone": processGroupGone,
+                                            "crashRecordRemoved": recordRemoved, "pgid": pgid]
+            try? JSONSerialization.data(withJSONObject: recovered, options: [.prettyPrinted, .sortedKeys]).write(to: proofURL, options: .atomic)
+            if !result { exit(1) }
+            print("PASS new Guard cleaned the installed runtime after crash-while-frozen")
+            return
+        }
+        guard (args.count == 7 || args.count == 8 && args[7] == "--freeze-crash"), let socksPort = UInt16(args[2]) else { exit(2) }
         let root = URL(fileURLWithPath: args[1])
         let model = GuardModel(diagnosticsURL: root.appendingPathComponent("guard-diagnostics.jsonl"))
-        var observedIP = "203.0.113.7"
+        var observedIP = "203.0.113.7", failNextCheck = false
         model.useProxy = true; model.host = "127.0.0.1"; model.port = String(socksPort)
         model.username = ""; model.password = ""; model.interval = 2; model.watchPublicIP = true
         model.timezone = "Europe/Amsterdam"; model.language = "en-US"; model.captureBodies = true
         model.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "Нидерланды", date: Date()) }
-        model.e2ePublicCheck = { _ in observedIP }
+        model.e2ePublicCheck = { _ in
+            if failNextCheck { failNextCheck = false; throw GuardError.message("controlled transient installed-runtime failure") }
+            return observedIP
+        }
         model.e2eRuntimeRoot = root.appendingPathComponent("Cache")
         model.e2eBootstrapURL = URL(fileURLWithPath: args[3])
         model.e2eSandboxURL = URL(fileURLWithPath: args[4])
@@ -134,18 +165,42 @@ import Darwin
                 throw GuardError.message("HTTPS stream did not stay open: \(stream)")
             }
             print("PASS long-lived HTTPS stream opened in Claude renderer")
+            failNextCheck = true; model.e2eVerifyNow()
+            let frozen = await wait(8) { model.processState == .frozen && !model.allowed }
+            let frozenState = try processState(processID)
+            guard frozen, model.e2eProcessID == processID, model.claudeRunning, frozenState.contains("T") else {
+                throw GuardError.message("Installed Claude did not enter SIGSTOP: frozen=\(frozen), state=\(frozenState), \(model.detail)")
+            }
+            if args.count == 8 {
+                guard let identity = model.e2eRuntimeIdentity else { throw GuardError.message("Frozen runtime identity is missing") }
+                proof["result"] = "FROZEN"; proof["pid"] = processID; proof["pgid"] = identity.pgid
+                proof["frozenState"] = frozenState
+                try JSONSerialization.data(withJSONObject: proof, options: [.prettyPrinted, .sortedKeys]).write(to: URL(fileURLWithPath: args[6]), options: .atomic)
+                kill(getpid(), SIGKILL)
+            }
+            let resumed = await wait(10) { model.allowed && model.processState == .running }
+            let resumedState = try processState(processID)
+            guard resumed, model.e2eProcessID == processID, !resumedState.contains("T") else {
+                throw GuardError.message("Installed Claude did not resume with the same PID: \(resumedState), \(model.detail)")
+            }
+            proof["freezeRecovery"] = ["samePID": processID, "frozenState": frozenState, "resumedState": resumedState]
+            print("PASS installed Claude SIGSTOP/SIGCONT resumed with PID \(processID)")
+
             let changed = Date(); observedIP = "203.0.113.8"
-            let blocked = await wait(6) { model.requiresRestart && !model.claudeRunning && !model.monitoring && !model.allowed }
+            let mismatchFrozen = await wait(8) { model.processState == .frozen && !model.allowed }
+            guard mismatchFrozen, model.e2eProcessID == processID else { throw GuardError.message("IP mismatch did not freeze Claude: \(model.detail)") }
+            let blocked = await wait(30) { model.requiresRestart && !model.claudeRunning && !model.monitoring && !model.allowed }
             let elapsed = Int(Date().timeIntervalSince(changed) * 1000)
-            let processGone = await wait(2) { kill(processID, 0) != 0 && errno == ESRCH }
+            let processGone = await wait(7) { kill(processID, 0) != 0 && errno == ESRCH }
             let portClosed = await refusesConnection(relayPort)
-            guard blocked, processGone, portClosed else {
-                throw GuardError.message("Kill switch failed: blocked=\(blocked), processGone=\(processGone), portClosed=\(portClosed)")
+            guard blocked, processGone, portClosed, elapsed >= 19000 else {
+                throw GuardError.message("Freeze timeout failed: blocked=\(blocked), processGone=\(processGone), portClosed=\(portClosed), elapsed=\(elapsed)")
             }
             model.stop(); model.check(andLaunch: true)
             guard model.requiresRestart, !model.claudeRunning else { throw GuardError.message("Restart latch was bypassed") }
             proof["killSwitch"] = ["from": "203.0.113.7", "to": observedIP, "blockedUntilRestart": true,
-                                   "processGone": processGone, "relayRefusesNewConnections": portClosed, "milliseconds": elapsed]
+                                   "freezeObservedBeforeClose": mismatchFrozen, "processGone": processGone,
+                                   "relayRefusesNewConnections": portClosed, "milliseconds": elapsed]
             let restartProof = root.appendingPathComponent("restart-proof.json")
             var restartChild: Process?
             var restartCount = 0

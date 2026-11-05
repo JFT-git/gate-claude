@@ -60,14 +60,37 @@ class Channel extends EventEmitter {
       this.once('connected', success).once('fatal', failure);
     });
   }
+  setFrozen(frozen) {
+    const next = frozen === true;
+    if (next === this.frozen) return;
+    this.frozen = next;
+    const now = performance.now();
+    for (const [id, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      if (next) entry.remaining = Math.max(0, entry.remaining - (now - entry.started));
+      else {
+        entry.started = now;
+        entry.timer = this.commandTimeout(id, entry.method, entry.remaining);
+      }
+    }
+    this.emit('freeze', next);
+  }
+  commandTimeout(id, method, delay) {
+    return setTimeout(() => {
+      const entry = this.pending.get(id);
+      if (!entry || this.frozen) return;
+      this.pending.delete(id); entry.reject(Error('CDP timeout: ' + method));
+    }, delay);
+  }
   command(method, params = {}, sessionId) {
     if (this.closed || !this.socket) return Promise.reject(Error('Канал диагностики закрыт.'));
     const id = ++this.nextID;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(Error('CDP timeout: ' + method)); }, 6000);
-      this.pending.set(id, { resolve, reject, timer });
+      const entry = { resolve, reject, method, remaining: 6000, started: performance.now(), timer: null };
+      this.pending.set(id, entry);
+      if (!this.frozen) entry.timer = this.commandTimeout(id, method, entry.remaining);
       this.socket.write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + '\0', error => {
-        if (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
+        if (error) { clearTimeout(entry.timer); this.pending.delete(id); reject(error); }
       });
     });
   }

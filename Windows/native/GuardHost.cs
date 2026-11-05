@@ -111,11 +111,42 @@ internal static class GuardHost {
     [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr attributes);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessInJob(IntPtr process,IntPtr job,out bool result);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcess(string executable,StringBuilder command,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string directory,ref STARTUPINFOEX startup,out PROCESS_INFORMATION info);
-    [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", EntryPoint="ResumeThread", SetLastError=true)] static extern uint NativeResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", EntryPoint="SuspendThread", SetLastError=true)] static extern uint NativeSuspendThread(IntPtr thread);
+    [DllImport("kernel32.dll", EntryPoint="OpenThread", SetLastError=true)] static extern IntPtr NativeOpenThread(uint access,bool inherit,uint tid);
+    [DllImport("kernel32.dll", EntryPoint="GetThreadTimes", SetLastError=true)] static extern bool NativeGetThreadTimes(IntPtr thread,out long created,out long exited,out long kernel,out long user);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags,uint pid);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool Thread32First(IntPtr snapshot,ref THREADENTRY32 entry);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool Thread32Next(IntPtr snapshot,ref THREADENTRY32 entry);
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
     [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr handle,uint code);
     [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr handle,out uint code);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job,int type,IntPtr info,int length,out int returned);
+    [DllImport("kernel32.dll", EntryPoint="OpenProcess", SetLastError=true)] static extern IntPtr NativeOpenProcess(uint access,bool inherit,uint pid);
+    static string nativeOperation = "";
+    static uint ResumeThread(IntPtr thread) { nativeOperation = "ResumeThread"; return NativeResumeThread(thread); }
+    static uint SuspendThread(IntPtr thread) { nativeOperation = "SuspendThread"; return NativeSuspendThread(thread); }
+    static IntPtr OpenThread(uint access,bool inherit,uint tid) { nativeOperation = "OpenThread"; return NativeOpenThread(access,inherit,tid); }
+    static bool GetThreadTimes(IntPtr thread,out long created,out long exited,out long kernel,out long user) {
+        nativeOperation = "GetThreadTimes"; return NativeGetThreadTimes(thread,out created,out exited,out kernel,out user);
+    }
+    static IntPtr OpenProcess(uint access,bool inherit,uint pid) { nativeOperation = "OpenProcess"; return NativeOpenProcess(access,inherit,pid); }
+    [StructLayout(LayoutKind.Sequential)] struct THREADENTRY32 {
+        public uint dwSize,cntUsage,th32ThreadID,th32OwnerProcessID;
+        public int tpBasePri,tpDeltaPri;
+        public uint dwFlags;
+    }
+    struct ThreadIdentity : IEquatable<ThreadIdentity> {
+        readonly uint pid,tid; readonly long created;
+        public uint ProcessId { get { return pid; } }
+        public uint ThreadId { get { return tid; } }
+        public long Created { get { return created; } }
+        public ThreadIdentity(uint process,uint thread,long start) { pid=process; tid=thread; created=start; }
+        public bool Equals(ThreadIdentity other) { return pid==other.pid && tid==other.tid && created==other.created; }
+        public override bool Equals(object other) { return other is ThreadIdentity && Equals((ThreadIdentity)other); }
+        public override int GetHashCode() { unchecked { return (((int)pid*397)^(int)tid)*397^created.GetHashCode(); } }
+    }
     static string Quote(string value) {
         var output = new StringBuilder("\""); int slashes = 0;
         foreach (char c in value) {
@@ -127,6 +158,141 @@ internal static class GuardHost {
         output.Append('\\',slashes*2); output.Append('"'); return output.ToString();
     }
     static void Check(bool value) { if (!value) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+    static uint[] JobProcessIds(IntPtr job) {
+        int capacity = 16;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            if (capacity < 1 || capacity > 4096) throw new InvalidOperationException("Too many processes in the owned job.");
+            int size = checked(8 + capacity * IntPtr.Size);
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try {
+                int returned;
+                bool ok = QueryInformationJobObject(job,3,buffer,size,out returned);
+                int error = Marshal.GetLastWin32Error();
+                if (!ok && error != 234) throw new Win32Exception(error);
+                uint assigned = unchecked((uint)Marshal.ReadInt32(buffer));
+                uint listed = unchecked((uint)Marshal.ReadInt32(buffer,4));
+                if (assigned > 4096 || listed > 4096) throw new InvalidOperationException("Too many processes in the owned job.");
+                if (!ok || assigned > listed) { capacity = checked(Math.Max(capacity * 2,(int)assigned + 8)); continue; }
+                if (returned < 8 || returned > size) throw new InvalidOperationException("Invalid job process list.");
+                var ids = new uint[listed]; int offset = 8;
+                for (int index = 0; index < ids.Length; index++,offset += IntPtr.Size)
+                    ids[index] = IntPtr.Size == 8 ? unchecked((uint)Marshal.ReadInt64(buffer,offset)) : unchecked((uint)Marshal.ReadInt32(buffer,offset));
+                return ids;
+            } finally { Marshal.FreeHGlobal(buffer); }
+        }
+        throw new InvalidOperationException("The job process list did not stabilize.");
+    }
+    static void VerifyProcessMembership(IntPtr job,uint pid) {
+        IntPtr process = OpenProcess(0x0800|0x1000,false,pid); Check(process != IntPtr.Zero);
+        try {
+            nativeOperation = "IsProcessInJob";
+            bool inJob; Check(IsProcessInJob(process,job,out inJob));
+            if (!inJob) throw new InvalidOperationException("A process left the owned job.");
+        } finally { CloseHandle(process); }
+    }
+    static bool TryThreadIdentity(uint pid,uint tid,out ThreadIdentity identity) {
+        identity = default(ThreadIdentity);
+        IntPtr thread = OpenThread(0x0002|0x0800,false,tid);
+        if (thread == IntPtr.Zero) {
+            int error = Marshal.GetLastWin32Error(); if (error == 87) return false; throw new Win32Exception(error);
+        }
+        long created,exited,kernel,user;
+        bool ok = GetThreadTimes(thread,out created,out exited,out kernel,out user);
+        int readError = Marshal.GetLastWin32Error(); CloseHandle(thread);
+        if (!ok) { if (readError == 87) return false; throw new Win32Exception(readError); }
+        identity = new ThreadIdentity(pid,tid,created); return true;
+    }
+    static IntPtr OpenVerifiedThread(ThreadIdentity identity) {
+        IntPtr thread = OpenThread(0x0002|0x0800,false,identity.ThreadId);
+        if (thread == IntPtr.Zero) {
+            int error = Marshal.GetLastWin32Error(); if (error == 87) return IntPtr.Zero; throw new Win32Exception(error);
+        }
+        long created,exited,kernel,user;
+        bool ok = GetThreadTimes(thread,out created,out exited,out kernel,out user);
+        int readError = Marshal.GetLastWin32Error();
+        if (!ok) { CloseHandle(thread); if (readError == 87) return IntPtr.Zero; throw new Win32Exception(readError); }
+        if (created != identity.Created) { CloseHandle(thread); return IntPtr.Zero; }
+        return thread;
+    }
+    static void ResumeThreadIdentity(ThreadIdentity identity) {
+        IntPtr thread = OpenVerifiedThread(identity); if (thread == IntPtr.Zero) return;
+        try {
+            if (ResumeThread(thread) == 0xffffffff) {
+                int error = Marshal.GetLastWin32Error(); if (error != 87) throw new Win32Exception(error);
+            }
+        } finally { CloseHandle(thread); }
+    }
+    static void SuspendNewThread(uint pid,uint tid,HashSet<ThreadIdentity> threads,List<ThreadIdentity> added) {
+        ThreadIdentity identity; if (!TryThreadIdentity(pid,tid,out identity) || threads.Contains(identity)) return;
+        IntPtr thread = OpenVerifiedThread(identity); if (thread == IntPtr.Zero) return;
+        try {
+            uint previous = SuspendThread(thread);
+            if (previous == 0xffffffff) {
+                int error = Marshal.GetLastWin32Error(); if (error == 87) return; throw new Win32Exception(error);
+            }
+            if (previous != 0) {
+                ResumeThread(thread);
+                throw new InvalidOperationException("A thread was already suspended by another owner.");
+            }
+            threads.Add(identity); added.Add(identity);
+        } finally { CloseHandle(thread); }
+    }
+    static void FreezeProcessThreads(uint pid,HashSet<ThreadIdentity> threads,List<ThreadIdentity> added) {
+        bool stable = false,sawThread = false;
+        for (int pass = 0; pass < 8 && !stable; pass++) {
+            int before = threads.Count;
+            nativeOperation = "ThreadSnapshot";
+            IntPtr snapshot = CreateToolhelp32Snapshot(0x4,0);
+            if (snapshot == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            try {
+                var entry = new THREADENTRY32(); entry.dwSize = (uint)Marshal.SizeOf(typeof(THREADENTRY32));
+                Check(Thread32First(snapshot,ref entry));
+                do {
+                    if (entry.th32OwnerProcessID != pid) continue;
+                    sawThread = true; SuspendNewThread(pid,entry.th32ThreadID,threads,added);
+                    entry.dwSize = (uint)Marshal.SizeOf(typeof(THREADENTRY32));
+                } while (Thread32Next(snapshot,ref entry));
+                int enumerationError = Marshal.GetLastWin32Error();
+                if (enumerationError != 18) throw new Win32Exception(enumerationError);
+            } finally { CloseHandle(snapshot); }
+            stable = threads.Count == before;
+        }
+        if (!sawThread) throw new InvalidOperationException("An owned process has no threads to freeze.");
+        if (!stable) throw new InvalidOperationException("The process thread list did not stabilize.");
+    }
+    static int FreezeProcesses(IntPtr job,HashSet<uint> frozen,HashSet<ThreadIdentity> threads) {
+        var added = new List<ThreadIdentity>();
+        try {
+            bool stable = false;
+            for (int pass = 0; pass < 8 && !stable; pass++) {
+                int beforeProcesses = frozen.Count,beforeThreads = threads.Count;
+                foreach (uint pid in JobProcessIds(job)) {
+                    VerifyProcessMembership(job,pid);
+                    FreezeProcessThreads(pid,threads,added);
+                    frozen.Add(pid);
+                }
+                stable = frozen.Count == beforeProcesses && threads.Count == beforeThreads;
+            }
+            if (frozen.Count == 0 || threads.Count == 0) throw new InvalidOperationException("The owned job has no processes to freeze.");
+            if (!stable) throw new InvalidOperationException("The job process tree did not stabilize.");
+            return frozen.Count;
+        } catch {
+            foreach (var identity in added) { try { ResumeThreadIdentity(identity); } catch {} threads.Remove(identity); }
+            throw;
+        }
+    }
+    static int ThawProcesses(IntPtr job,HashSet<uint> frozen,HashSet<ThreadIdentity> threads) {
+        if (frozen.Count == 0) return 0;
+        var identities = new ThreadIdentity[threads.Count]; threads.CopyTo(identities);
+        foreach (var identity in identities) { ResumeThreadIdentity(identity); threads.Remove(identity); }
+        int resumed = frozen.Count; frozen.Clear(); return resumed;
+    }
+    static void ProcessAck(string command,int id,bool ok,int count,string error = null) {
+        Console.WriteLine("{\"" + command + "Ack\":" + id.ToString(CultureInfo.InvariantCulture) +
+            ",\"ok\":" + (ok ? "true" : "false") + ",\"count\":" + count.ToString(CultureInfo.InvariantCulture) +
+            (error == null ? "" : ",\"error\":\"" + error + "\"") + "}");
+        Console.Out.Flush();
+    }
     public static int Main(string[] args) {
         if (args.Length > 0 && args[0] == "--route-fingerprint") {
             if (args.Length != 1) return 64;
@@ -162,11 +328,24 @@ internal static class GuardHost {
             if (ResumeThread(child.thread) == 0xffffffff) throw new Win32Exception(Marshal.GetLastWin32Error());
             Console.WriteLine("{\"pid\":" + child.pid + "}"); Console.Out.Flush();
             long lastHeartbeat = Stopwatch.GetTimestamp();
+            var frozen = new HashSet<uint>();
+            var frozenThreads = new HashSet<ThreadIdentity>();
             Task eof = Task.Factory.StartNew(() => {
                 string line;
                 while ((line = Console.In.ReadLine()) != null) {
-                    if (line != "ping") return;
+                    if (line == "ping") { Interlocked.Exchange(ref lastHeartbeat,Stopwatch.GetTimestamp()); continue; }
+                    string[] parts = line.Split(' ');
+                    if (parts.Length != 2 || (parts[0] != "freeze" && parts[0] != "thaw")) return;
+                    int id;
+                    if (!int.TryParse(parts[1],NumberStyles.None,CultureInfo.InvariantCulture,out id) || id <= 0) return;
                     Interlocked.Exchange(ref lastHeartbeat,Stopwatch.GetTimestamp());
+                    try {
+                        int count = parts[0] == "freeze" ? FreezeProcesses(job,frozen,frozenThreads) : ThawProcesses(job,frozen,frozenThreads);
+                        ProcessAck(parts[0],id,true,count);
+                    } catch (Exception error) {
+                        int errorCode = error is Win32Exception ? ((Win32Exception)error).NativeErrorCode : 0;
+                        ProcessAck(parts[0],id,false,frozen.Count,error.GetType().Name + ":" + errorCode.ToString(CultureInfo.InvariantCulture) + ":" + nativeOperation);
+                    }
                 }
             });
             while (!eof.Wait(50) && WaitForSingleObject(child.process,0) == 258) {
