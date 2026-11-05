@@ -228,6 +228,36 @@ struct ASARArchive {
             throw GuardError.message("Неизвестный тип входного модуля Claude.")
         }
         let entry = try content(item(components[...], in: json))
+        let anchor = "titleBarStyle:\"hidden\",titleBarOverlay:!1,trafficLightPosition:zHi()"
+        let initialPosition = "B.setWindowButtonPosition(PHi(e,Do?Z1:NHi()))"
+        let zoomPosition = "e.setWindowButtonPosition(DHi(t,rI(e.webContents.zoomFactor)))"
+        var titlebar: (path: [String], data: Data)?
+        func findTitlebar(_ files: [String: Any], parent: [String]) throws {
+            for (name, value) in files {
+                guard let item = value as? [String: Any] else { continue }
+                let path = parent + [name]
+                if let children = item["files"] as? [String: Any] { try findTitlebar(children, parent: path); continue }
+                guard name.hasSuffix(".js"), item["unpacked"] == nil, item["link"] == nil,
+                      let size = item["size"] as? Int, size <= 16 * 1024 * 1024 else { continue }
+                let text = String(decoding: try content(item), as: UTF8.self)
+                guard text.contains(anchor) else { continue }
+                guard titlebar == nil, text.components(separatedBy: anchor).count == 2,
+                      text.contains(initialPosition), text.contains(zoomPosition) else {
+                    throw GuardError.message("Неоднозначный заголовок главного окна Claude Code.")
+                }
+                let patched = text.replacingOccurrences(of: anchor, with: "titleBarStyle:\"default\",titleBarOverlay:!1")
+                    .replacingOccurrences(of: initialPosition, with: "void 0")
+                    .replacingOccurrences(of: zoomPosition, with: "void 0")
+                titlebar = (path, Data(patched.utf8))
+            }
+        }
+        if let build = json["files"] as? [String: Any],
+           let vite = build[".vite"] as? [String: Any],
+           let files = vite["files"] as? [String: Any],
+           let directory = files["build"] as? [String: Any],
+           let children = directory["files"] as? [String: Any] {
+            try findTitlebar(children, parent: [".vite", "build"])
+        }
         let marker = Data("\"use strict\";require(\"./proxy-guard-boot.cjs\");\n".utf8)
         let modified = marker + entry
         var body = original.subdata(in: payloadStart..<original.count)
@@ -239,6 +269,10 @@ struct ASARArchive {
         }
         var changed = try replacing(components[...], value: file(modified, offset: body.count), in: json)
         body.append(modified)
+        if let titlebar {
+            changed = try replacing(titlebar.path[...], value: file(titlebar.data, offset: body.count), in: changed)
+            body.append(titlebar.data)
+        }
         var bootstrapPath = Array(components.dropLast()); bootstrapPath.append("proxy-guard-boot.cjs")
         changed = try replacing(bootstrapPath[...], value: file(bootstrap, offset: body.count), in: changed)
         body.append(bootstrap)

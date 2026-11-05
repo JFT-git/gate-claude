@@ -117,7 +117,10 @@ struct ProcessSignaler {
         try signal(identity, SIGTERM, allowOrphanedLeader: allowOrphanedLeader)
     }
     func kill(_ identity: RuntimeIdentity, allowOrphanedLeader: Bool = true) throws {
-        try signal(identity, SIGKILL, allowOrphanedLeader: allowOrphanedLeader)
+        do { try signal(identity, SIGKILL, allowOrphanedLeader: allowOrphanedLeader) }
+        catch ProcessSignalError.signalFailed(let signal) {
+            guard signal == SIGKILL && !system.exists(-identity.pgid) else { throw ProcessSignalError.signalFailed(signal) }
+        }
     }
 
     func terminateFrozen(_ identity: RuntimeIdentity) throws {

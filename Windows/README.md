@@ -1,8 +1,10 @@
-# Claude Proxy Guard для Windows · 0.8.0
+# Claude Proxy Guard для Windows · 0.8.1
 
 Независимое приложение для Windows 10/11 x64. Требует отдельно установленного Claude Desktop. Для Claude Code поддерживается закреплённый Desktop 1.44121.2 и CLI 2.1.304. ARM64, Git Bash и Git SSH не заявлены.
 
-Запустите `ClaudeProxyGuard-Windows-0.8.0-x64-Setup.exe` для установки текущему пользователю или полностью распакуйте portable ZIP и запустите `Claude Proxy Guard.exe`. Нужна вся папка с Electron, native-помощниками и CodeTools. Установщик размещает эти же файлы в `%LOCALAPPDATA%\Programs\Claude Proxy Guard`.
+Запустите `ClaudeProxyGuard-Windows-0.8.1-x64-Setup.exe` для установки текущему пользователю или полностью распакуйте portable ZIP и запустите `Claude Proxy Guard.exe`. Нужна вся папка с Electron, native-помощниками и CodeTools. Установщик размещает эти же файлы в `%LOCALAPPDATA%\Programs\Claude Proxy Guard`.
+
+В 0.8.1 исправлено наложение заголовка главного окна Claude Code: используется системная рамка без кастомного смещения кнопок.
 
 Выберите сеть/VPN или SOCKS5, нажмите «Запустить», подтвердите запрос Windows для NetworkFence и дождитесь фактической проверки Claude. Guard ищет Claude в установленных пакетах WindowsApps; менять ACL WindowsApps не нужно. Code использует постоянную `Guard\CodeState\Workspace`, если проект не выбран. Рабочие файлы сохраняются после выхода.
 

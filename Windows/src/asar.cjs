@@ -25,11 +25,34 @@ function parseArchive(buffer) {
   return { header, raw, payloadStart, entry, read, digest: hash(raw) };
 }
 
+function patchNativeTitlebar(archive) {
+  const anchor = 'titleBarStyle:"hidden",titleBarOverlay:!1,trafficLightPosition:zHi()';
+  const initialPosition = 'B.setWindowButtonPosition(PHi(e,Do?Z1:NHi()))';
+  const zoomPosition = 'e.setWindowButtonPosition(DHi(t,rI(e.webContents.zoomFactor)))';
+  const patches = [];
+  function visit(files, parent) {
+    for (const [name, item] of Object.entries(files || {})) {
+      const filename = parent + '/' + name;
+      if (item.files) { visit(item.files, filename); continue; }
+      if (!name.endsWith('.js') || item.unpacked || item.link || item.size > 16 * 1024 * 1024) continue;
+      const source = archive.read(filename).toString();
+      if (!source.includes(anchor)) continue;
+      if (source.split(anchor).length !== 2 || !source.includes(initialPosition) || !source.includes(zoomPosition) || patches.length) {
+        throw Error('Неоднозначный заголовок главного окна Claude Code.');
+      }
+      patches.push({ name: filename, source: Buffer.from(source.replace(anchor, 'titleBarStyle:"default",titleBarOverlay:!1')
+        .replaceAll(initialPosition, 'void 0').replaceAll(zoomPosition, 'void 0')) });
+    }
+  }
+  visit(archive.header.files['.vite']?.files?.build?.files, '.vite/build');
+  return patches;
+}
+
 function addBootstrap(original, boot, extraEntries = []) {
   const archive = parseArchive(original), metadata = JSON.parse(archive.read('package.json').toString('utf8'));
   const main = metadata.main;
   if (typeof main !== 'string' || !/\.(?:c?js)$/.test(main) || metadata.type === 'module') throw Error('Неподдерживаемый входной модуль Claude.');
-  const entry = archive.read(main);
+  const entry = archive.read(main), titlebarPatches = patchNativeTitlebar(archive);
   const marker = Buffer.from('"use strict";require("./proxy-guard-boot.cjs");\n');
   if (entry.includes(marker)) throw Error('Выберите оригинальную установку Claude.');
   const changed = Buffer.concat([marker, entry]);
@@ -56,6 +79,7 @@ function addBootstrap(original, boot, extraEntries = []) {
     body = Buffer.concat([body, data]);
   }
   append(main, changed);
+  for (const patch of titlebarPatches) append(patch.name, patch.source);
   append(bootName, boot);
   for (const item of extraEntries) append(item.name, item.source);
   const raw = Buffer.from(JSON.stringify(archive.header)), padding = (4 - raw.length % 4) % 4;

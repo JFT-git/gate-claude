@@ -98,7 +98,11 @@ import Darwin
         defer { model.shutdown() }
         do {
             model.check(andLaunch: true)
-            let ready = await wait(60) { model.lastVerifiedProfile?.url.hasPrefix("https://claude.ai/") == true || model.requiresRestart || (!model.busy && !model.monitoring) }
+            let ready = await wait(60) {
+                model.lastVerifiedProfile?.url.hasPrefix("https://claude.ai/") == true && model.claudeRunning &&
+                model.e2eInspector != nil && model.e2eRelayPort != nil && model.e2eProcessID != nil ||
+                model.requiresRestart || (!model.busy && !model.monitoring)
+            }
             guard ready, let initial = model.lastVerifiedProfile, let inspector = model.e2eInspector,
                   let relayPort = model.e2eRelayPort, let processID = model.e2eProcessID else {
                 throw GuardError.message("Startup failed: \(model.phase): \(model.detail); \(model.profileStatus)")
@@ -233,7 +237,10 @@ import Darwin
             exitModel.e2eExtraArguments = model.e2eExtraArguments
             defer { exitModel.shutdown() }
             exitModel.check(andLaunch: true)
-            let exitReady = await wait(20) { exitModel.lastVerifiedProfile?.url.hasPrefix("https://claude.ai/") == true || exitModel.requiresRestart || (!exitModel.busy && !exitModel.monitoring) }
+            let exitReady = await wait(20) {
+                exitModel.lastVerifiedProfile?.url.hasPrefix("https://claude.ai/") == true && exitModel.claudeRunning &&
+                exitModel.e2eInspector != nil || exitModel.requiresRestart || (!exitModel.busy && !exitModel.monitoring)
+            }
             guard exitReady, exitModel.claudeRunning, let exitInspector = exitModel.e2eInspector else { throw GuardError.message("Exit scenario startup failed: \(exitModel.detail)") }
             _ = try await command(exitInspector, "ProxyGuard.testExit")
             let reported = await wait(5) { exitModel.requiresRestart && !exitModel.claudeRunning }

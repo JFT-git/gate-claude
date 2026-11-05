@@ -7,7 +7,9 @@ import Darwin
         var children: [Int32: [Int32]] = [:]
         var signals: [(pid: Int32, signal: Int32)] = []
         var ownerExists = false
+        var groupExists = true
         var failSignals = false
+        var failKill = false
 
         func system(currentPGID: Int32 = 100, barrierGID: UInt32 = 380) -> ProcessSystem {
             var system = ProcessSystem()
@@ -23,9 +25,13 @@ import Darwin
             system.send = { [weak self] pid, signal in
                 guard let self, !self.failSignals else { return false }
                 self.signals.append((pid, signal))
-                return true
+                return !(self.failKill && signal == SIGKILL)
             }
-            system.exists = { [weak self] _ in self?.ownerExists ?? false }
+            system.exists = { [weak self] pid in
+                guard let self else { return false }
+                if pid < 0 { return self.groupExists && self.samples.values.contains { $0.pgid == -pid } }
+                return self.ownerExists
+            }
             return system
         }
 
@@ -188,6 +194,14 @@ import Darwin
         let orphanCleaned = RuntimeCrashRecovery.clean(store: store, system: fixture.system())
         expect(orphanCleaned && fixture.signals.map(\.signal) == [SIGCONT, SIGTERM, SIGKILL] && store.load() == nil,
                "crash cleanup thaws and terminates a verified orphaned runtime group")
+
+        try store.write(stale)
+        fixture.signals = []
+        fixture.failKill = true
+        fixture.groupExists = false
+        let vanishedCleaned = RuntimeCrashRecovery.clean(store: store, system: fixture.system())
+        expect(vanishedCleaned && fixture.signals.map(\.signal) == [SIGCONT, SIGTERM, SIGKILL] && store.load() == nil,
+               "crash cleanup removes the record when the runtime group exits before SIGKILL: cleaned=\(vanishedCleaned), signals=\(fixture.signals), record=\(store.load() != nil)")
 
         if CommandLine.arguments.count == 3 { try native(host: CommandLine.arguments[1], fixture: CommandLine.arguments[2]) }
         print("PROCESS FREEZE TESTS: \(failures) failures")

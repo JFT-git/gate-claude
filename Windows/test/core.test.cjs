@@ -171,10 +171,16 @@ test('named channel requires token, parses fragmented messages, closes pending w
   const stopped = channel.command('pending'); const rejection = assert.rejects(stopped); channel.close(); await rejection;
 });
 
-function fixtureArchive() {
-  const files = { 'package.json': Buffer.from('{"name":"@ant/desktop","version":"fixture","main":"main.js"}'), 'main.js': Buffer.from('console.log("fixture");') };
+function fixtureArchive(mainSource = 'console.log("fixture");', chunkSource) {
+  const files = { 'package.json': Buffer.from('{"name":"@ant/desktop","version":"fixture","main":"main.js"}'), 'main.js': Buffer.from(mainSource) };
+  if (chunkSource) files['.vite/build/index.chunk-fixture.js'] = Buffer.from(chunkSource);
   let payload = Buffer.alloc(0); const header = { files: {} };
-  for (const [name, bytes] of Object.entries(files)) { header.files[name] = { offset: String(payload.length), size: bytes.length }; payload = Buffer.concat([payload, bytes]); }
+  for (const [name, bytes] of Object.entries(files)) {
+    const parts = name.split('/'); let parent = header;
+    for (const part of parts.slice(0, -1)) parent = parent.files[part] ||= { files: {} };
+    parent.files[parts.at(-1)] = { offset: String(payload.length), size: bytes.length };
+    payload = Buffer.concat([payload, bytes]);
+  }
   const raw = Buffer.from(JSON.stringify(header)), pad = (4 - raw.length % 4) % 4, prefix = Buffer.alloc(16);
   prefix.writeUInt32LE(4, 0); prefix.writeUInt32LE(raw.length + pad + 8, 4); prefix.writeUInt32LE(raw.length + pad + 4, 8); prefix.writeUInt32LE(raw.length, 12);
   return Buffer.concat([prefix, raw, Buffer.alloc(pad), payload]);
@@ -189,4 +195,17 @@ test('ASAR bootstrap keeps original source and recomputes header and block hashe
   const base = fs.readFileSync(path.join(__dirname, '..', '..', 'Resources', 'RuntimeBootstrap.cjs'), 'utf8');
   const win = A.windowsBootstrap(base).toString(); assert.ok(win.includes('ProxyGuard.hello')); assert.ok(!win.includes('fd: 3'));
   assert.throws(() => A.parseArchive(Buffer.from('broken'))); assert.throws(() => A.updatePEIntegrity(Buffer.alloc(128), 'x', 'y'));
+});
+test('main-window ASAR chunk uses native titlebar without changing other windows', () => {
+  const anchor = 'titleBarStyle:"hidden",titleBarOverlay:!1,trafficLightPosition:zHi()';
+  const otherWindow = 'titleBarStyle:"hidden",trafficLightPosition:{x:8,y:8}';
+  const source = anchor + ';B.setWindowButtonPosition(PHi(e,Do?Z1:NHi()));' +
+    'e.setWindowButtonPosition(DHi(t,rI(e.webContents.zoomFactor)));' + otherWindow;
+  const result = A.addBootstrap(fixtureArchive('console.log("fixture");', source), Buffer.from('/* own boot */'));
+  const parsed = A.parseArchive(result.archive), text = parsed.read('.vite/build/index.chunk-fixture.js').toString();
+  assert.match(text, /titleBarStyle:"default"/);
+  assert.ok(!text.includes(anchor)); assert.ok(!text.includes('setWindowButtonPosition'));
+  assert.ok(text.includes(otherWindow));
+  assert.equal(parsed.entry('.vite/build/index.chunk-fixture.js').integrity.hash, A.hash(parsed.read('.vite/build/index.chunk-fixture.js')));
+  assert.throws(() => A.addBootstrap(fixtureArchive('console.log("fixture");', anchor), Buffer.from('boot')), /Неоднозначный заголовок/);
 });
