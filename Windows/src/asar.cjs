@@ -26,22 +26,34 @@ function parseArchive(buffer) {
 }
 
 function patchNativeTitlebar(archive) {
-  const anchor = 'titleBarStyle:"hidden",titleBarOverlay:!1,trafficLightPosition:zHi()';
-  const initialPosition = 'B.setWindowButtonPosition(PHi(e,Do?Z1:NHi()))';
-  const zoomPosition = 'e.setWindowButtonPosition(DHi(t,rI(e.webContents.zoomFactor)))';
+  const variants = [
+    { anchor: 'titleBarStyle:"hidden",titleBarOverlay:!1,trafficLightPosition:zHi()', positions: [
+      'B.setWindowButtonPosition(PHi(e,Do?Z1:NHi()))',
+      'e.setWindowButtonPosition(DHi(t,rI(e.webContents.zoomFactor)))'
+    ] },
+    { anchor: 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:I0t()', positions: [
+      'e.setWindowButtonPosition(A0t(t,WN(e.webContents.zoomFactor)))'
+    ] }
+  ];
   const patches = [];
   function visit(files, parent) {
     for (const [name, item] of Object.entries(files || {})) {
       const filename = parent + '/' + name;
       if (item.files) { visit(item.files, filename); continue; }
       if (!name.endsWith('.js') || item.unpacked || item.link || item.size > 16 * 1024 * 1024) continue;
-      const source = archive.read(filename).toString();
-      if (!source.includes(anchor)) continue;
-      if (source.split(anchor).length !== 2 || !source.includes(initialPosition) || !source.includes(zoomPosition) || patches.length) {
+      const source = archive.read(filename).toString(), matches = variants.filter(variant => source.includes(variant.anchor));
+      if (!matches.length) {
+        if (source.includes('titleBarStyle:"hidden",titleBarOverlay:') && source.includes(',trafficLightPosition:')) {
+          throw Error('Неподдерживаемый заголовок главного окна Claude Code.');
+        }
+        continue;
+      }
+      if (matches.length !== 1 || source.split(matches[0].anchor).length !== 2 || matches[0].positions.some(position => !source.includes(position)) || patches.length) {
         throw Error('Неоднозначный заголовок главного окна Claude Code.');
       }
-      patches.push({ name: filename, source: Buffer.from(source.replace(anchor, 'titleBarStyle:"default",titleBarOverlay:!1')
-        .replaceAll(initialPosition, 'void 0').replaceAll(zoomPosition, 'void 0')) });
+      let patched = source.replace(matches[0].anchor, 'titleBarStyle:"default",titleBarOverlay:!1');
+      for (const position of matches[0].positions) patched = patched.replaceAll(position, 'void 0');
+      patches.push({ name: filename, source: Buffer.from(patched) });
     }
   }
   visit(archive.header.files['.vite']?.files?.build?.files, '.vite/build');

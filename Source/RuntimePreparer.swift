@@ -228,9 +228,15 @@ struct ASARArchive {
             throw GuardError.message("Неизвестный тип входного модуля Claude.")
         }
         let entry = try content(item(components[...], in: json))
-        let anchor = "titleBarStyle:\"hidden\",titleBarOverlay:!1,trafficLightPosition:zHi()"
-        let initialPosition = "B.setWindowButtonPosition(PHi(e,Do?Z1:NHi()))"
-        let zoomPosition = "e.setWindowButtonPosition(DHi(t,rI(e.webContents.zoomFactor)))"
+        let variants = [
+            (anchor: "titleBarStyle:\"hidden\",titleBarOverlay:!1,trafficLightPosition:zHi()", positions: [
+                "B.setWindowButtonPosition(PHi(e,Do?Z1:NHi()))",
+                "e.setWindowButtonPosition(DHi(t,rI(e.webContents.zoomFactor)))"
+            ]),
+            (anchor: "titleBarStyle:\"hidden\",titleBarOverlay:!0,trafficLightPosition:I0t()", positions: [
+                "e.setWindowButtonPosition(A0t(t,WN(e.webContents.zoomFactor)))"
+            ])
+        ]
         var titlebar: (path: [String], data: Data)?
         func findTitlebar(_ files: [String: Any], parent: [String]) throws {
             for (name, value) in files {
@@ -240,14 +246,20 @@ struct ASARArchive {
                 guard name.hasSuffix(".js"), item["unpacked"] == nil, item["link"] == nil,
                       let size = item["size"] as? Int, size <= 16 * 1024 * 1024 else { continue }
                 let text = String(decoding: try content(item), as: UTF8.self)
-                guard text.contains(anchor) else { continue }
-                guard titlebar == nil, text.components(separatedBy: anchor).count == 2,
-                      text.contains(initialPosition), text.contains(zoomPosition) else {
+                let matches = variants.filter { text.contains($0.anchor) }
+                if matches.isEmpty {
+                    if text.contains("titleBarStyle:\"hidden\",titleBarOverlay:") && text.contains(",trafficLightPosition:") {
+                        throw GuardError.message("Неподдерживаемый заголовок главного окна Claude Code.")
+                    }
+                    continue
+                }
+                guard matches.count == 1, let variant = matches.first, titlebar == nil,
+                      text.components(separatedBy: variant.anchor).count == 2,
+                      variant.positions.allSatisfy({ text.contains($0) }) else {
                     throw GuardError.message("Неоднозначный заголовок главного окна Claude Code.")
                 }
-                let patched = text.replacingOccurrences(of: anchor, with: "titleBarStyle:\"default\",titleBarOverlay:!1")
-                    .replacingOccurrences(of: initialPosition, with: "void 0")
-                    .replacingOccurrences(of: zoomPosition, with: "void 0")
+                var patched = text.replacingOccurrences(of: variant.anchor, with: "titleBarStyle:\"default\",titleBarOverlay:!1")
+                for position in variant.positions { patched = patched.replacingOccurrences(of: position, with: "void 0") }
                 titlebar = (path, Data(patched.utf8))
             }
         }

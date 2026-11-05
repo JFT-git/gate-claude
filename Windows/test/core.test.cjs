@@ -209,3 +209,15 @@ test('main-window ASAR chunk uses native titlebar without changing other windows
   assert.equal(parsed.entry('.vite/build/index.chunk-fixture.js').integrity.hash, A.hash(parsed.read('.vite/build/index.chunk-fixture.js')));
   assert.throws(() => A.addBootstrap(fixtureArchive('console.log("fixture");', anchor), Buffer.from('boot')), /Неоднозначный заголовок/);
 });
+test('Windows main-window ASAR variant disables overlay and custom button positioning', () => {
+  const anchor = 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:I0t()';
+  const otherWindow = 'titleBarStyle:"hidden",trafficLightPosition:{x:8,y:8}';
+  const source = anchor + ';e.setWindowButtonPosition(A0t(t,WN(e.webContents.zoomFactor)));' + otherWindow;
+  const result = A.addBootstrap(fixtureArchive('console.log("fixture");', source), Buffer.from('/* own boot */'));
+  const parsed = A.parseArchive(result.archive), text = parsed.read('.vite/build/index.chunk-fixture.js').toString();
+  assert.match(text, /titleBarStyle:"default",titleBarOverlay:!1/);
+  assert.ok(!text.includes(anchor)); assert.ok(!text.includes('setWindowButtonPosition'));
+  assert.ok(text.includes(otherWindow));
+  const unknown = source.replace('trafficLightPosition:I0t()', 'trafficLightPosition:Other()');
+  assert.throws(() => A.addBootstrap(fixtureArchive('console.log("fixture");', unknown), Buffer.from('boot')), /Неподдерживаемый заголовок/);
+});
