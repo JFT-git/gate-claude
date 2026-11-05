@@ -102,3 +102,14 @@ for (const action of ['pause', 'close']) test(`${action} destroys a pending HTTP
   const pending = connectTunnel(r.port, 'held-http-proxy.invalid', 443); pending.catch(() => {}); await until(() => proxy.requests.length === 1, 'Proxy did not receive CONNECT'); r[action](); await assert.rejects(pending);
   await until(() => proxy.peers.size === 0, 'Held HTTP proxy socket survived cancellation'); assert.equal(target.accepted, 0); assert.equal(r.sockets.size, 0);
 });
+
+for (const kind of ['http', 'socks5']) test(`${kind} clean upstream FIN flushes the final tunnel bytes without a reset`, { timeout: 10000 }, async t => {
+  const payload = Buffer.alloc(4 * 1024 * 1024, 0x5a);
+  const target = await server(t, socket => { socket.on('data', () => {}); socket.end(payload); });
+  const proxy = kind === 'http' ? await httpProxy(t, target) : await socksProxy(t, target), r = await configured(t, proxy, kind); r.unlock();
+  const socket = await connectTunnel(r.port, 'clean-close.invalid', target.port), chunks = [], errors = [];
+  socket.on('data', chunk => chunks.push(chunk)); socket.on('error', error => errors.push(error)); socket.resume();
+  await once(socket, 'close');
+  assert.deepEqual(errors, []); assert.equal(Buffer.concat(chunks).length, payload.length);
+  assert.ok(Buffer.concat(chunks).equals(payload));
+});

@@ -411,10 +411,9 @@ class SOCKSRelay extends EventEmitter {
         const close = () => { client.destroy(); upstream.destroy(); };
         client.once('close', close);
         upstream.once('close', () => {
-          // Keep a clean HTTP response's buffered writes alive until client.end
-          // flushes them. A reset or incomplete upstream still retires both sides.
-          if (request.kind === 'http' && upstream.readableEnded) { if (!client.writableEnded) client.end(); }
-          else close();
+          // Upstream is already closed: flush the remaining bytes and TLS close
+          // handshake. An incomplete stream still fails TLS/HTTP validation.
+          if (!client.writableEnded) client.end();
         });
         client.on('error', close); upstream.on('error', close);
         if (request.kind === 'connect') {
@@ -517,8 +516,9 @@ async function connectTunnel(port, host, targetPort = 443, checkToken = '', onSo
     const onError = e => { cleanup(); reject(e); }, onEnd = () => onError(Error('Шлюз закрыл соединение.'));
     const onData = data => {
       buffer = Buffer.concat([buffer, data]);
-      if (buffer.length > 16384) return onError(Error('Слишком большой ответ шлюза.'));
-      const end = buffer.indexOf('\r\n\r\n'); if (end < 0) return;
+      const end = buffer.indexOf('\r\n\r\n');
+      if (end < 0 && buffer.length > 16384 || end + 4 > 16384) return onError(Error('Слишком большой ответ шлюза.'));
+      if (end < 0) return;
       if (!/^HTTP\/1\.1 200 /.test(buffer.toString('ascii'))) return onError(Error('Шлюз отказал в подключении.'));
       socket.pause(); cleanup();
       if (buffer.length > end + 4) socket.unshift(buffer.subarray(end + 4));

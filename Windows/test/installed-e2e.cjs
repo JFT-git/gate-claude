@@ -251,7 +251,12 @@ command=async m=>{
   let controller;
   try {
     controller = fixtureNetworkChecks(new GuardController(root, resources)); controller.on('log', e => console.log(e.kind + ': ' + e.message));
-    const states = []; controller.on('state', state => states.push(state.state));
+    const states = []; controller.on('state', state => {
+      states.push(state.state);
+      const event = { at: Date.now(), state: state.state, processState: state.processState, frozen: state.processFrozen, message: state.message, activeStreams: activeStreams.size };
+      (observations.timeline ||= []).push(event);
+      fsSync.appendFileSync(path.join(work, 'timeline.jsonl'), JSON.stringify(event) + '\n');
+    });
     const captures = new Map(); controller.on('record', r => captures.set(r.id, r));
     const input = { mode: connectionMode, host: '127.0.0.1', port: socks.address().port, timezone: 'Europe/Amsterdam', language: 'en-US', interval: 2, captureBodies: true, claudePath: source };
     await controller.start(input);
@@ -468,7 +473,7 @@ command=async m=>{
 }
 main().catch(async error => {
   console.error(error.stack || error); await fs.mkdir(work, { recursive: true });
-  await fs.writeFile(path.join(work, 'failure.json'), JSON.stringify({ error: String(error), observations }, null, 2)); process.exitCode = 1;
+  fsSync.writeFileSync(path.join(work, 'failure.json'), JSON.stringify({ error: String(error), observations }, null, 2)); process.exitCode = 1;
   for (const socket of sockets) socket.destroy();
   // Bound a failed native test even if an external Electron fixture did not exit.
   setTimeout(() => process.exit(1), 1000).unref();

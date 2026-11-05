@@ -314,7 +314,10 @@ function attach(wc) {
   const sid = 'guard-' + wc.id;
   let closed = false;
   const active = () => !closed && !wc.isDestroyed();
-  const targetFailure = error => { if (active()) fatal(error); };
+  const targetFailure = error => {
+    const expectedClose = /target closed|session closed|object has been destroyed|render frame was disposed/i.test(error?.message || error);
+    if (active() && !expectedClose) fatal(error);
+  };
   function cleanup() {
     if (closed) return;
     closed = true;

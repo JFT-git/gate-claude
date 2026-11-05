@@ -24,13 +24,15 @@ function checkControls(controls) {
 }
 function download(relayPort, controls, check, file) {
   let raw, secure, request, response, finished = false;
-  const agent = new https.Agent({ keepAlive: false, maxSockets: 1 });
+  const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
   return new Promise((resolve, reject) => {
     const finish = error => {
       if (finished) return; finished = true;
       clearTimeout(deadline); clearInterval(activePoll); controls.signal?.removeEventListener('abort', abort);
-      response?.destroy(); request?.destroy(); secure?.destroy(); raw?.destroy(); agent.destroy();
-      if (error) reject(failure()); else resolve();
+      if (error) {
+        response?.destroy(); request?.destroy(); secure?.destroy(); raw?.destroy(); agent.destroy();
+        reject(failure());
+      } else resolve();
     };
     const abort = () => finish(failure());
     const deadline = setTimeout(abort, DOWNLOAD_TIMEOUT_MS);
@@ -53,7 +55,7 @@ function download(relayPort, controls, check, file) {
     try {
       check();
       request = https.request({ hostname: ASSET.hostname, port: 443, path: ASSET.pathname, method: 'GET', agent,
-        headers: { Accept: 'application/octet-stream', 'Accept-Encoding': 'identity', Connection: 'close', 'User-Agent': 'gate-claude-code-assets' } }, incoming => {
+        headers: { Accept: 'application/octet-stream', 'Accept-Encoding': 'identity', Connection: 'keep-alive', 'User-Agent': 'gate-claude-code-assets' } }, incoming => {
         response = incoming;
         response.once('error', abort);
         void (async () => {
