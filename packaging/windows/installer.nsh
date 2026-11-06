@@ -38,6 +38,46 @@
   !insertmacro GuardSetupTrace serviceInstallReady
 !macroend
 
+!macro customUnInstallCheck
+  IntCmp $R0 0 guardMigrationCheckDone
+  Push $R2
+  Push $R3
+  Push $R4
+  StrCmp $installMode "CurrentUser" 0 guardMigrationRejected
+  ReadRegStr $R2 HKCU "${UNINSTALL_REGISTRY_KEY}" "DisplayVersion"
+  StrCmp $R2 "0.8.1" 0 guardMigrationRejected
+  ReadRegStr $R2 HKCU "${INSTALL_REGISTRY_KEY}" "InstallLocation"
+  StrCmp $R2 "" guardMigrationRejected
+  System::Call 'Kernel32::SetEnvironmentVariable(t "GUARD_MIGRATION_SOURCE", t "$R2\Uninstall Claude Proxy Guard.exe")'
+  System::Call 'Kernel32::SetEnvironmentVariable(t "GUARD_MIGRATION_TEMP", t "$PLUGINSDIR\old-uninstaller.exe")'
+  System::Call 'Kernel32::SetEnvironmentVariable(t "GUARD_MIGRATION_INSTALL", t "$R2")'
+  nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -C "$$ErrorActionPreference='Stop';function C($$p){$$f=[IO.Path]::GetFullPath($$p);if($$f-ne$$p-or$$f.Length-gt240-or$$f-notmatch'^[A-Za-z]:\\'){exit 40};$$c=$$f;while($$c.Length-gt3){if((Get-Item -LiteralPath $$c -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){exit 41};$$c=[IO.Path]::GetDirectoryName($$c)};$$f};$$s=$$env:GUARD_MIGRATION_SOURCE;$$t=$$env:GUARD_MIGRATION_TEMP;$$i=$$env:GUARD_MIGRATION_INSTALL;if((C $$s)-ne(Join-Path (C $$i) 'Uninstall Claude Proxy Guard.exe')){exit 42};if($$s-eq$$t){exit 43};if((Get-FileHash -LiteralPath (C $$s) -Algorithm SHA256).Hash.ToLowerInvariant()-ne'5dbbd29997a485289cfbc8ba382ab2f47bd10e20d926fc6196fb1e990fe21df1'){exit 44};if((Get-FileHash -LiteralPath (C $$t) -Algorithm SHA256).Hash.ToLowerInvariant()-ne'5dbbd29997a485289cfbc8ba382ab2f47bd10e20d926fc6196fb1e990fe21df1'){exit 45};if((Get-FileHash -LiteralPath (C (Join-Path $$i 'resources\app.asar')) -Algorithm SHA256).Hash.ToLowerInvariant()-ne'1a6cd4e62b2d5cb604d0b8f4d8ed6fdc6ffe3bfd058c2faa53d0cc64ffd13a9e'){exit 46};if((Get-FileHash -LiteralPath (C (Join-Path $$i 'Claude Proxy Guard.exe')) -Algorithm SHA256).Hash.ToLowerInvariant()-ne'b710f3b94d03ebdb29709edc35d2ec6200c593d1fc8685826aa5a95df45538a9'){exit 47};exit 0"`
+  Pop $R3
+  System::Call 'Kernel32::SetEnvironmentVariable(t "GUARD_MIGRATION_SOURCE", t "")'
+  System::Call 'Kernel32::SetEnvironmentVariable(t "GUARD_MIGRATION_TEMP", t "")'
+  System::Call 'Kernel32::SetEnvironmentVariable(t "GUARD_MIGRATION_INSTALL", t "")'
+  StrCpy $0 $R3
+  !insertmacro GuardSetupTrace migrationAuthorization
+  IntCmp $R3 0 guardMigrationAuthorized
+  Goto guardMigrationRejected
+  guardMigrationAuthorized:
+  ExecWait '"$PLUGINSDIR\old-uninstaller.exe" /NCRC /S /KEEP_APP_DATA /currentuser --updated _?=$R2' $R4
+  StrCpy $0 $R4
+  !insertmacro GuardSetupTrace migrationReceipt
+  IntCmp $R4 0 guardMigrationAccepted
+  Goto guardMigrationRejected
+  guardMigrationAccepted:
+  ClearErrors
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Goto guardMigrationCheckDone
+  guardMigrationRejected:
+  MessageBox MB_ICONSTOP 'The existing 0.8.1 installation or its uninstaller was not accepted for migration. Setup was interrupted. User data was not removed.'
+  Abort
+  guardMigrationCheckDone:
+!macroend
+
 !macro customUnInstall
   ${If} ${isUpdated}
     !insertmacro GuardSetupTrace serviceUpdatePreserved

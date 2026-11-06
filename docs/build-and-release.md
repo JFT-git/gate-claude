@@ -21,6 +21,8 @@ NSIS устанавливает приложение для текущего п�
 
 Release NSIS следует собирать и проверять на Windows. В проведённой валидации macOS/Wine uninstaller не прошёл собственную integrity check, тогда как Windows-native install, current same-version update и manual uninstall прошли. Нельзя отключать NSIS integrity check или принимать cross-build без реального update/uninstall теста.
 
+Для повреждённого uninstaller из опубликованного 0.8.1 добавлен отдельный guarded migration hook: только после отказа старого uninstaller, проверки CurrentUser, owned InstallLocation, DisplayVersion 0.8.1, canonical non-reparse paths и точных SHA-256 uninstaller, его временной копии, app.asar и application executable. Только в этом случае используется документированный `/NCRC`; глобальный CRCCheck off отсутствует. Реальный A→B с sentinel data прошёл с явно elevated continuation, current same-version update уже не использует `/NCRC`. Manual standard-user UAC confirmation отдельно не подтверждён: в проверках использовался elevated owned task.
+
 Authenticode по-прежнему не настроена. Подпись update metadata подтверждает происхождение обновления относительно закреплённого ключа, но не является подписью издателя Windows. Неподписанный Setup.exe может вызвать предупреждение ОС; успешная компиляция не означает успешную установку, удаление, differential download или прохождение SmartScreen.
 
 ## macOS

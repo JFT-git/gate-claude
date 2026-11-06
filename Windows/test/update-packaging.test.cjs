@@ -37,9 +37,27 @@ test('install and uninstall wait for the owned service request and preserve exit
   assert.match(script, /ExecWait '"\$INSTDIR\\resources\\GuardService\.exe" --request-install --owner 0' \$0/);
   assert.match(script, /ExecWait '"\$INSTDIR\\resources\\GuardService\.exe" --request-uninstall --owner 0' \$0/);
   assert.match(script, /StrCmp \$0 2 guardServiceExitTwo/); assert.match(script, /StrCmp \$0 2 guardServiceUninstallExitTwo/);
-  const uninstall = script.match(/!macro customUnInstall([\s\S]*?)!macroend/)[1];
+  const uninstall = script.match(/!macro customUnInstall\r?\n([\s\S]*?)!macroend/)[1];
   assert.match(uninstall, /\$\{If\} \$\{isUpdated\}[\s\S]*?\$\{Else\}[\s\S]*?--request-uninstall --owner 0[\s\S]*?\$\{EndIf\}/);
   assert.doesNotMatch(script, /HKLM|WriteReg|CreateService|sc\.exe/i);
+});
+
+test('0.8.1 migration allows documented NCRC only for the exact owned corrupted uninstaller', () => {
+  const script = fs.readFileSync(path.join(root, 'packaging/windows/installer.nsh'), 'utf8');
+  assert.match(script, /!macro customUnInstallCheck/);
+  assert.match(script, /IntCmp \$R0 0 guardMigrationCheckDone/);
+  assert.match(script, /StrCmp \$installMode "CurrentUser" 0 guardMigrationRejected/);
+  assert.match(script, /StrCmp \$R2 "0\.8\.1" 0 guardMigrationRejected/);
+  assert.match(script, /GUARD_MIGRATION_SOURCE/); assert.match(script, /GUARD_MIGRATION_TEMP/); assert.match(script, /GUARD_MIGRATION_INSTALL/);
+  assert.match(script, /ReparsePoint/);
+  for (const hash of ['5dbbd29997a485289cfbc8ba382ab2f47bd10e20d926fc6196fb1e990fe21df1',
+    '1a6cd4e62b2d5cb604d0b8f4d8ed6fdc6ffe3bfd058c2faa53d0cc64ffd13a9e',
+    'b710f3b94d03ebdb29709edc35d2ec6200c593d1fc8685826aa5a95df45538a9']) assert.ok(script.includes(hash));
+  assert.equal(script.match(/\/NCRC/g).length, 1);
+  assert.match(script, /\/NCRC \/S \/KEEP_APP_DATA \/currentuser --updated _\?=\$R2/);
+  assert.match(script, /guardMigrationRejected:[\s\S]*MessageBox MB_ICONSTOP/);
+  assert.doesNotMatch(script, /CRCCheck\s+(?:off|force)/i);
+  assert.doesNotMatch(script, /\$PowerShellPath/);
 });
 
 test('GuardService is a required packaged resource with an independent Windows csc pin', () => {
