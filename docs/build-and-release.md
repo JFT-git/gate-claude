@@ -2,7 +2,7 @@
 
 ## Поддерживаемая матрица
 
-- Windows 10/11 **x64**: Electron 44.9.2, Node >=22.12 для сборки, .NET Framework C# compiler для native-помощников. Portable ZIP; подготовлен Inno Setup 6.3+ установщик текущего пользователя. ARM64 и x86 не заявлены.
+- Windows 10/11 **x64**: Electron 44.9.2, Node >=22.12 для сборки, .NET Framework C# compiler для native-помощников. Portable ZIP и per-user NSIS; предусмотрена миграция с Inno Setup 6.3+. ARM64 и x86 не заявлены.
 - macOS **13+ universal arm64 + x86_64**: Xcode Command Line Tools/SDK, SwiftUI/AppKit/Network, clang, codesign, lipo, ditto, hdiutil. Переносимый `.app` в ZIP и DMG для drag-and-drop установки. Это не PKG и не установка службы.
 - Linux не поддерживается. Наличие universal-секции не означает проверенного исполнения на Intel. Cross-build Windows не является запуском Windows.
 
@@ -15,9 +15,11 @@ $env:GUARD_WINDOWS_UPDATE_PRIVATE_KEY='C:\secure\guard-windows-ed25519.pem'
 
 Приватный Ed25519-ключ должен находиться только во внешнем защищённом хранилище и соответствовать публичному ключу в `Windows/src/updater.cjs`. Скрипт собирает portable ZIP, per-user NSIS Setup, `.blockmap`, `latest.yml` и detached `latest.yml.sig`, затем вычисляет SHA-256. Изменение `latest.yml` после подписи запрещено: metadata нужно создать и подписать заново. Не публикуйте новый Setup/blockmap с metadata от другой сборки.
 
-Комплекты CodeTools обязательны для полного Code-релиза. Их готовит `Windows/scripts/prepare-code-tools.cjs` из закреплённых исходников Git/PowerShell и bootstrap; произвольный ZIP не принимается. Native-компиляция использует существующие исходники, движок не подменяется. Проверяйте source commit, production dependencies, byte-match ASAR и хеши helper/sidecar.
+Комплекты CodeTools обязательны для полного Code-релиза. Их готовит `Windows/scripts/prepare-code-tools.cjs` из закреплённых исходников Git/PowerShell и bootstrap; произвольный ZIP не принимается. `GuardService.exe` собирается из `Windows/native/GuardService.cs` stock Windows `.NET Framework` csc для x64 с `System.ServiceProcess.dll`, добавляется в `resources` и имеет отдельный SHA-256 в `packaging/windows/cross-build-pins.json`. Cross-build обязан передать `--service /absolute/path/to/GuardService.exe`; packaging сверяет его с pin. NetworkFence pin также сверяется тестом с константой в GuardService. Старый csc не поддерживает `/deterministic`: pin относится к проверенному binary, а другая пересборка считается privileged update. Проверяйте source commit, production dependencies, byte-match ASAR и хеши helper/sidecar.
 
-NSIS устанавливает только приложение для текущего пользователя в `%LOCALAPPDATA%\Programs\Claude Proxy Guard`, без службы и без удаления Application Data. Он не должен завершать активную защищённую сессию: updater сначала запрашивает подтверждение и дожидается shutdown. Удаление собственных HKCU регистраций условно по marker и полному пути EXE; чужая установка не затрагивается. Миграция с Inno Setup и installed A→B проверяются на настоящей Windows.
+NSIS устанавливает приложение для текущего пользователя в `%LOCALAPPDATA%\Programs\Claude Proxy Guard`, затем вызывает `resources\GuardService.exe --request-install --owner 0` и ждёт результат. Первый install/privileged update вызывает UAC; current running compatible service не вызывает повторного повышения. При `--updated` старый uninstaller сохраняет службу, а manual uninstall выполняет явный elevated `--request-uninstall`, проверяет owned ImagePath и не удаляет Application Data. Native exit 2 и любой другой неподтверждённый результат прерывают setup. Updater сначала запрашивает подтверждение и дожидается shutdown активной сессии. Удаление собственных HKCU регистраций условно по marker и полному пути EXE; чужая установка не затрагивается. Миграция с Inno Setup и installed A→B между разными версиями проверяются отдельно на настоящей Windows.
+
+Release NSIS следует собирать и проверять на Windows. В проведённой валидации macOS/Wine uninstaller не прошёл собственную integrity check, тогда как Windows-native install, current same-version update и manual uninstall прошли. Нельзя отключать NSIS integrity check или принимать cross-build без реального update/uninstall теста.
 
 Authenticode по-прежнему не настроена. Подпись update metadata подтверждает происхождение обновления относительно закреплённого ключа, но не является подписью издателя Windows. Неподписанный Setup.exe может вызвать предупреждение ОС; успешная компиляция не означает успешную установку, удаление, differential download или прохождение SmartScreen.
 
@@ -38,6 +40,7 @@ Developer ID и нотариализация не выполняются и не
 
 - `cd Windows && npm test`: платформенные skipped должны быть перечислены, а не объявлены PASS.
 - `Windows/scripts/ci-windows.ps1`: отдельные реальные Windows/native проверки; потенциально устанавливают временные собственные политики на выделенном runner. Нужны корректная сборка всех native-зависимостей и права, описанные самим скриптом. Этот legacy-скрипт не используется как доказательство нового UI.
+- `node --test test/service-backend.test.cjs test/service-integration.test.cjs`: строгий protocol/status, no-repeat install, serialization, authorization input, read-back и sanitized failures. `test/service-native.test.cjs` активируется только на Windows с `GATE_SERVICE_HELPER` и `GATE_FENCE_HELPER` и не устанавливает службу сам. `test/helpers/ServiceFenceProbe.cs` выполняет тот же реальный pipe/WFP handshake без Node. Перед native lifecycle отдельно проверьте отсутствие/владельца `ClaudeProxyGuard`; после проверки удалите только собственный service через request uninstall.
 - `Windows/scripts/ui-smoke.cjs`: тест локального renderer через Electron, отдельный temporary профиль и только тестовые bridge responses. Он проверяет UI/доступность/дубли/состояния, не WFP, Claude или установленную службу.
 - `bash packaging/macos/test-ui.sh /tmp/guard-ui.png`: отрисовка собственного SwiftUI View с тестовой моделью, без сетевых действий.
 - `bash test.sh`: macOS тесты с собственными локальными fixture. Работа реального Claude и смена VPN проверяются отдельно, не подменяются unit-тестами.

@@ -64,3 +64,13 @@ test('an unwritable storage path cannot report a committed pin', t => {
   const broken = new IPMemory(file); assert.throws(() => broken.commit('203.0.113.7'), { message: UNAVAILABLE });
   assert.equal(fs.readFileSync(file, 'utf8'), 'unchanged');
 });
+
+test('Windows lstat dev zero does not invalidate the same open file', { skip: process.platform !== 'win32' }, t => {
+  const memory = fixture(t); memory.commit('203.0.113.7');
+  const stat = fs.lstatSync(memory.file), fd = fs.openSync(memory.file, 'r');
+  try {
+    const actual = fs.fstatSync(fd);
+    assert.equal(stat.dev, 0); assert.notEqual(actual.dev, 0);
+    assert.equal(actual.ino, stat.ino); assert.equal(memory.load(), '203.0.113.7');
+  } finally { fs.closeSync(fd); }
+});

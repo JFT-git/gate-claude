@@ -1,5 +1,17 @@
 # Изменения
 
+## Windows 0.9.0 / macOS 0.6.0 — 2026-11-06
+
+- Windows: добавлена постоянная auto-start служба `ClaudeProxyGuard` с защищёнными helpers в ProgramData, pinned NetworkFence, impersonation/SID/ProfileList authorization и узким native protocol без произвольного executable/args или запуска Claude.
+- Первый install и privileged update требуют UAC; повторный install для current/running и обычные сессии без изменения service binaries не вызывают повторного повышения. Uninstall выполняется отдельным elevated owned request. Production fallback на per-session user-writable helper отсутствует.
+- `ServiceIntegration` подключён к реальному main-process backend; serviceLaunch сохраняет прежние NetworkFence proof, stage/approval, timeout и close/fatal semantics. NSIS/Inno ждут service request и fail closed, включая явный exit 2. NSIS update сохраняет службу, а manual uninstall выполняет отдельный `--request-uninstall`. Профиль, CodeState, settings и ip-memory сохраняются.
+- Добавлены unit protocol/status/serialization/authorization/failure tests и Windows-native service/WFP probe. На выделенном Windows x64 проверены csc, install/start/stop/update/uninstall, no-repeat `elevated:false` и реальные WFP install/remove; тестовая служба удалена. Interactive standard-user UAC, Global mutex и Chat network/SOCKS5 подтверждены. Реальный `codeEnabled` сеанс через SYSTEM service прошёл `CodeFenceSession`, same-PID freeze/thaw, kill switch, restart и cleanup. Windows-native NSIS прошёл install, current same-version update и manual uninstall с совпадающими SHA-256 service binaries; A→B между разными версиями и Inno migration этим не заменяются.
+- Закрыты lifecycle races: атомарный launch/stop admission, отказ stop/update/uninstall при active broker, management mutex и read-only orphan process checks перед replace/delete. Native regressions покрывают оба порядка launch/stop, concurrent updates, crash-created orphan и очистку fixture.
+- Global management mutex больше не назначает владельца через SDDL: standard user может создать его для start/stop; mutex используется только для сериализации. Исправлено безопасное чтение pinned IP и официального Code asset на Windows, где `lstat.dev=0`, а `fstat.dev` содержит volume id; на других платформах device mismatch по-прежнему отклоняется, inode проверяется всегда.
+- При NSIS E2E обнаружен повреждённый macOS/Wine uninstaller, который не проходил собственную integrity check. Проверки не отключались: успешный install/current update/manual uninstall повторён на Windows-native NSIS; cross-built uninstaller в proof не принят.
+- Windows: обновлены визуальная иерархия, карточки статусов, локальные иконки и адаптивные состояния; светлая/тёмная темы, keyboard focus, reduced motion, 320px и 200% zoom проверяются UI-smoke.
+- macOS: приложение запускается в меню-баре с template-значком и меню состояния. Главное окно открывается по запросу и скрывается обратно без остановки защищённой сессии; reopen и deep links восстанавливают окно, явный выход использует прежний безопасный shutdown.
+
 ## Windows 0.8.1 / macOS 0.5.1 — 2026-11-05
 
 - Исправлено наложение заголовка главного окна Claude Code: возвращена системная рамка `default` и удалено кастомное смещение нативных кнопок. Патч применяется к фактическому `.vite/build` модулю окна; остальные окна не затронуты.

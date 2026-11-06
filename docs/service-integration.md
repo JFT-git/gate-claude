@@ -1,42 +1,46 @@
-# Контракт интеграции системной службы
+# Интеграция системной службы Windows
 
-## Реальное состояние
+## Реализованная архитектура
 
-Постоянной службы и её привилегированного API в текущем проекте **нет**. Production создаёт `new ServiceIntegration()` без backend. `serviceStatus()` возвращает `available: false`, `state: unavailable`, `SERVICE_API_UNAVAILABLE`; операции возвращают ошибку, не выполняя установку, SCM, PowerShell или повышение. UI скрывает недоступные операции. Он не считает отсутствие backend доказательством отсутствия какой-либо службы на компьютере.
+`GuardService.exe` — постоянная auto-start служба `ClaudeProxyGuard` с API 1. Production создаёт `new ServiceIntegration(new NativeServiceBackend(...))`; запуск Claude проходит через `GuardController → NetworkFence.prepare → serviceLaunch → GuardService → NetworkFence`. Служба не запускает Claude, не принимает произвольный executable или arguments и не выполняет shell/PowerShell-команды клиента.
 
-Текущая цепочка `GuardController → NetworkFence.prepare → UAC → подтверждение WFP` сохранена. На macOS постоянная служба также не используется, а системного сетевого запрета нет.
+При установке и privileged update `GuardService.exe` и неизменный `NetworkFence.exe` копируются в `C:\ProgramData\Claude Proxy Guard\Service`. Изменять файлы и каталог могут только SYSTEM и Administrators. Служба запускает только защищённый `NetworkFence.exe` с аргументами `--pipe gate-network-fence-[32hex] --token [64hex]`; SHA-256 NetworkFence закреплён в GuardService и сверяется перед установкой и запуском. Существующая WFP-логика `NetworkFence.cs` не изменена.
 
-## Предлагаемый интерфейс backend
+User-writable `GuardService.exe` из ресурсов приложения является requester/installer. Повышенный процесс из такого источника возможен только после явного UAC для install/update/uninstall. В обычной сессии requester работает без повышения, а SYSTEM запускает лишь binary из защищённого каталога. Silent fallback на запуск user-writable helper как SYSTEM отсутствует.
 
-Адаптер `Windows/src/service-integration.cjs` принимает необязательный объект с асинхронными методами:
+## UAC и жизненный цикл
 
-```js
-getStatus() // → { schema: 1, available: true, state, version: string|null, actions: [] }
-install()
-start()
-stop()
-update()
-uninstall()
-```
+- **Первая установка:** NSIS после копирования файлов вызывает `resources\GuardService.exe --request-install --owner 0` и ждёт завершения. Один системный запрос разрешает копирование, создание и запуск службы. Ошибка, включая native exit 2, прерывает установку и не маскируется как успех.
+- **Повторный `--request-install`:** сначала читает authoritative status. Если текущая совместимая служба уже running, возвращает `elevated:false` и не создаёт UAC. Current stopped запускается через узкий SCM request без повторной установки.
+- **Обычные сессии:** ensure/read-back подтверждает running и API 1; per-session UAC не нужен. Backend сериализует операции, поэтому одновременные запуски не создают параллельные install/UAC.
+- **Обновление приложения:** если GuardService и NetworkFence byte-identical текущим защищённым binaries, UAC не вызывается. NSIS в режиме `--updated` не вызывает `--request-uninstall` и сохраняет текущую службу; ручной uninstall выполняет отдельный owned request. Изменение любого из binaries означает `update_required` и новый privileged update с UAC. Пересборка старым stock `csc` может изменить bytes даже без изменения исходника; это тоже privileged binary update.
+- **Start/stop:** отдельные фиксированные native requests. Service DACL даёт Authenticated Users только query/start/stop/read control, а SYSTEM/Administrators — full control. Под общим `Sync` stop сначала запрещает новые launches и атомарно проверяет brokers. При active broker accepting восстанавливается, а stop/update/uninstall завершаются ошибкой без stopped/deleted service с новым broker. Уже принятые, но ещё не зарегистрированные clients проходят тот же admission gate.
+- **Удаление:** требуется явный `--request-uninstall` и elevation. При активных brokers действие скрыто из capabilities и повторно отклоняется перед stop. ImagePath службы должен точно соответствовать owned protected binary. Удаляются только два известных helper и пустые собственные каталоги; чужие файлы, ACL, службы, профиль, CodeState, Workspace, settings и ip-memory не затрагиваются. Удаление и privileged update не обещаются бесплатными.
 
-Допустимые `state`: `not_installed`, `installing`, `running`, `stopped`, `error`, `update_required`. Только backend определяет авторитетное состояние и доступные `actions` из `install/start/stop/update/uninstall`. Ответ без точной схемы даёт ошибку состояния; сообщения неизвестного backend не копируются в UI. После операции адаптер **перечитывает** статус, а не предполагает `running`. Одновременные операции блокируются. Никакой backend из renderer подключить нельзя.
+Install/update/uninstall/start/stop сериализуются `Global\ClaudeProxyGuard.Management.v1` между процессами и Windows terminal sessions с bounded wait; Authenticated Users получают только synchronize/modify-state, без write DACL/owner. SDDL не назначает владельца: им становится фактический creator mutex, поэтому standard user может создать его при первом start/stop. Mutex нужен только для сериализации, не для авторизации: install/uninstall по-прежнему требуют administrator, а start/stop разрешены отдельной service policy. Status и launch не ждут management mutex. Update/uninstall дополнительно выполняют read-only enumeration процессов по полному пути protected NetworkFence до stop и повторно перед replace/delete. Поэтому живой orphan broker после остановки или crash службы блокирует замену и удаление без попытки завершить чужой процесс.
 
-Существующая IPC-обёртка проверяет sender/main frame. Новые методы preload: `window.guard.serviceStatus()` и `window.guard.serviceOperation(action)`. Это UI-контракт, не привилегированное IPC службы и не её протокол безопасности.
+Portable ZIP содержит тот же service requester и при первой защищённой сессии тоже требует установку службы с UAC. Portable не означает отсутствие системных изменений. Тестовые/source fixtures, которые не передают `serviceLaunch`, сохраняют старый `options.launch`/elevation mock; production main всегда получает real backend и не откатывается на per-session helper при ошибке службы.
 
-## UX при наличии будущего реального API
+## Авторизация privileged pipe
 
-- Не установлена: «Установить службу…», только если backend разрешает install.
-- Установка: неопределённый индикатор, ожидание штатного системного запроса; двойной запрос запрещён.
-- Работает: состояние API, доступные действия только по capabilities backend.
-- Остановлена: «Запустить службу», если разрешено.
-- Ошибка: понятное фиксированное сообщение и повторное чтение статуса.
-- Требуется обновление: «Обновить службу…»; возможен UAC.
-- Удаление: только явная операция backend; возможен UAC. Удаление файлов приложения не заменяет удаление службы.
+Имя pipe: `\\.\pipe\ClaudeProxyGuard.Service.v1`. DACL разрешает обмен Authenticated Users и полный доступ SYSTEM/Administrators. Для каждого launch служба:
 
-## Зависимости, которые не реализуются этим обновлением
+1. Ограничивает одно сообщение 2048 bytes, применяет timeouts, допускает до 4 клиентов и до 16 broker processes; повторное имя pipe отклоняется.
+2. Читает только `status` или `launch\t[base64 root]\t[pipe]\t[token]`.
+3. Через impersonation получает SID клиента и его `ProfileImagePath` из `HKLM\...\ProfileList\<SID>`.
+4. Требует canonical local root строго внутри профиля именно этого SID, имя каталога `Runtime-[24hex]` и `guard-manifest.json`. UNC, reparse points, выход за профиль и malformed base64 отклоняются.
+5. Запускает только protected NetworkFence. NetworkFence независимо повторяет полную проверку inventory, manifest, списка EXE, links/hardlinks и WFP install/remove. Случайный token и обратное подключение к user pipe сохранены.
 
-Для сценария «администратор подтверждает один раз, обычные сессии без UAC» нужны реальная установка/обновление/удаление службы, проверка издателя и версии, аутентифицированный протокол с минимальными полномочиями, проверка клиента/путей/образов, корректное завершение jobs и WFP, авторитетные статусы и отдельная интеграция контроллера с этим backend. Только после этого можно менять маршрутизацию защищённых сессий. Адаптер намеренно возвращает `sessionRoutingSupported: false` даже для тестируемого будущего backend.
+Renderer получает только прежние `window.guard.serviceStatus()` и `serviceOperation(action)` через проверенный Electron IPC. Privileged pipe и `NativeServiceBackend` доступны только main process. Ошибки native/service возвращаются как ограниченные коды и фиксированные сообщения без token, аргументов, путей профиля или stderr.
 
-Установщик пользователя сейчас устанавливает **только файлы приложения**. Он не создаёт службу и не устраняет UAC движка. Политика выдачи прав start/stop службы должна быть отдельным решением ИБ; интерфейс не утверждает, что любое действие доступно без администратора.
+## Статусы и контракт JS
 
-Тестовые состояния проверяют только отображение и контракт. Тестовый ответ `running` не является доказательством установленной службы и не входит в production backend.
+`NativeServiceBackend` вызывает только `--status`, `--request-install`, `--start`, `--stop`, `--request-uninstall` и фиксированный `--launch`. Ответы имеют строгую schema и точный набор полей. `ServiceIntegration` допускает состояния `not_installed`, `installing`, `running`, `stopped`, `error`, `update_required` и operations `install/start/stop/update/uninstall` только из authoritative capabilities.
+
+`sessionRoutingSupported:true` допустимо исключительно для running service с совместимым API и подтверждённым pipe handshake. Любая ошибка, stopped, not installed или update required даёт `false`. После install/start/stop/update/uninstall адаптер перечитывает статус, а не считает возврат операции доказательством состояния. Controller не запускает Claude без последующего точного WFP proof от NetworkFence; stage/approval, timeouts, close/fatal и persistent BLOCK semantics сохранены.
+
+## Проверено и оставшиеся ограничения
+
+На выделенном Windows 11 x64 ПК выполнены stock `.NET Framework` csc build, clean install, running read-back, no-repeat install (`elevated:false`), native stop/start, privileged update, request install/uninstall, ACL/status checks и реальный service→NetworkFence handshake с WFP install/remove. Root вне профиля отклонён. Interactive limited-token install с видимым UAC, создание/open Global mutex, stop/start и две последовательные service-сессии подтверждены. Chat network и SOCKS5 через SYSTEM service прошли running, same-PID freeze/thaw, kill switch, restart и cleanup. Реальный `codeEnabled` сеанс через SOCKS5 дополнительно подтвердил `CodeHost --prepare-state`, `CodeFenceSession` с 10 фильтрами и cleanup через SYSTEM service. Windows-native NSIS прошёл fresh install, current same-version update и manual uninstall; при update сохранились service process и byte-identical protected binaries, после uninstall service и protected root отсутствуют.
+
+**Ограничения текущей валидации:** A→B между разными версиями, differential download и реальная Inno migration не выполнялись. Собранный на macOS через Wine NSIS uninstaller не прошёл собственную integrity check; успешный lifecycle относится к Windows-native NSIS build, integrity checks не отключались. Roaming/UNC/reparse profile paths fail closed; их поддержка не заявляется. Реальный account login и физическая смена WAN в synthetic TLS fixture не проверялись.

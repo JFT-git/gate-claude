@@ -1,54 +1,190 @@
 <!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>Claude Proxy Guard</title><link rel="stylesheet" href="style.css">
+  <title>Claude Proxy Guard</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <a class="skip-link" href="#sessionActions">К управлению сессией</a>
-<header class="app-header"><div class="brand"><svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 3 6v6c0 5 9 10 9 10s9-5 9-10V6Z"/><path d="m8 12 3 3 5-6"/></svg><div><h1>Claude Proxy Guard</h1><p class="muted">Контроль подключения <span aria-hidden="true">·</span> Windows <span id="version"></span></p></div></div><button id="openLogs" type="button" class="secondary"><svg class="icon" aria-hidden="true"><use href="icons.svg#journal"/></svg>Журнал</button></header>
+<header class="app-header">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><use href="icons.svg#shield-check"/></svg>
+    <div class="brand-copy">
+      <h1>Claude Proxy Guard</h1>
+      <p class="muted">Контроль подключения <span aria-hidden="true">·</span> Windows <span id="version"></span></p>
+    </div>
+  </div>
+  <button id="openLogs" type="button" class="secondary header-action"><svg class="icon" aria-hidden="true"><use href="icons.svg#journal"/></svg>Журнал</button>
+</header>
 <main>
   <section class="status-card" aria-labelledby="state">
-    <div class="status-heading"><span id="lamp" class="lamp" aria-hidden="true"></span><div class="status-copy" aria-live="polite" aria-atomic="true"><span class="eyebrow">Сессия Claude</span><h2 id="state">Открываем Guard…</h2><p id="message">Загружаем состояние приложения.</p></div><span id="country" class="pill">IP не закреплён</span></div>
-    <p id="approvalHint" class="notice" hidden>Подтвердите системный запрос для NetworkFence.exe. Выберите «Нет», чтобы отменить повышение. Пока окно Windows не закрыто, повторный запрос и перезапуск недоступны.</p>
-    <div id="processStatus" class="process-status" data-state="running"><div><span class="eyebrow">Процессы Claude</span><strong id="processState" role="status">Не запущены</strong></div><span id="processCountdown" class="process-countdown" role="timer" hidden></span></div>
-    <p id="processHint" class="hint process-hint">Состояние процессов подтверждается через Windows Job Object.</p>
-    <div id="sessionActions" class="action-group" role="group" aria-label="Управление сессией и приложением" tabindex="-1">
-      <button id="start" type="submit" form="settings" class="primary" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#play"/></svg><span>Запустить</span></button>
-      <button id="stop" type="button" class="secondary" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#stop"/></svg><span>Остановить</span></button>
-      <button id="restart" type="button" class="secondary" aria-label="Перезапустить Guard" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#restart"/></svg><span>Перезапустить</span></button>
+    <div class="session-overview">
+      <div class="status-heading">
+        <span class="status-symbol">
+          <svg class="status-icon" aria-hidden="true"><use id="stateIcon" href="icons.svg#shield"/></svg>
+          <span id="lamp" class="lamp" aria-hidden="true"></span>
+        </span>
+        <div class="status-copy" aria-live="polite" aria-atomic="true">
+          <span class="eyebrow">Сессия Claude</span>
+          <h2 id="state">Открываем Guard…</h2>
+          <p id="message">Загружаем состояние приложения.</p>
+        </div>
+        <span class="pill"><svg class="icon" aria-hidden="true"><use href="icons.svg#globe"/></svg><span id="country">IP не закреплён</span></span>
+      </div>
+      <p id="approvalHint" class="notice" hidden><svg class="icon" aria-hidden="true"><use href="icons.svg#alert"/></svg><span>Подтвердите системный запрос для NetworkFence.exe. Выберите «Нет», чтобы отменить повышение. Пока окно Windows не закрыто, повторный запрос и перезапуск недоступны.</span></p>
+      <div id="sessionActions" class="action-group" role="group" aria-label="Управление сессией и приложением" tabindex="-1">
+        <button id="start" type="submit" form="settings" class="primary" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#play"/></svg><span>Запустить</span></button>
+        <button id="stop" type="button" class="secondary" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#stop"/></svg><span>Остановить</span></button>
+        <button id="restart" type="button" class="secondary" aria-label="Перезапустить Guard" aria-describedby="actionReason" disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#restart"/></svg><span>Перезапустить</span></button>
+      </div>
+      <p id="actionReason" class="hint">Запуск проверяет подключение. Перезапуск заново открывает Guard и закрывает его сессию Claude.</p>
+      <div id="restartConfirm" class="notice confirm-row" role="group" aria-label="Подтверждение перезапуска" hidden>
+        <span id="restartConfirmText">Перезапуск закроет текущую сессию Claude, пароль прокси потребуется ввести снова.</span>
+        <button id="restartConfirmYes" type="button" class="primary" aria-describedby="restartConfirmText">Перезапустить</button>
+        <button id="restartConfirmNo" type="button" class="secondary">Отмена</button>
+      </div>
+      <div id="activity" class="activity" role="progressbar" aria-label="Выполняется действие Guard" hidden><span class="spinner" aria-hidden="true"></span><span id="activityText">Дождитесь завершения действия.</span></div>
     </div>
-    <p id="actionReason" class="hint">Запуск проверяет подключение. Перезапуск заново открывает Guard и закрывает его сессию Claude.</p>
-    <div id="restartConfirm" class="notice confirm-row" role="group" aria-label="Подтверждение перезапуска" hidden><span id="restartConfirmText">Перезапуск закроет текущую сессию Claude, пароль прокси потребуется ввести снова.</span><button id="restartConfirmYes" type="button" class="primary" aria-describedby="restartConfirmText">Перезапустить</button><button id="restartConfirmNo" type="button" class="secondary">Отмена</button></div>
-    <div id="activity" class="activity" role="progressbar" aria-label="Выполняется действие Guard" hidden><span class="spinner" aria-hidden="true"></span><span id="activityText">Дождитесь завершения действия.</span></div>
+    <aside class="process-panel" aria-label="Состояние процессов Claude">
+      <div id="processStatus" class="process-status" data-state="running">
+        <div class="process-copy">
+          <span class="process-label"><svg class="icon" aria-hidden="true"><use id="processIcon" href="icons.svg#process"/></svg><span class="eyebrow">Процессы Claude</span></span>
+          <strong id="processState" role="status">Не запущены</strong>
+        </div>
+        <span id="processCountdown" class="process-countdown" role="timer" hidden></span>
+      </div>
+      <p id="processHint" class="hint process-hint">Состояние процессов подтверждается через Windows Job Object.</p>
+    </aside>
     <p id="lastOperation" class="operation-result" role="status">Последняя операция: действий ещё не было.</p>
   </section>
-  <section id="updateCard" class="service-card" aria-labelledby="updateHeading"><div class="service-summary"><div><h2 id="updateHeading">Обновление Guard</h2><p id="updateMessage" class="muted" role="status">Проверка станет доступна после загрузки окна.</p></div><span id="updateState" class="status-tag" data-state="idle">Ожидание</span></div><div class="service-bottom"><p class="hint">Проверяются только стабильные выпуски GitHub. Обновление скачивается в фоне; установка начинается только после вашего подтверждения.</p><div class="wrap-actions"><button id="updateCheck" type="button" class="secondary small" disabled>Проверить обновление</button><button id="updateInstall" type="button" class="primary small" hidden>Установить и перезапустить…</button></div></div><progress id="updateProgress" max="100" value="0" hidden aria-label="Загрузка обновления"></progress><div id="updateConfirm" class="notice confirm-row" role="group" aria-label="Подтверждение установки обновления" hidden><span id="updateConfirmText">Guard остановит Claude, завершит операции защиты, установит обновление и перезапустится. Profile, CodeState, Workspace, settings.json и ip-memory.json сохраняются.</span><button id="updateConfirmYes" type="button" class="primary" aria-describedby="updateConfirmText">Остановить, установить и перезапустить</button><button id="updateConfirmNo" type="button" class="secondary">Отмена</button></div></section>
-  <section id="errorBanner" class="error-banner" role="alert" hidden><div><strong>Действие не завершено</strong><p id="errorText"></p></div><div class="inline"><button id="errorLogs" type="button" class="secondary">Открыть журнал</button><button id="dismissError" type="button" class="secondary" aria-label="Скрыть сообщение об ошибке">Скрыть</button></div></section>
-  <section class="service-card" aria-labelledby="serviceHeading"><div class="service-summary"><div><h2 id="serviceHeading">Системная служба</h2><p id="serviceMessage" class="muted">Проверяем доступность интеграции…</p></div><span id="serviceState" class="status-tag">Проверка</span></div><div class="service-bottom"><p id="serviceRouting" class="hint">Постоянный режим без повторного UAC требует отдельной реализации службы и подключения движка.</p><button id="serviceRefresh" type="button" class="secondary small"><svg class="icon" aria-hidden="true"><use href="icons.svg#restart"/></svg>Проверить состояние</button></div><div id="serviceActivity" class="activity" role="status" hidden><span class="spinner" aria-hidden="true"></span><span>Ожидаем подтверждённый ответ API службы…</span></div><div id="serviceActions" class="service-actions" hidden><button type="button" data-service="install">Установить службу…</button><button type="button" data-service="start">Запустить службу</button><button type="button" data-service="stop">Остановить службу</button><button type="button" data-service="update">Обновить службу…</button><button type="button" data-service="uninstall">Удалить службу…</button></div></section>
-  <section class="service-card" aria-labelledby="ipMemoryHeading"><h2 id="ipMemoryHeading">Постоянный IP</h2><p id="savedIP" class="muted" role="status">Читаем закреплённый адрес…</p><p class="hint" id="ipMemoryHint">Первый успешно проверенный IP сохраняется между запусками. Общий выход и маршруты Claude должны использовать этот адрес. Другой IP блокируется.</p><button id="resetIP" type="button" class="secondary small" aria-describedby="ipMemoryHint" disabled>Сбросить закрепление…</button></section>
+
+  <section id="errorBanner" class="error-banner" role="alert" hidden>
+    <svg class="icon error-icon" aria-hidden="true"><use href="icons.svg#alert"/></svg>
+    <div class="error-copy"><strong>Действие не завершено</strong><p id="errorText"></p></div>
+    <div class="inline"><button id="errorLogs" type="button" class="secondary">Открыть журнал</button><button id="dismissError" type="button" class="secondary" aria-label="Скрыть сообщение об ошибке">Скрыть</button></div>
+  </section>
+
+  <div class="support-grid">
+    <section id="updateCard" class="service-card" aria-labelledby="updateHeading">
+      <div class="service-summary">
+        <div>
+          <div class="card-heading"><svg class="icon" aria-hidden="true"><use href="icons.svg#download"/></svg><h2 id="updateHeading">Обновление Guard</h2></div>
+          <p id="updateMessage" class="muted" role="status">Проверка станет доступна после загрузки окна.</p>
+        </div>
+        <span id="updateState" class="status-tag" data-state="idle">Ожидание</span>
+      </div>
+      <div class="service-bottom">
+        <p class="hint">Проверяются только стабильные выпуски GitHub. Обновление скачивается в фоне; установка начинается только после вашего подтверждения.</p>
+        <div class="wrap-actions"><button id="updateCheck" type="button" class="secondary small" disabled>Проверить обновление</button><button id="updateInstall" type="button" class="primary small" hidden>Установить и перезапустить…</button></div>
+      </div>
+      <progress id="updateProgress" max="100" value="0" hidden aria-label="Загрузка обновления"></progress>
+      <div id="updateConfirm" class="notice confirm-row" role="group" aria-label="Подтверждение установки обновления" hidden>
+        <span id="updateConfirmText">Guard остановит Claude, завершит операции защиты, установит обновление и перезапустится. Profile, CodeState, Workspace, settings.json и ip-memory.json сохраняются.</span>
+        <button id="updateConfirmYes" type="button" class="primary" aria-describedby="updateConfirmText">Остановить, установить и перезапустить</button>
+        <button id="updateConfirmNo" type="button" class="secondary">Отмена</button>
+      </div>
+    </section>
+
+    <section class="service-card" aria-labelledby="serviceHeading">
+      <div class="service-summary">
+        <div>
+          <div class="card-heading"><svg class="icon" aria-hidden="true"><use href="icons.svg#server"/></svg><h2 id="serviceHeading">Системная служба</h2></div>
+          <p id="serviceMessage" class="muted">Проверяем доступность интеграции…</p>
+        </div>
+        <span id="serviceState" class="status-tag">Проверка</span>
+      </div>
+      <div class="service-bottom">
+        <p id="serviceRouting" class="hint">Проверяем состояние постоянной службы и возможность запуска без повторного UAC.</p>
+        <button id="serviceRefresh" type="button" class="secondary small"><svg class="icon" aria-hidden="true"><use href="icons.svg#restart"/></svg>Проверить состояние</button>
+      </div>
+      <div id="serviceActivity" class="activity" role="status" hidden><span class="spinner" aria-hidden="true"></span><span>Ожидаем подтверждённый ответ API службы…</span></div>
+      <div id="serviceActions" class="service-actions" hidden><button type="button" data-service="install">Установить службу…</button><button type="button" data-service="start">Запустить службу</button><button type="button" data-service="stop">Остановить службу</button><button type="button" data-service="update">Обновить службу…</button><button type="button" data-service="uninstall">Удалить службу…</button></div>
+    </section>
+
+    <section class="service-card" aria-labelledby="ipMemoryHeading">
+      <div class="card-heading"><svg class="icon" aria-hidden="true"><use href="icons.svg#pin"/></svg><h2 id="ipMemoryHeading">Постоянный IP</h2></div>
+      <p id="savedIP" class="muted saved-ip" role="status">Читаем закреплённый адрес…</p>
+      <div class="service-bottom">
+        <p class="hint" id="ipMemoryHint">Первый успешно проверенный IP сохраняется между запусками. Общий выход и маршруты Claude должны использовать этот адрес. Другой IP блокируется.</p>
+        <button id="resetIP" type="button" class="secondary small" aria-describedby="ipMemoryHint" disabled>Сбросить закрепление…</button>
+      </div>
+    </section>
+  </div>
+
   <div class="columns">
-    <section class="panel connection" aria-labelledby="connectionHeading"><h2 id="connectionHeading">Подключение</h2>
+    <section class="panel connection" aria-labelledby="connectionHeading">
+      <div class="card-heading panel-heading"><svg class="icon" aria-hidden="true"><use href="icons.svg#settings"/></svg><h2 id="connectionHeading">Подключение</h2></div>
       <form id="settings">
         <input id="claudeSource" type="hidden" value="auto">
-        <fieldset><legend>Claude Desktop</legend><p class="hint" id="claudeStatus" role="status">Автопоиск установленного приложения…</p><label class="visually-hidden" for="claudePath">Путь установленного Claude Desktop</label><div class="inline"><input id="claudePath" placeholder="Ищем в установленных пакетах Windows" readonly><button type="button" id="find" class="secondary" title="Найти установленный Claude"><svg class="icon" aria-hidden="true"><use href="icons.svg#search"/></svg><span>Найти</span></button><button type="button" id="choose" class="secondary" title="Указать EXE вручную">EXE…</button></div></fieldset>
-        <fieldset><legend>Маршрут сети</legend><label for="mode">Подключение</label><select id="mode"><option value="network">Текущая сеть / VPN</option><option value="socks5">SOCKS5-прокси</option></select>
-          <div id="proxyFields" hidden><div class="row"><label class="grow">Хост SOCKS5<input id="host" placeholder="127.0.0.1" autocomplete="off"></label><label class="port">Порт<input id="port" type="number" min="1" max="65535"></label></div><div class="row"><label>Логин<input id="username" autocomplete="off"></label><label>Пароль<input id="password" type="password" autocomplete="off" placeholder="Только в памяти"></label></div></div>
+        <fieldset>
+          <legend>Claude Desktop</legend>
+          <p class="hint" id="claudeStatus" role="status">Автопоиск установленного приложения…</p>
+          <label class="visually-hidden" for="claudePath">Путь установленного Claude Desktop</label>
+          <div class="inline path-controls">
+            <input id="claudePath" placeholder="Ищем в установленных пакетах Windows" readonly>
+            <button type="button" id="find" class="secondary" title="Найти установленный Claude"><svg class="icon" aria-hidden="true"><use href="icons.svg#search"/></svg><span>Найти</span></button>
+            <button type="button" id="choose" class="secondary" title="Указать EXE вручную"><svg class="icon" aria-hidden="true"><use href="icons.svg#folder"/></svg>EXE…</button>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Маршрут сети</legend>
+          <label for="mode">Подключение</label>
+          <select id="mode"><option value="network">Текущая сеть / VPN</option><option value="socks5">SOCKS5-прокси</option></select>
+          <div id="proxyFields" hidden>
+            <div class="row"><label class="grow">Хост SOCKS5<input id="host" placeholder="127.0.0.1" autocomplete="off"></label><label class="port">Порт<input id="port" type="number" min="1" max="65535"></label></div>
+            <div class="row"><label>Логин<input id="username" autocomplete="off"></label><label>Пароль<input id="password" type="password" autocomplete="off" placeholder="Только в памяти"></label></div>
+          </div>
           <p id="networkHint" class="hint">Используется поддерживаемый системный прокси Windows или текущий маршрут VPN. Проверяются общий IP и выход к Claude.</p>
         </fieldset>
-        <fieldset><legend>Claude Code</legend><label class="check"><input type="checkbox" id="codeEnabled"> Включить Code в изоляции Guard</label><p class="hint" id="workspaceHint">Без выбранного проекта используется постоянная Workspace. Её файлы сохраняются после выхода. Code, native Git HTTPS и PowerShell работают с ограниченными правами; Git Bash и Git SSH недоступны.</p><button type="button" id="codeWorkspace" class="secondary" aria-describedby="workspaceHint"><svg class="icon" aria-hidden="true"><use href="icons.svg#folder"/></svg>Открыть рабочую папку</button></fieldset>
-        <details class="settings-details"><summary>Профиль страницы и диагностика</summary><div class="details-content"><div class="row"><label>Часовой пояс<select id="timezone"><option>Europe/Amsterdam</option><option>Europe/London</option><option>Europe/Berlin</option><option>America/New_York</option><option>Etc/UTC</option></select></label><label>Язык<select id="language"><option>en-US</option><option>en-GB</option><option>nl-NL</option><option>de-DE</option><option>fr-FR</option></select></label></div><label>Проверка IP<select id="interval"><option value="2">Каждые 2 секунды</option><option value="5">Каждые 5 секунд</option><option value="10">Каждые 10 секунд</option><option value="30">Каждые 30 секунд</option></select></label><label class="check"><input type="checkbox" id="captureBodies"> Показывать тела запросов и ответов</label><p class="hint">Содержимое может включать переписку и секреты. Экспорт нужно проверить перед передачей. Язык и часовой пояс Windows не меняются.</p></div></details>
-        <fieldset class="protocol-choice"><legend>Ссылки входа Claude</legend><p id="protocolHint" class="hint">Проверяем обработчик ссылок входа…</p><div class="wrap-actions"><button id="protocolSettings" type="button" class="secondary small">Выбрать Guard в Windows</button><button id="protocolCheck" type="button" class="secondary small">Проверить выбор</button></div></fieldset>
+        <fieldset>
+          <legend>Claude Code</legend>
+          <label class="check"><input type="checkbox" id="codeEnabled"> Включить Code в изоляции Guard</label>
+          <p class="hint" id="workspaceHint">Без выбранного проекта используется постоянная Workspace. Её файлы сохраняются после выхода. Code, native Git HTTPS и PowerShell работают с ограниченными правами; Git Bash и Git SSH недоступны.</p>
+          <button type="button" id="codeWorkspace" class="secondary" aria-describedby="workspaceHint"><svg class="icon" aria-hidden="true"><use href="icons.svg#folder"/></svg>Открыть рабочую папку</button>
+        </fieldset>
+        <details class="settings-details">
+          <summary>Профиль страницы и диагностика</summary>
+          <div class="details-content">
+            <div class="row"><label>Часовой пояс<select id="timezone"><option>Europe/Amsterdam</option><option>Europe/London</option><option>Europe/Berlin</option><option>America/New_York</option><option>Etc/UTC</option></select></label><label>Язык<select id="language"><option>en-US</option><option>en-GB</option><option>nl-NL</option><option>de-DE</option><option>fr-FR</option></select></label></div>
+            <label>Проверка IP<select id="interval"><option value="2">Каждые 2 секунды</option><option value="5">Каждые 5 секунд</option><option value="10">Каждые 10 секунд</option><option value="30">Каждые 30 секунд</option></select></label>
+            <label class="check"><input type="checkbox" id="captureBodies"> Показывать тела запросов и ответов</label>
+            <p class="hint">Содержимое может включать переписку и секреты. Экспорт нужно проверить перед передачей. Язык и часовой пояс Windows не меняются.</p>
+          </div>
+        </details>
+        <fieldset class="protocol-choice">
+          <legend>Ссылки входа Claude</legend>
+          <p id="protocolHint" class="hint">Проверяем обработчик ссылок входа…</p>
+          <div class="wrap-actions"><button id="protocolSettings" type="button" class="secondary small">Выбрать Guard в Windows</button><button id="protocolCheck" type="button" class="secondary small">Проверить выбор</button></div>
+        </fieldset>
       </form>
       <div class="verified"><span class="eyebrow">Фактический профиль страницы</span><strong id="profile">Ожидаем запуск Claude</strong><span class="muted" id="locale">Проверяются Intl, navigator и Accept-Language</span></div>
     </section>
-    <section class="panel monitor" aria-label="Наблюдение за сессией"><div class="monitor-toolbar"><div class="tabs" role="tablist" aria-label="Данные сессии"><button id="logsTab" type="button" class="tab active" role="tab" aria-selected="true" aria-controls="logs" tabindex="0">Журнал</button><button id="trafficTab" type="button" class="tab" role="tab" aria-selected="false" aria-controls="traffic" tabindex="-1">Трафик <span id="count">0</span></button></div><button id="export" type="button" class="secondary small" hidden disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#download"/></svg>Экспорт JSON</button></div>
-      <div id="logs" class="logs" role="tabpanel" aria-labelledby="logsTab" tabindex="0"><p id="logsEmpty" class="empty">Здесь появятся этапы запуска и результаты проверок.<br>Запустите сессию, чтобы начать.</p></div>
-      <div id="traffic" role="tabpanel" aria-labelledby="trafficTab" tabindex="0" hidden><p class="traffic-note">Локальный просмотр. До 200 записей в памяти; некоторые потоки могут быть неполными.</p><div id="requests" class="requests"><p class="empty">Доступные веб-запросы появятся после запуска Claude.</p></div><div id="detail" class="detail"><p class="empty">Выберите запрос для просмотра.</p></div></div>
+
+    <section class="panel monitor" aria-label="Наблюдение за сессией">
+      <div class="monitor-toolbar">
+        <div class="tabs" role="tablist" aria-label="Данные сессии">
+          <button id="logsTab" type="button" class="tab active" role="tab" aria-selected="true" aria-controls="logs" tabindex="0"><svg class="icon" aria-hidden="true"><use href="icons.svg#journal"/></svg>Журнал</button>
+          <button id="trafficTab" type="button" class="tab" role="tab" aria-selected="false" aria-controls="traffic" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="icons.svg#traffic"/></svg>Трафик <span id="count">0</span></button>
+        </div>
+        <button id="export" type="button" class="secondary small" hidden disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#download"/></svg>Экспорт JSON</button>
+      </div>
+      <div id="logs" class="logs" role="tabpanel" aria-labelledby="logsTab" tabindex="0">
+        <div id="logsEmpty" class="empty"><svg class="empty-icon" aria-hidden="true"><use href="icons.svg#journal"/></svg><p>Здесь появятся этапы запуска и результаты проверок.<br>Запустите сессию, чтобы начать.</p></div>
+      </div>
+      <div id="traffic" role="tabpanel" aria-labelledby="trafficTab" tabindex="0" hidden>
+        <p class="traffic-note">Локальный просмотр. До 200 записей в памяти; некоторые потоки могут быть неполными.</p>
+        <div id="requests" class="requests"><p class="empty">Доступные веб-запросы появятся после запуска Claude.</p></div>
+        <div id="detail" class="detail"><p class="empty">Выберите запрос для просмотра.</p></div>
+      </div>
     </section>
   </div>
-  <footer>Guard использует собственную копию и отдельный профиль Claude. Закрытие Guard завершает его копию Claude. Оригинальные файлы Claude, язык и часовой пояс Windows не меняются.</footer>
+  <footer><svg class="icon" aria-hidden="true"><use href="icons.svg#shield-check"/></svg><span>Guard использует собственную копию и отдельный профиль Claude. Закрытие Guard завершает его копию Claude. Оригинальные файлы Claude, язык и часовой пояс Windows не меняются.</span></footer>
   <details class="limits"><summary>Границы защиты и привилегий</summary><p>Windows устанавливает WFP-ограничения для проверенных EXE частной копии и запускает runtime через Job Object. Это ограничение Chat по путям EXE. Claude Code использует отдельные AppContainer и CodeGate; эти режимы не являются полной изоляцией компьютера или системных служб. Текущий NetworkFence — брокер сессии, не постоянная служба.</p><p>Проверки ipwho.is, ipify и служебных адресов claude.ai / api.anthropic.com получают внешний IP без данных чата. Проверка периодическая: между изменением удалённого IP и его обнаружением есть интервал. После подтверждённого запуска временный сбой или другой IP немедленно закрывает потоки и приостанавливает процессы на непродлеваемые 20 секунд. Полная проверка прежнего IP возобновляет их; иначе Claude корректно закрывается, а потоки не восстанавливаются. До подтверждённого запуска, при RU и сбоях защиты сессия блокируется сразу.</p><p>Неизвестные секреты могут остаться в данных трафика. Guard не устанавливает сертификаты MITM и не отключает TLS-проверку. Для локальной копии изменяется ASAR; подпись Anthropic не удостоверяет эту копию. Приложение независимо от Anthropic.</p></details>
-</main><script src="view-model.js"></script><script src="renderer.js"></script>
-</body></html>
+</main>
+<script src="view-model.js"></script>
+<script src="renderer.js"></script>
+</body>
+</html>

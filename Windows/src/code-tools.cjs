@@ -54,7 +54,9 @@ function safeFilesystem(fs = rawFS.promises) {
     const handle = await fs.open(file, 'r');
     try {
       const stat = await handle.stat(), named = await fs.lstat(file);
-      if (!stat.isFile() || stat.nlink !== 1 || !Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > maximum || named.isSymbolicLink() || named.dev !== stat.dev || named.ino !== stat.ino || !samePath(await fs.realpath(file), file)) throw fail();
+      // Windows lstat reports dev=0 while fstat reports the volume id; ino still binds the open file to the inspected path.
+      const windowsDevice = process.platform === 'win32' && named.dev === 0;
+      if (!stat.isFile() || stat.nlink !== 1 || !Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > maximum || named.isSymbolicLink() || (!windowsDevice && named.dev !== stat.dev) || named.ino !== stat.ino || !samePath(await fs.realpath(file), file)) throw fail();
       const bytes = Buffer.alloc(stat.size); let offset = 0;
       while (offset < bytes.length) { const result = await handle.read(bytes, offset, bytes.length - offset, offset); if (!result.bytesRead) throw fail(); offset += result.bytesRead; }
       const extra = await handle.read(Buffer.alloc(1), 0, 1, offset), after = await handle.stat();

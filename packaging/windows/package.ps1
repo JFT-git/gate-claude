@@ -40,5 +40,5 @@ try {
   $digest=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
   [IO.File]::WriteAllText(($_.FullName+'.sha256'),($digest+'  '+$_.Name+"`n"),[Text.UTF8Encoding]::new($false))
  }
- [ordered]@{version=$version;portable='BUILT_UPDATER_DISABLED';installer='BUILT_NOT_INSTALL_TESTED';updateMetadata='SIGNED';differentialBlockmap='BUILT';innoMigration='IMPLEMENTED_NOT_WINDOWS_RUN';installerElevates=$false;installsService=$false;deleteAppDataOnUninstall=$false;runtimeTests='NOT_RUN_BY_PACKAGING';authenticode='NOT_CONFIGURED'}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $ArtifactDir 'windows-build-status.json') -Encoding UTF8
+ [ordered]@{version=$version;portable='BUILT_UPDATER_DISABLED';installer='BUILT_NOT_INSTALL_TESTED';updateMetadata='SIGNED';differentialBlockmap='BUILT';innoMigration='IMPLEMENTED_NOT_WINDOWS_RUN';installerElevates='SERVICE_REQUEST_ON_DEMAND';installsService='REQUEST_INSTALL_FAIL_CLOSED_NOT_WINDOWS_RUN';deleteAppDataOnUninstall=$false;runtimeTests='NOT_RUN_BY_PACKAGING';authenticode='NOT_CONFIGURED'}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $ArtifactDir 'windows-build-status.json') -Encoding UTF8
 }finally{Set-Location $old.Path}

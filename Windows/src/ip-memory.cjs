@@ -15,7 +15,8 @@ class IPMemory {
       if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 4096) throw Error();
       fd = fs.openSync(this.file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
       const actual = fs.fstatSync(fd);
-      if (!actual.isFile() || actual.nlink !== 1 || actual.size > 4096 || actual.ino !== stat.ino || actual.dev !== stat.dev) throw Error();
+      // Windows lstat reports dev=0 while fstat reports the volume id; ino still binds the open file to the inspected path.
+      if (!actual.isFile() || actual.nlink !== 1 || actual.size > 4096 || actual.ino !== stat.ino || (stat.dev !== 0 && actual.dev !== stat.dev)) throw Error();
       const value = JSON.parse(fs.readFileSync(fd, 'utf8'));
       if (!value || value.version !== 1 || Object.keys(value).sort().join(',') !== 'pinnedIP,version') throw Error();
       if (value.pinnedIP === null) return null;

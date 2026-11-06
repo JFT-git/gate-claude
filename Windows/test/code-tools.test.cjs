@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { SOURCE_POLICY, prepareCodeTools, validatePolicy } = require('../src/code-tools.cjs');
+const { SOURCE_POLICY, prepareCodeTools, validatePolicy, safeFilesystem } = require('../src/code-tools.cjs');
 const { sha256, manifestSHA256 } = require('../src/portable-zip.cjs');
 const { buildCodeTools, parseArguments } = require('../scripts/prepare-code-tools.cjs');
 const denied = /Не удалось безопасно подготовить/;
@@ -133,4 +133,26 @@ test('release command parser only accepts all fixed named inputs exactly once', 
   for (const argv of [[], ['--git-root', '../relative'], ['--bad', '/tmp', '--git-root', '/tmp', '--powershell-root', '/tmp', '--git-asset', '/tmp', '--output', '/tmp'], ['--git-root', '/tmp', '--git-root', '/tmp', '--powershell-root', '/tmp', '--git-asset', '/tmp', '--output', '/tmp']]) assert.throws(() => parseArguments(argv));
   const absolute = path.resolve(os.tmpdir(), 'fixture'); const args = ['--git-root', '--powershell-root', '--powershell-bootstrap', '--git-asset', '--powershell-asset', '--output'].flatMap(flag => [flag, absolute]); assert.equal(parseArguments(args).powerShellBootstrap, absolute);
   const duplicate = [...args]; duplicate[4] = '--powershell-root'; assert.throws(() => parseArguments(duplicate));
+});
+
+test('safe read does not extend the Windows dev exception to other platforms', { skip: process.platform === 'win32' }, async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gate-safe-device-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'asset.bin'); fs.writeFileSync(file, 'synthetic-asset');
+  const promises = { ...fs.promises, lstat: async target => {
+    const stat = await fs.promises.lstat(target); stat.dev = 0; return stat;
+  } };
+  await assert.rejects(safeFilesystem(promises).read(file, 64), denied);
+});
+
+test('safe read accepts the same open file when Windows lstat dev is zero', { skip: process.platform !== 'win32' }, async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gate-safe-read-'))); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'asset.bin'); fs.writeFileSync(file, Buffer.from('synthetic-asset'));
+  const named = fs.lstatSync(file), handle = fs.openSync(file, 'r');
+  try {
+    const stat = handle.stat();
+    assert.equal(named.dev, 0); assert.notEqual(stat.dev, 0); assert.equal(stat.ino, named.ino);
+    const bytes = await safeFilesystem(fs.promises).read(file, 64);
+    assert.equal(bytes.toString(), 'synthetic-asset');
+  } finally { await handle.close(); }
 });

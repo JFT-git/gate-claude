@@ -11,6 +11,7 @@ const { diagnostic } = require('./sanitize.cjs');
 const { takeDeepLinkFromArgv, LINK_REFUSED } = require('./deep-link.cjs');
 const { ensureGuardProtocolRegistration, SETTINGS_URL } = require('./protocol-registration.cjs');
 const { ServiceIntegration } = require('./service-integration.cjs');
+const { NativeServiceBackend } = require('./service-backend.cjs');
 const { resetIPWithConfirmation } = require('./ip-reset.cjs');
 const { WindowsUpdater } = require('./updater.cjs');
 
@@ -45,13 +46,16 @@ else {
     });
   }
   app.whenReady().then(async () => {
-    const serviceIntegration = new ServiceIntegration();
+    const ownerWindow = () => {
+      if (!window || window.isDestroyed()) throw Error('Окно Guard недоступно для системного запроса Windows.');
+      window.show(); window.focus();
+      return window.getNativeWindowHandle();
+    };
+    const serviceBackend = new NativeServiceBackend({ helperPath: path.join(resources, 'GuardService.exe'), ownerWindow });
+    const serviceIntegration = new ServiceIntegration(serviceBackend);
     controller = new GuardController(root, resources, {
-      ownerWindow: () => {
-        if (!window || window.isDestroyed()) throw Error('Окно Guard недоступно для системного запроса Windows.');
-        window.show(); window.focus();
-        return window.getNativeWindowHandle();
-      }
+      ownerWindow,
+      serviceLaunch: request => serviceIntegration.launch(request)
     });
     if (!process.argv.includes('--smoke-test')) {
       const autoUpdater = require('electron-updater').autoUpdater;

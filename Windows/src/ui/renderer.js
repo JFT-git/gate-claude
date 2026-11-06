@@ -5,6 +5,7 @@ const fields = ['mode','claudeSource','claudePath','host','port','username','pas
 const records = new Map(), pending = new Set();
 let selected = '', state = { state: 'idle' }, ready = false, finding = false, discoveryGeneration = 0, operationSerial = 0, serviceSnapshot, updateSnapshot;
 const node = (tag, text, cls) => { const result = document.createElement(tag); result.textContent = text; if (cls) result.className = cls; return result; };
+const setIcon = (id, name) => $(id).setAttribute('href', 'icons.svg#' + name);
 function failure(message) { $('errorText').textContent = message; $('errorBanner').hidden = false; }
 function lastOperation(label, result, kind = 'info') {
   $('lastOperation').textContent = 'Последняя операция: ' + label + ' · ' + result + ' · ' + new Date().toLocaleTimeString();
@@ -45,6 +46,8 @@ function showState(value) {
   const previous = state; state = value; document.body.dataset.state = value.state;
   const presentation = VM.process(value); document.body.dataset.processState = presentation.key;
   const title = ({ idle: 'Готов к запуску', checking: 'Проверка подключения', starting: 'Запуск и проверка Claude', running: 'Claude под защитой Guard', rechecking: 'Трафик приостановлен', blocked: 'Сессия закрыта' })[value.state];
+  const statusIcon = value.processFrozen ? ({ freezing: 'pause', frozen: 'pause', thawing: 'play', thawed: 'play', closing: 'stop' })[presentation.key] : ({ idle: 'shield', checking: 'search', starting: 'play', running: 'shield-check', rechecking: 'pause', blocked: 'alert' })[value.state];
+  setIcon('stateIcon', statusIcon); setIcon('processIcon', value.processFrozen && presentation.key !== 'thawing' && presentation.key !== 'thawed' ? statusIcon : 'process');
   $('state').textContent = value.processFrozen ? ({ freezing: 'Приостановка Claude', frozen: 'Claude приостановлен', thawing: 'Возобновление Claude', thawed: 'Возобновление Claude', closing: 'Завершение Claude' })[presentation.key] : title;
   $('processState').textContent = presentation.label; $('processStatus').dataset.state = presentation.key;
   $('processCountdown').hidden = !presentation.countdown; $('processCountdown').textContent = presentation.countdown ? 'Закрытие через ' + presentation.secondsRemaining + ' с' : '';
@@ -92,6 +95,9 @@ function showService(value) {
   serviceSnapshot = value; const presentation = VM.service(value);
   $('serviceState').textContent = presentation.label; $('serviceState').dataset.state = presentation.key;
   $('serviceMessage').textContent = presentation.message;
+  $('serviceRouting').textContent = value?.sessionRoutingSupported === true
+    ? 'Служба запускает защищённые сессии Claude без повторного UAC.'
+    : value?.available ? 'Сессии через службу не запускаются. Проверьте её состояние.' : 'Служба недоступна. Защищённая сессия не запускается.';
   $('serviceActions').hidden = !value?.available || presentation.actions.length === 0;
   for (const button of document.querySelectorAll('[data-service]')) { button.hidden = !presentation.actions.includes(button.dataset.service); button.disabled = presentation.busy || pending.has('service'); }
   $('serviceRefresh').disabled = pending.has('service');
@@ -124,9 +130,9 @@ async function refreshService() {
   try {
     const value = await window.guard.serviceStatus();
     if (value && !value.error) showService(value);
-    else { $('serviceState').textContent = 'Служба не используется'; $('serviceState').dataset.state = 'unavailable'; $('serviceMessage').textContent = VM.service(null).message; $('serviceActions').hidden = true; }
+    else { $('serviceState').textContent = 'Служба не используется'; $('serviceState').dataset.state = 'unavailable'; $('serviceMessage').textContent = VM.service(null).message; $('serviceRouting').textContent = 'Служба недоступна. Защищённая сессия не запускается.'; $('serviceActions').hidden = true; }
   } catch {
-    $('serviceState').textContent = 'Служба не используется'; $('serviceState').dataset.state = 'unavailable'; $('serviceMessage').textContent = VM.service(null).message; $('serviceActions').hidden = true;
+    $('serviceState').textContent = 'Служба не используется'; $('serviceState').dataset.state = 'unavailable'; $('serviceMessage').textContent = VM.service(null).message; $('serviceRouting').textContent = 'Служба недоступна. Защищённая сессия не запускается.'; $('serviceActions').hidden = true;
   } finally { pending.delete('service'); refreshControls(); }
 }
 function log(value) {

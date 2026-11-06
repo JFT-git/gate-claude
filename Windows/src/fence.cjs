@@ -140,15 +140,18 @@ class NetworkFence extends EventEmitter {
       if (approvalOwner) throw Error('Сначала ответьте на предыдущий запрос Windows. Повторное подтверждение пока не запрошено.');
       approvalOwner = instance;
       server.listen(pipe); await once(server, 'listening');
-      const requestElevationOptions = { helper: path.resolve(helper), pipeName: name, token, ownerWindow: options.ownerWindow };
-      // The native requester waits for a human on the secure desktop. Its wait
-      // is not broker installation time; killing a requester cannot cancel UAC.
-      const launch = options.launch || requestElevation;
+      const launchOptions = { helper: path.resolve(helper), pipeName: name, token, ownerWindow: options.ownerWindow };
+      // Test launch mocks retain the legacy boundary. Production serviceLaunch
+      // separately ensures a compatible running service and supplies only the
+      // validated inventory root, pipe name and random token.
+      const serviceLaunch = options.launch ? null : options.serviceLaunch;
+      const launch = options.launch || serviceLaunch || requestElevation;
+      if (serviceLaunch) launchOptions.root = inventory.root;
       stage('approval'); launchStarted = true;
-      Promise.resolve().then(() => launch(requestElevationOptions)).then(() => {
+      Promise.resolve().then(() => launch(launchOptions)).then(() => {
         if (!authenticated) armDeadline('Повышенный процесс Windows не подключился к Guard. Claude не запущен.');
       }, error => {
-        if (!settled) instance.emit('prepare-error', elevationFailure(error));
+        if (!settled) instance.emit('prepare-error', serviceLaunch ? error : elevationFailure(error));
       }).finally(() => {
         if (approvalOwner === instance) approvalOwner = null;
         stage('approval-ended');

@@ -1459,14 +1459,26 @@ struct GuardView: View {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    let model = GuardModel()
-    var window: NSWindow!
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
+    let model: GuardModel
+    var window: NSWindow?
     var statusItem: NSStatusItem!
+    private let startUpdater: Bool
     private var restartedProcess: Process?
     private var updateController: GuardUpdateController?
+    private weak var sessionMenuItem: NSMenuItem?
+    private weak var stopMenuItem: NSMenuItem?
+    private weak var restartMenuItem: NSMenuItem?
+    private weak var updatesMenuItem: NSMenuItem?
+
+    init(model: GuardModel? = nil, startUpdater: Bool = true) {
+        self.model = model ?? GuardModel()
+        self.startUpdater = startUpdater
+        super.init()
+    }
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        showWindow()
         for url in urls { model.deepLinkInbox.accept(url.absoluteString) }
     }
 
@@ -1477,28 +1489,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onRestart = { [weak self] in self?.restartApplication() }
         model.canRestartGuard = { [weak self] in self?.updateController?.canRestartGuard ?? true }
         model.checkForUpdates = { [weak self] in self?.updateController?.checkForUpdates() }
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 820),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Claude Proxy Guard"
-        window.contentMinSize = NSSize(width: 320, height: 560)
-        window.contentMaxSize = NSSize(width: 420, height: CGFloat.greatestFiniteMagnitude)
-        window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: GuardView(model: model))
-        window.center(); showWindow()
+        makeMainWindow()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "network.badge.shield.half.filled", accessibilityDescription: "Claude Proxy Guard")
+        if let image = NSImage(systemSymbolName: "network.badge.shield.half.filled", accessibilityDescription: "Claude Proxy Guard") {
+            image.size = NSSize(width: 18, height: 18)
+            image.isTemplate = true
+            statusItem.button?.image = image
+        }
+        statusItem.button?.toolTip = "Claude Proxy Guard"
         let menu = NSMenu()
+        menu.delegate = self
         let open = NSMenuItem(title: "Открыть Claude Proxy Guard", action: #selector(showWindow), keyEquivalent: "")
         open.target = self; menu.addItem(open)
+        let session = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        session.isEnabled = false; menu.addItem(session); sessionMenuItem = session
         let stop = NSMenuItem(title: "Остановить Claude и шлюз", action: #selector(stopGuard), keyEquivalent: "")
-        stop.target = self; menu.addItem(stop)
+        stop.target = self; menu.addItem(stop); stopMenuItem = stop
         let restart = NSMenuItem(title: "Перезапустить Guard", action: #selector(restartGuard), keyEquivalent: "")
-        restart.target = self; menu.addItem(restart)
+        restart.target = self; menu.addItem(restart); restartMenuItem = restart
         let updates = NSMenuItem(title: "Проверить обновления…", action: #selector(checkUpdates), keyEquivalent: "")
-        updates.target = self; menu.addItem(updates)
+        updates.target = self; menu.addItem(updates); updatesMenuItem = updates
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        let quit = NSMenuItem(title: "Выход", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApplication.shared; menu.addItem(quit)
         statusItem.menu = menu
+        refreshStatusMenu()
         let appMenu = NSMenu()
         let root = NSMenuItem(); appMenu.addItem(root)
         let submenu = NSMenu(); root.submenu = submenu
@@ -1527,11 +1542,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMenu.addItem(NSMenuItem(title: "Все окна — на передний план", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
         NSApplication.shared.windowsMenu = windowMenu
         NSApplication.shared.mainMenu = appMenu
-        updateController = GuardUpdateController(model: model)
+        updateController = startUpdater ? GuardUpdateController(model: model) : nil
+        refreshStatusMenu()
     }
 
-    @objc func showWindow() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
-    @objc func stopGuard() { model.stop() }
+    @discardableResult
+    private func makeMainWindow() -> NSWindow {
+        if let window { return window }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 820),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "Claude Proxy Guard"
+        window.contentMinSize = NSSize(width: 320, height: 560)
+        window.contentMaxSize = NSSize(width: 420, height: CGFloat.greatestFiniteMagnitude)
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.contentView = NSHostingView(rootView: GuardView(model: model))
+        window.center()
+        self.window = window
+        return window
+    }
+
+    private func refreshStatusMenu() {
+        sessionMenuItem?.title = "Сессия: \(model.phase) · Claude: \(model.processState.title)"
+        sessionMenuItem?.toolTip = model.detail
+        statusItem?.button?.toolTip = "Claude Proxy Guard — \(model.phase)"
+        stopMenuItem?.isEnabled = (model.monitoring || model.busy || model.claudeRunning) && !model.restarting
+        restartMenuItem?.isEnabled = !model.restarting
+        updatesMenuItem?.isEnabled = !model.restarting && model.checkForUpdates != nil
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu == statusItem.menu else { return }
+        refreshStatusMenu()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === window else { return }
+        NSApp.setActivationPolicy(.accessory)
+    }
+
+    func applicationDidHide(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+    }
+
+    @objc func showWindow() {
+        let window = makeMainWindow()
+        NSApp.setActivationPolicy(.regular)
+        NSApp.unhide(nil)
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    @objc func stopGuard() { model.stop(); refreshStatusMenu() }
     @objc func checkUpdates() { updateController?.checkForUpdates() }
     @objc func restartGuard() {
         guard !model.restarting else { return }
@@ -1573,7 +1635,7 @@ struct Main {
         let application = NSApplication.shared
         let delegate = AppDelegate()
         application.delegate = delegate
-        application.setActivationPolicy(.regular)
+        application.setActivationPolicy(.accessory)
         application.run()
         withExtendedLifetime(delegate) {}
     }

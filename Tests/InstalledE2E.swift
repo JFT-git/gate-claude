@@ -99,13 +99,14 @@ import Darwin
         do {
             model.check(andLaunch: true)
             let ready = await wait(60) {
-                model.lastVerifiedProfile?.url.hasPrefix("https://claude.ai/") == true && model.claudeRunning &&
+                verifiedProfiles.values.contains { $0.url.hasPrefix("https://claude.ai/") } && model.claudeRunning &&
                 model.e2eInspector != nil && model.e2eRelayPort != nil && model.e2eProcessID != nil ||
                 model.requiresRestart || (!model.busy && !model.monitoring)
             }
-            guard ready, let initial = model.lastVerifiedProfile, let inspector = model.e2eInspector,
-                  let relayPort = model.e2eRelayPort, let processID = model.e2eProcessID else {
-                throw GuardError.message("Startup failed: \(model.phase): \(model.detail); \(model.profileStatus)")
+            guard ready, let initial = verifiedProfiles.values.first(where: { $0.url.hasPrefix("https://claude.ai/") }),
+                  let inspector = model.e2eInspector, let relayPort = model.e2eRelayPort, let processID = model.e2eProcessID else {
+                let urls = verifiedProfiles.values.map(\.url).sorted().joined(separator: ", ")
+                throw GuardError.message("Startup failed: \(model.phase): \(model.detail); \(model.profileStatus); URLs=\(urls); running=\(model.claudeRunning); inspector=\(model.e2eInspector != nil); relay=\(model.e2eRelayPort != nil); pid=\(model.e2eProcessID != nil)")
             }
             print("PASS actual Claude renderer: \(initial.timezone), \(initial.language)")
             let shared = try await command(inspector, "ProxyGuard.testSharedLocale", ["targetSession": initial.sessionID])

@@ -143,9 +143,15 @@ def configure(app, name, expected_version=None):
     else:
         configuration["GUARD_UPDATE_TEST_EXPECT_FAILURE"] = "1"
     (app / "Contents/Resources/UpdateTest.json").write_text(json.dumps(configuration, indent=2) + "\n")
-    identifier = "local.proxyguard.claude"
     with (app / "Contents/Info.plist").open("rb") as handle:
-        identifier = plistlib.load(handle)["CFBundleIdentifier"]
+        bundle = plistlib.load(handle)
+        identifier = bundle["CFBundleIdentifier"]
+    if identifier == "local.proxyguard.claude":
+        # Do not route a synthetic updater through the user's installed app.
+        identifier += ".sparkle-test"
+        bundle["CFBundleIdentifier"] = identifier
+        with (app / "Contents/Info.plist").open("wb") as handle:
+            plistlib.dump(bundle, handle)
     run(["/usr/bin/codesign", "--force", "--sign", "-", "--identifier", identifier, str(app)], stdout=subprocess.DEVNULL)
 
 

@@ -41,8 +41,10 @@ async function fixture(t) {
   const { NetworkFence } = module.exports;
   const h = {
     NetworkFence, launches, servers, sockets, resolveLaunch, rejectLaunch,
-    begin() {
-      const value = NetworkFence.prepare({ executable }, 23456, { helperPath: process.execPath, timeout: 120000 });
+    begin(service = false) {
+      const options = { helperPath: process.execPath, timeout: 120000 };
+      if (service) options.serviceLaunch = request => { launches.push(request); return launch; };
+      const value = NetworkFence.prepare({ executable }, 23456, options);
       preparations.push(value); value.catch(() => {}); return value;
     },
     async untilLaunch() {
@@ -144,4 +146,12 @@ unit('an untrusted broker hello cannot write an installation request or obtain p
   h.resolveLaunch(123); await turn(); const socket = h.connect('0'.repeat(64));
   await assert.rejects(pending, /закрылся до подтверждения/);
   assert.equal(socket.writes.length, 0); assert.equal(socket.destroyed, true);
+});
+
+unit('service launch is a separate production path and receives only the validated inventory root', async t => {
+  const h = await fixture(t), pending = h.begin(true); await h.untilLaunch();
+  assert.equal(h.launches.length, 1); assert.match(h.launches[0].root, /Runtime-[a-f0-9]{24}$/);
+  assert.equal(h.launches[0].pipeName.startsWith('gate-network-fence-'), true);
+  h.resolveLaunch(123); await turn(); const socket = h.connect(); h.proof(socket);
+  const fence = await pending; assert.equal(fence.installed, true); await fence.close();
 });

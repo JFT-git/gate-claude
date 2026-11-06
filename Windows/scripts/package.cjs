@@ -55,6 +55,18 @@ async function main() {
       await fs.copyFile(path.resolve(argument('--fence')), fence);
     }
     extraResource.push(fence);
+    const service = path.join(stage, 'resources', 'GuardService.exe');
+    if (args.includes('--service')) {
+      await fs.copyFile(path.resolve(argument('--service')), service);
+      const pins = JSON.parse(await fs.readFile(path.join(project, 'packaging', 'windows', 'cross-build-pins.json'), 'utf8'));
+      if (sha256(await fs.readFile(service)) !== pins.sha256['GuardService.exe']) throw Error('GuardService sidecar checksum mismatch.');
+    } else if (process.platform === 'win32') {
+      const csc = path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+      execFileSync(csc, ['/nologo', '/optimize+', '/platform:x64', '/target:exe', '/r:System.ServiceProcess.dll', '/out:' + service, path.join(root, 'native', 'GuardService.cs')], { stdio: 'inherit', windowsHide: true });
+    } else {
+      throw Error('Cross-build requires --service /absolute/path/to/GuardService.exe compiled from native/GuardService.cs on Windows.');
+    }
+    extraResource.push(service);
     const codeHost = path.join(stage, 'resources', 'CodeHost.exe');
     if (process.platform === 'win32') {
       const csc = path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');

@@ -38,6 +38,7 @@ class GuardController extends EventEmitter {
       notice: kind => this.log(linkMessages[kind], ['refused', 'failed', 'expired'].includes(kind) ? 'warning' : 'event')
     });
     this.fenceOwnerWindow = options.ownerWindow;
+    this.fenceServiceLaunch = options.serviceLaunch;
     this.root = root; this.resources = resources; this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
     this.processFrozen = false; this.processState = 'running'; this.freezeDeadline = null; this.freezeWanted = false;
     this.hostCommands = new Map(); this.hostCommandID = 0;
@@ -377,9 +378,12 @@ class GuardController extends EventEmitter {
       try { fence = await NetworkFence.prepare(this.runtime, port, {
         helperPath: path.join(this.resources, 'NetworkFence.exe'),
         ownerWindow: this.fenceOwnerWindow?.(),
+        ...(this.fenceServiceLaunch ? { serviceLaunch: this.fenceServiceLaunch } : {}),
         onStage: stage => {
           if (active() && this.state !== 'rechecking') {
-            if (stage === 'approval') this.status('Подтвердите системный запрос Windows. До подтверждения защиты Claude не запускается.');
+            if (stage === 'approval') this.status(this.fenceServiceLaunch
+              ? 'Проверяем системную службу Guard. При первой установке или обновлении службы Windows может запросить разрешение администратора.'
+              : 'Подтвердите системный запрос Windows. До подтверждения защиты Claude не запускается.');
             else if (stage === 'installing') this.status('Windows разрешила запуск защиты. Устанавливаем сетевые ограничения…');
             else this.emit('state', this.snapshot());
           } else this.emit('state', this.snapshot());

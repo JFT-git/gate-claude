@@ -8,6 +8,7 @@ const fsSync = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const https = require('node:https');
+const tls = require('node:tls');
 const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
@@ -20,13 +21,35 @@ const connectionMode = argv.includes('--network') ? 'network' : 'socks5';
 const certPath = path.resolve(argument('--cert')), keyPath = path.resolve(argument('--key'));
 const hostPath = path.resolve(argument('--host'));
 const fencePath = argument('--fence') ? path.resolve(argument('--fence')) : null;
+const servicePath = argument('--service') ? path.resolve(argument('--service')) : null;
+const codeEnabled = argv.includes('--code');
+const codeHostPath = argument('--code-host') ? path.resolve(argument('--code-host')) : null;
+const codeToolsDir = argument('--code-tools-dir') ? path.resolve(argument('--code-tools-dir')) : null;
 const ipHosts = ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org'];
 const persistenceMarker = crypto.randomBytes(24).toString('hex');
 const persistenceCookie = '__Host-guard_fixture_persist';
 const fixtureDeepLink = 'claude://claude.ai/magic-link#guard-fixture-id:synthetic-token';
 let observed = '203.0.113.7', failNextCurrentIP = false, holdCurrentIP = false;
 const heldIPResponses = [], activeStreams = new Set();
+const childProcess = require('node:child_process');
+const nativeSpawn = childProcess.spawn;
+childProcess.spawn = (file, args, options) => {
+  const child = nativeSpawn(file, args, options);
+  if (args.includes('--prepare-state')) {
+    let stdout = '', stderr = '';
+    const end = child.stdin.end.bind(child.stdin);
+    child.stdin.end = bytes => {
+      try { observations.preparePacket = JSON.parse(bytes.subarray(4).toString('utf8')); } catch { observations.preparePacket = { invalid: true }; }
+      return end(bytes);
+    };
+    child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-4096); });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4096); });
+    child.once('close', code => { observations.prepareState = { code, stdout, stderr }; });
+  }
+  return child;
+};
 const { GuardController } = require('../src/controller.cjs');
+const { NativeServiceBackend } = require('../src/service-backend.cjs');
 const fixtureNetworkProxy = Object.freeze({ kind: 'direct', host: '', port: 0,
   fingerprint: crypto.createHash('sha256').update('gate-claude/installed-e2e/direct-proxy/v1').digest('hex') });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -74,6 +97,46 @@ function fixtureNetworkChecks(controller) {
   };
   return controller;
 }
+function newGuardController(root, resources) {
+  const controller = new GuardController(root, resources);
+  if (servicePath) {
+    const backend = new NativeServiceBackend({ helperPath: servicePath, ownerWindow: () => null });
+    controller.nativeServiceBackend = backend;
+    controller.fenceServiceLaunch = request => {
+      observations.serviceLaunches = (observations.serviceLaunches || 0) + 1;
+      return backend.launchFence(request);
+    };
+  }
+  return fixtureNetworkChecks(controller);
+}
+function instrumentAsset() {
+  if (observations.assetInstrumented) return;
+  observations.assetInstrumented = true;
+  const request = https.request;
+  https.request = (...args) => {
+    const options = args[0] || {};
+    const result = request(...args);
+    if (options.hostname === 'downloads.claude.ai') {
+      result.on('error', error => (observations.assetErrors ||= []).push({ phase: 'request', code: error.code || 'ERROR' }));
+      result.on('response', response => {
+        (observations.assetResponses ||= []).push({ status: response.statusCode, length: response.headers['content-length'], encoding: response.headers['content-encoding'], transfer: response.headers['transfer-encoding'] });
+        const digest = crypto.createHash('sha256'); let bytes = 0;
+        response.on('data', chunk => { bytes += chunk.length; digest.update(chunk); });
+        response.on('end', () => (observations.assetBodies ||= []).push({ event: 'end', bytes, sha256: digest.digest('hex') }));
+        response.on('aborted', () => (observations.assetBodies ||= []).push({ event: 'aborted', bytes }));
+        response.on('close', () => (observations.assetBodies ||= []).push({ event: 'close', bytes }));
+      });
+    }
+    return result;
+  };
+  const connect = tls.connect;
+  tls.connect = (...args) => {
+    const options = args[0] || {};
+    const result = connect(...args);
+    if (options.servername === 'downloads.claude.ai') result.on('error', error => (observations.assetErrors ||= []).push({ phase: 'tls', code: error.code || 'ERROR' }));
+    return result;
+  };
+}
 const track = socket => { sockets.add(socket); socket.on('error', () => {}); socket.once('close', () => sockets.delete(socket)); return socket; };
 const html = `<!doctype html><html><body><h1>Guard Windows fixture</h1><script>
 const profile=()=>({timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,language:navigator.language,locale:Intl.DateTimeFormat().resolvedOptions().locale});
@@ -92,6 +155,7 @@ const frame = '<script>parent.postMessage({guardFixture:true,timezone:Intl.DateT
 
 async function main() {
   assert.equal(process.platform, 'win32'); await fs.mkdir(work, { recursive: true });
+  if (codeEnabled) instrumentAsset();
   const execution = JSON.parse(await powershell("[pscustomobject]@{elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);interactive=((Get-Process -Id $PID).SessionId -gt 0)}|ConvertTo-Json -Compress"));
   proof.executionContext = { elevated: execution.elevated === true, interactive: execution.interactive === true,
     standardUserRuntimeCovered: execution.elevated !== true,
@@ -168,6 +232,7 @@ async function main() {
       if (options && typeof options === 'object' && options.host && !['127.0.0.1', '::1'].includes(options.host)) {
         if (['claude.ai', 'challenges.cloudflare.com', ...ipHosts].includes(options.host) && options.port === 443)
           return originalConnection.call(this, { ...options, host: '127.0.0.1', port: tlsServer.address().port }, ...args);
+        if (codeEnabled && options.host === 'downloads.claude.ai' && options.port === 443) return originalConnection.call(this, options, ...args);
         const socket = new net.Socket(); queueMicrotask(() => socket.destroy(Object.assign(Error('Fixture denies external destinations'), { code: 'ECONNREFUSED' }))); return socket;
       }
       return originalConnection.call(this, options, ...args);
@@ -179,21 +244,27 @@ async function main() {
       const greeting = await reader.read(2); await reader.read(greeting[1]); socket.write(Buffer.from([5, 0]));
       const request = await reader.read(5); assert.equal(request[3], 3);
       const host = (await reader.read(request[4])).toString(), port = (await reader.read(2)).readUInt16BE();
-      if (!['claude.ai', 'challenges.cloudflare.com', ...ipHosts].includes(host) || port !== 443) {
+      if (!['claude.ai', 'challenges.cloudflare.com', ...ipHosts, ...(codeEnabled ? ['downloads.claude.ai'] : [])].includes(host) || port !== 443) {
         (observations.deniedTargets ||= []).push({ host, port });
         socket.write(Buffer.from([5, 2, 0, 1, 0, 0, 0, 0, 0, 0])); reader.release(); socket.end(); return;
       }
-      const upstream = track(net.connect(tlsServer.address().port, '127.0.0.1')); await once(upstream, 'connect');
+      const codeDownload = codeEnabled && host === 'downloads.claude.ai';
+      const upstream = track(net.connect(codeDownload ? port : tlsServer.address().port, codeDownload ? host : '127.0.0.1')); await once(upstream, 'connect');
       socket.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0])); reader.release();
       socket.once('close', () => upstream.destroy()); upstream.once('close', () => socket.destroy());
       socket.pipe(upstream); upstream.pipe(socket); socket.resume();
     } catch { reader.release(); socket.destroy(); }
   });
   socks.listen(0, '127.0.0.1'); await once(socks, 'listening');
-  const resources = path.join(work, 'resources'); await fs.mkdir(resources, { recursive: true });
+  const resources = path.join(path.dirname(work), path.basename(work) + '-resources'); await fs.mkdir(resources, { recursive: true });
   await fs.copyFile(hostPath, path.join(resources, 'GuardHost.exe'));
   if (fencePath) await fs.copyFile(fencePath, path.join(resources, 'NetworkFence.exe'));
   await fs.access(path.join(resources, 'NetworkFence.exe')); // Never bypass the production fence for this test.
+  if (codeEnabled) {
+    await fs.copyFile(codeHostPath, path.join(resources, 'CodeHost.exe'));
+    await fs.copyFile(path.join(codeToolsDir, 'code-tools-policy.json'), path.join(resources, 'code-tools-policy.json'));
+    await fs.cp(path.join(codeToolsDir, 'CodeTools'), path.join(resources, 'CodeTools'), { recursive: true });
+  }
   const originalBoot = await fs.readFile(path.resolve(__dirname, '..', '..', 'Resources', 'RuntimeBootstrap.cjs'), 'utf8');
   const fingerprint = new crypto.X509Certificate(cert).fingerprint256;
   const fixtureBoot = originalBoot + `
@@ -250,20 +321,35 @@ command=async m=>{
   proof.sourceVersion = runtime.version; proof.sourceSignature = runtime.signature;
   let controller;
   try {
-    controller = fixtureNetworkChecks(new GuardController(root, resources)); controller.on('log', e => console.log(e.kind + ': ' + e.message));
+    controller = newGuardController(root, resources); controller.on('log', e => console.log(e.kind + ': ' + e.message));
     const states = []; controller.on('state', state => {
       states.push(state.state);
-      const event = { at: Date.now(), state: state.state, processState: state.processState, frozen: state.processFrozen, message: state.message, activeStreams: activeStreams.size };
+      const event = { at: Date.now(), state: state.state, processState: state.processState, frozen: state.processFrozen, message: state.message, activeStreams: activeStreams.size, revision: controller.revalidationRevision || 0 };
       (observations.timeline ||= []).push(event);
       fsSync.appendFileSync(path.join(work, 'timeline.jsonl'), JSON.stringify(event) + '\n');
     });
     const captures = new Map(); controller.on('record', r => captures.set(r.id, r));
-    const input = { mode: connectionMode, host: '127.0.0.1', port: socks.address().port, timezone: 'Europe/Amsterdam', language: 'en-US', interval: 2, captureBodies: true, claudePath: source };
+    const input = { mode: connectionMode, host: '127.0.0.1', port: socks.address().port, timezone: 'Europe/Amsterdam', language: 'en-US', interval: codeEnabled ? 30 : 2, captureBodies: true, claudePath: source, codeEnabled };
     await controller.start(input);
     await until(() => controller.state === 'running' || (controller.state === 'blocked' && Promise.reject(Error(controller.message))), 'renderer profile', 45000);
     assert.equal(controller.fence?.installed, true, 'Production WFP protection must be installed before runtime launch');
     assert.equal(controller.fence.proof?.persistent, true);
     proof.networkFence = { ...controller.fence.proof, installedBeforeRuntime: true };
+    if (servicePath) {
+      const status = await controller.nativeServiceBackend.getStatus();
+      proof.serviceRouting = { backend: 'NativeServiceBackend', state: status.state, sessionRoutingSupported: status.sessionRoutingSupported,
+        launchRequests: observations.serviceLaunches, perSessionElevation: false };
+      assert.equal(status.state, 'running'); assert.equal(status.sessionRoutingSupported, true);
+    }
+    if (codeEnabled) {
+      assert.equal(controller.fence.codeProof?.filters, 10);
+      const prepared = JSON.parse(observations.prepareState.stdout);
+      assert.equal(prepared.prepared, true); assert.equal(prepared.sid, controller.fence.codeProof.sid);
+      proof.codeStatePreparation = { prepared: true, entries: prepared.entries };
+      proof.codeFenceSession = { ...controller.fence.codeProof, running: true };
+      observations.codeStatePreparation = proof.codeStatePreparation;
+      observations.codeFenceSession = proof.codeFenceSession;
+    }
     proof.internet = 'production WFP fence permits private runtime images to use only the Guard relay';
     const channel = controller.channel;
     let sid;
@@ -331,6 +417,7 @@ command=async m=>{
       sameRuntimePID: true, privateProfileArgument: true, workingDirectoryCorrect: true, vendorNavigatedFixture: true };
     const statesBefore = states.length;
     failNextCurrentIP = true;
+    if (codeEnabled) void controller.revalidate();
     await until(() => observations.http500 === 1 && controller.processState === 'frozen', 'HTTP 500 freezes the verified runtime', 10000);
     assert.equal(controller.relay.unlocked, false); assert.equal(controller.policy.blocked, false);
     assert.equal(controller.runtimePID, pid); process.kill(pid, 0);
@@ -386,6 +473,7 @@ command=async m=>{
     observations.ownKeyPresenceAfterSettling=await profileKeyPresence();observations.ownEncryptionKeyPresentAfterSettling=(await profileKeyHash())!==null;
     const port = controller.relay.port, changedAt = Date.now();
     observed = '203.0.113.8';
+    if (codeEnabled) void controller.revalidate();
     await until(() => controller.processState === 'frozen', 'IP mismatch freezes before timeout', 10000);
     assert.equal(controller.runtimePID, pid); process.kill(pid, 0);
     await until(() => controller.state === 'blocked', 'IP freeze timeout closes Claude', 35000);
@@ -401,7 +489,7 @@ command=async m=>{
     await until(() => firstFence.closed && firstFence.installed === false, 'old WFP broker acknowledged filter removal', 20000);
     observations.fixtureCookieDiskStopped=await fixtureCookieDisk(firstProfile);
     observed = '203.0.113.7';
-    controller = fixtureNetworkChecks(new GuardController(root, resources));
+    controller = newGuardController(root, resources);
     controller.on('log', event => console.log('restart ' + event.kind + ': ' + event.message));
     assert.equal(controller.policy.pinned, null); assert.equal(controller.policy.blocked, false);
     await controller.start(input);
@@ -457,6 +545,8 @@ command=async m=>{
       keysBefore:observations.ownKeyPresenceBefore,keysAfterSettling:observations.ownKeyPresenceAfterSettling,keysAfterRestart:observations.ownKeyPresenceAfter,
       beforeKillDBLocked:observations.fixtureCookieDiskBefore.locked===true,persistedFixtureRowsBeforeReload:observations.fixtureCookieDiskStopped.rows.length,
       encryptedFixtureScheme:observations.fixtureCookieDiskStopped.rows[0]?.scheme,diagnosticSettleBeforeIPChange:argv.includes('--settle-key')};
+    if (servicePath) proof.serviceRouting.launchRequests = observations.serviceLaunches;
+    if (codeEnabled) proof.codeFenceSession.closeCleanup = true;
     proof.result = 'PASS'; await fs.writeFile(path.join(work, 'proof.json'), JSON.stringify(proof, null, 2));
     console.log('PASS: installed Windows Claude, production WFP, locale, interception, same-PID revalidation, IP kill and persistent private profile');
   } catch (error) {

@@ -30,10 +30,25 @@ test('Inno migration removes only an owned legacy uninstall entry and refuses a 
   assert.doesNotMatch(script, /ExecWait.*unins000/i);
 });
 
-test('uninstall keeps conditional owned-HKCU protocol cleanup and never installs a service', () => {
+test('install and uninstall wait for the owned service request and preserve exit 2 and conditional HKCU cleanup', () => {
   const script = fs.readFileSync(path.join(root, 'packaging/windows/installer.nsh'), 'utf8');
   for (const value of ['GateClaudeOwner', 'gate-claude.protocol.v1', 'GateClaudeGuard.Url.claude', 'Software\\RegisteredApplications']) assert.ok(script.includes(value));
-  assert.ok(script.includes('"$INSTDIR\\Claude Proxy Guard.exe"')); assert.doesNotMatch(script, /HKLM|WriteReg|CreateService|sc\.exe/i);
+  assert.ok(script.includes('"$INSTDIR\\Claude Proxy Guard.exe"'));
+  assert.match(script, /ExecWait '"\$INSTDIR\\resources\\GuardService\.exe" --request-install --owner 0' \$0/);
+  assert.match(script, /ExecWait '"\$INSTDIR\\resources\\GuardService\.exe" --request-uninstall --owner 0' \$0/);
+  assert.match(script, /StrCmp \$0 2 guardServiceExitTwo/); assert.match(script, /StrCmp \$0 2 guardServiceUninstallExitTwo/);
+  const uninstall = script.match(/!macro customUnInstall([\s\S]*?)!macroend/)[1];
+  assert.match(uninstall, /\$\{If\} \$\{isUpdated\}[\s\S]*?\$\{Else\}[\s\S]*?--request-uninstall --owner 0[\s\S]*?\$\{EndIf\}/);
+  assert.doesNotMatch(script, /HKLM|WriteReg|CreateService|sc\.exe/i);
+});
+
+test('GuardService is a required packaged resource with an independent Windows csc pin', () => {
+  const script = fs.readFileSync(path.join(root, 'Windows/scripts/package.cjs'), 'utf8');
+  const pins = JSON.parse(fs.readFileSync(path.join(root, 'packaging/windows/cross-build-pins.json'), 'utf8'));
+  assert.match(script, /resources', 'GuardService\.exe'/); assert.match(script, /native', 'GuardService\.cs'/);
+  assert.match(script, /--service/); assert.match(script, /System\.ServiceProcess\.dll/);
+  assert.match(pins.sha256['GuardService.exe'], /^[a-f0-9]{64}$/);
+  assert.match(fs.readFileSync(path.join(root, 'packaging/windows/package.ps1'), 'utf8'), /SERVICE_REQUEST_ON_DEMAND/);
 });
 
 test('release packaging excludes electron-builder debug output', () => {
