@@ -223,41 +223,63 @@ enum IPChecker {
         return try parseDestinationTrace(await fetch(url: "https://\(hostname)/cdn-cgi/trace", relayPort: relayPort, token: token, timeout: 4, limit: 16384), hostname: hostname, family: family)
     }
 
+    private final class FetchDelegate: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
     private static func fetch(url: String, relayPort: UInt16?, token: String, timeout: Int, limit: Int = 65536) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-                    var args = ["-q", "--silent", "--show-error", "--fail", "--connect-timeout", "3",
-                                "--max-time", String(timeout), "--max-filesize", String(limit), "--proto", "=https",
-                                "--max-redirs", "0", "--header", "Cache-Control: no-cache"]
-                    if let port = relayPort {
-                        guard token.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { throw GuardError.message("Неверный токен проверки.") }
-                        args += ["--proxy", "http://127.0.0.1:\(port)", "--noproxy", "", "--proxy-header", "Proxy-Authorization: Bearer \(token)"]
-                    } else {
-                        args += ["--proxy", "", "--noproxy", "*"]
-                    }
-                    args += [url]
-                    process.arguments = args
-                    process.environment = ProcessInfo.processInfo.environment.filter {
-                        !["http_proxy", "https_proxy", "all_proxy", "no_proxy"].contains($0.key.lowercased())
-                    }
-                    let output = Pipe()
-                    process.standardOutput = output; process.standardError = FileHandle.nullDevice
-                    try process.run()
-                    var data = Data()
-                    while let chunk = try output.fileHandleForReading.read(upToCount: 4096), !chunk.isEmpty {
-                        if data.count + chunk.count > limit { process.terminate(); process.waitUntilExit(); throw GuardError.message("Слишком большой ответ проверки IP.") }
-                        data.append(chunk)
-                    }
-                    process.waitUntilExit()
-                    guard process.terminationStatus == 0 else {
-                        throw GuardError.message("Ошибка проверки IP (сеть, прокси или сервис). Доступ закрыт.")
-                    }
-                    continuation.resume(returning: data)
-                } catch { continuation.resume(throwing: error) }
+        guard let endpoint = URL(string: url), endpoint.scheme == "https", endpoint.host != nil, limit > 0 else {
+            throw GuardError.message("Неверный адрес проверки IP.")
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = TimeInterval(timeout)
+        configuration.timeoutIntervalForResource = TimeInterval(timeout)
+        configuration.waitsForConnectivity = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.httpShouldUsePipelining = false
+        var request = URLRequest(url: endpoint)
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        if let port = relayPort {
+            guard token.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { throw GuardError.message("Неверный токен проверки.") }
+            configuration.connectionProxyDictionary = [
+                "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": Int(port),
+                "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": Int(port),
+            ]
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Proxy-Authorization")
+        } else {
+            configuration.connectionProxyDictionary = [:]
+        }
+        let delegate = FetchDelegate()
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel(); withExtendedLifetime(delegate) {} }
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<400).contains(http.statusCode),
+                  http.expectedContentLength <= Int64(limit) else {
+                bytes.task.cancel()
+                throw GuardError.message("Ошибка проверки IP (сеть, прокси или сервис). Доступ закрыт.")
             }
+            var data = Data()
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count > limit {
+                    bytes.task.cancel()
+                    throw GuardError.message("Слишком большой ответ проверки IP.")
+                }
+            }
+            return data
+        } catch let error as GuardError {
+            throw error
+        } catch {
+            throw GuardError.message("Ошибка проверки IP (сеть, прокси или сервис). Доступ закрыт.")
         }
     }
 }
