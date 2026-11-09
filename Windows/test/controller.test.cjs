@@ -44,7 +44,17 @@ test('saved IP is read by a new controller and a different exit cannot replace i
   assert.equal(controller.ipMemory.load(), '203.0.113.7');
   controller.stop(); assert.equal(controller.ipMemory.load(), '203.0.113.7');
   controller.resetIP(); assert.equal(controller.ipMemory.load(), null);
-  assert.equal(controller.state, 'blocked', 'explicit reset cannot reopen a latched session');
+  assert.equal(controller.state, 'idle', 'explicit reset starts a fresh session without reopening the old runtime');
+});
+test('explicit reset clears in-memory policy and allows a different external IP', async t => {
+  const controller = await fixture(t), epoch = controller.epoch;
+  controller.policy.pin({ country_code: 'NL', ip: '203.0.113.7' }); controller.state = 'blocked';
+  const snapshot = controller.resetIP();
+  assert.equal(snapshot.state, 'idle'); assert.equal(snapshot.savedIP, null); assert.equal(controller.policy.pinned, null); assert.equal(controller.policy.blocked, false);
+  assert.equal(controller.epoch, epoch + 1, 'reset invalidates all callbacks from the previous session');
+  controller.startSession = async () => { controller.policy.assertAvailable(); controller.policy.pin({ country_code: 'NL', ip: '203.0.113.8' }); controller.state = 'running'; };
+  await controller.start({ mode: 'network' });
+  assert.equal(controller.policy.pinned, '203.0.113.8'); assert.equal(controller.state, 'running');
 });
 test('a foreign destination using a different exit blocks first launch without saving any pin', async t => {
   const controller = await fixture(t);
@@ -172,6 +182,16 @@ test('failed initial IP check never discovers or publishes a local pin', async t
     await controller.start({ ...input, mode });
     assert.equal(calls, 0);
   }
+});
+test('continuous rechecking is bounded even without a runtime host', async t => {
+  const controller = await fixture(t);
+  controller.policy.pin({ country_code: 'NL', ip: '203.0.113.7' }); controller.state = 'rechecking';
+  controller.relay = { port: 1234, pause() {}, resume() {}, close() {} };
+  controller.pauseForRevalidation('first failure');
+  assert.ok(controller.recheckingSince !== null); assert.equal(controller.state, 'rechecking');
+  controller.recheckingSince = performance.now() - 20001;
+  controller.pauseForRevalidation('permanent failure');
+  assert.equal(controller.state, 'blocked'); assert.equal(controller.policy.blocked, true); assert.equal(controller.recheckingSince, null);
 });
 test('successful revalidation refreshes the local pin and stop resets it', async t => {
   const controller = await fixture(t); let calls = 0, resumed = 0;

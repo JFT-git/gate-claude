@@ -44,7 +44,7 @@ class GuardController extends EventEmitter {
     this.fenceOwnerWindow = options.ownerWindow;
     this.fenceServiceLaunch = options.serviceLaunch;
     this.root = root; this.resources = resources; this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
-    this.processFrozen = false; this.processState = 'running'; this.freezeDeadline = null; this.freezeWanted = false;
+    this.processFrozen = false; this.processState = 'running'; this.freezeDeadline = null; this.freezeWanted = false; this.recheckingSince = null;
     this.hostCommands = new Map(); this.hostCommandID = 0;
     this.ipMemory = new IPMemory(root); this.savedIP = null; this.ipMemoryError = '';
     try { this.savedIP = this.ipMemory.load(); } catch (error) { this.ipMemoryError = error.message; }
@@ -63,9 +63,11 @@ class GuardController extends EventEmitter {
   canResetIP() { return ['idle', 'blocked'].includes(this.state) && !NetworkFence.approvalPending && !this.fencePending && !this.codePreparationPending; }
   resetIP() {
     if (!this.canResetIP()) throw Error('Сначала остановите сессию Claude и дождитесь завершения запуска.');
+    this.stop();
     this.ipMemory.reset(); this.savedIP = null; this.ipMemoryError = '';
+    this.policy = new IPPolicy(); this.country = ''; this.state = 'idle';
     this.log('Закрепление IP сброшено пользователем после подтверждения.', 'warning');
-    this.status(this.state === 'blocked' ? 'Память IP сброшена. Перезапустите Guard перед новым подключением.' : 'Память IP сброшена. Следующий проверенный адрес будет закреплён.');
+    this.status('Память IP сброшена. Следующий проверенный адрес будет закреплён.');
     return this.snapshot();
   }
   log(message, kind = 'event') {
@@ -222,7 +224,7 @@ class GuardController extends EventEmitter {
     try { this.relay.resume(); }
     catch { if (valid()) this.block('Не удалось возобновить защищённый шлюз. Сессия закрыта.'); return false; }
     if (!valid()) { this.relay?.pause(); return false; }
-    this.clearProcessFreeze(); return true;
+    this.recheckingSince = null; this.clearProcessFreeze(); return true;
   }
   closeFrozenSession(epoch, host) {
     if (this.epoch !== epoch || this.host !== host || !this.processFrozen || this.freezeClosing) return;
@@ -805,6 +807,11 @@ class GuardController extends EventEmitter {
   }
   pauseForRevalidation(reason, invalidate = true) {
     if (!this.relay || !this.policy.pinned || this.policy.blocked || this.freezeClosing || ['idle', 'blocked'].includes(this.state)) return false;
+    const now = performance.now();
+    if (this.recheckingSince !== null && now - this.recheckingSince >= FREEZE_LIMIT_MS) {
+      this.block('Проверка сети не завершилась за 20 секунд. Сессия остановлена.'); return true;
+    }
+    this.recheckingSince ??= now;
     if (invalidate) this.revalidationRevision = (this.revalidationRevision || 0) + 1;
     this.relay.pause();
     setPinnedLocalAddresses(null);
@@ -902,7 +909,7 @@ class GuardController extends EventEmitter {
       if (this.checkTask === task) this.checkTask = null;
       if (!active()) return;
       const changed = task.revision !== (this.revalidationRevision || 0), elapsed = performance.now() - task.started;
-      this.schedulePoll(epoch, this.processFrozen ? Math.max(0, FREEZE_RETRY_MS - elapsed) : changed ? 0 : Math.max(0, this.settings.interval * 1000 - elapsed));
+      this.schedulePoll(epoch, this.processFrozen ? Math.max(0, FREEZE_RETRY_MS - elapsed) : changed ? FREEZE_RETRY_MS : Math.max(0, this.settings.interval * 1000 - elapsed));
     });
     this.checkTask = task; return task.promise;
   }
@@ -912,7 +919,7 @@ class GuardController extends EventEmitter {
     this.codeAssetAbort?.abort(); this.codeAssetAbort = null;
     this.cancelCodeState?.();
     this.deepLinkReady = false; this.deepLinks.clear();
-    this.epoch++;
+    this.recheckingSince = null; this.epoch++;
     if (this.networkMetrics?.dns?.state === 'checking') this.networkMetrics.dns = { state: 'idle' };
     this.dnsMetricsTask = null;
     clearInterval(this.networkTimer); clearInterval(this.heartbeatTimer); clearTimeout(this.pollTimer);

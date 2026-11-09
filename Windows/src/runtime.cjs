@@ -4,7 +4,7 @@ const path = require('node:path');
 const { promisify } = require('node:util');
 const { execFile } = require('node:child_process');
 const run = promisify(execFile);
-const { parseArchive, addBootstrap, updatePEIntegrity, windowsBootstrap, hash } = require('./asar.cjs');
+const { parseArchive, patchNativeTitlebar, addBootstrap, updatePEIntegrity, windowsBootstrap, hash } = require('./asar.cjs');
 const { powershell, psQuote } = require('./windows.cjs');
 const { findManagedCliSDK, patchManagedCliSDK, findManagedCliMain, patchManagedCliMain, findManagedCliSessions, patchManagedCliSessions, findManagedCliScratch } = require('./managed-cli-patch.cjs');
 
@@ -54,8 +54,10 @@ async function prepareRuntime(sourcePath, root, bootstrapPath, onStatus = () => 
       { name: path.posix.join(mainDirectory, 'proxy-guard-managed-cli.cjs'), source: transport });
   }
   const base = await fs.readFile(bootstrapPath, 'utf8'), bootstrap = windowsBootstrap(base, networkGuard, { codeEnabled }), executable = await fs.readFile(source);
+  const titlebarPatches = patchNativeTitlebar(parsed);
   const fingerprint = hash(Buffer.concat([Buffer.from(parsed.digest), bootstrap, Buffer.from(hash(executable)), Buffer.from('gate-runtime-v5:' + codeEnabled),
-    ...extraEntries.flatMap(item => [Buffer.from(item.name + '\0'), Buffer.from(hash(item.source))])]));
+    ...extraEntries.flatMap(item => [Buffer.from(item.name + '\0'), Buffer.from(hash(item.source))]),
+    ...titlebarPatches.flatMap(item => [Buffer.from(item.name + '\0'), Buffer.from(hash(item.source))])]));
   const bootName = path.posix.join(path.posix.dirname(metadata.main), 'proxy-guard-boot.cjs');
   const directory = path.join(root, 'Runtime-' + fingerprint.slice(0, 24)), destination = path.join(directory, path.basename(source));
   const profile = path.join(root, 'Profile');
@@ -71,7 +73,8 @@ async function prepareRuntime(sourcePath, root, bootstrapPath, onStatus = () => 
     const manifest = JSON.parse(await fs.readFile(path.join(directory, 'guard-manifest.json'), 'utf8'));
     const cached = parseArchive(await fs.readFile(path.join(directory, 'resources', 'app.asar')));
     if (manifest.fingerprint === fingerprint && hash(await fs.readFile(destination)) === manifest.exeDigest && cached.digest === manifest.asarDigest &&
-        cached.read(bootName).equals(bootstrap) && extraEntries.every(item => cached.read(item.name).equals(item.source))) {
+        cached.read(bootName).equals(bootstrap) && extraEntries.every(item => cached.read(item.name).equals(item.source)) &&
+        titlebarPatches.every(item => cached.read(item.name).equals(item.source))) {
       return { executable: destination, profile, version: String(metadata.version), signature, codeEnabled };
     }
   } catch {}

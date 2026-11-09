@@ -94,6 +94,18 @@ test('runtime Code preparation is explicit, has its own cache fingerprint and re
   f.setTransport('module.exports={initCodeTransport(){}};/* fixture-v2 */'); const updated = await f.prepare({ codeEnabled: true }); assert.notEqual(updated.executable, enabled.executable); assert.equal(f.status.length, 7);
   assert.ok(fs.readFileSync(path.join(path.dirname(f.source), 'resources', 'app.asar')).equals(originalArchive), 'Original signed source remains the hash authority');
 });
+test('titlebar bytes are part of the runtime fingerprint and cache validation', async t => {
+  const f = await runtimeFixture(t), sourceArchive = path.join(path.dirname(f.source), 'resources', 'app.asar');
+  fs.writeFileSync(sourceArchive, archive({
+    'package.json': Buffer.from(JSON.stringify({ name: '@ant/desktop', version: 'fixture', main: '.vite/build/main.js' })),
+    '.vite/build/main.js': Buffer.from('module.exports.vendorFixture=true;'),
+    '.vite/build/index.chunk-fixture.js': Buffer.from('titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:FutureFn();e.setWindowButtonPosition(FutureFn(t,Other(e.webContents.zoomFactor)));')
+  }));
+  const first = await f.prepare(), second = await f.prepare(); assert.equal(second.executable, first.executable);
+  const cachedArchive = path.join(path.dirname(first.executable), 'resources', 'app.asar'), bytes = fs.readFileSync(cachedArchive), parsed = A.parseArchive(bytes), entry = parsed.entry('.vite/build/index.chunk-fixture.js');
+  bytes[parsed.payloadStart + Number(entry.offset)] ^= 1; fs.writeFileSync(cachedArchive, bytes);
+  const rebuilt = await f.prepare(); assert.equal(rebuilt.executable, first.executable); assert.equal(f.status.length, 2, 'A changed titlebar payload must force reconstruction');
+});
 test('an unsupported Code main fails before creating a runtime while ordinary Chat remains available', async t => {
   const f = await runtimeFixture(t); f.rejectMain(); await assert.rejects(f.prepare({ codeEnabled: true }), /Unsupported fixture main/); assert.equal(f.status.length, 0); assert.equal(fs.existsSync(f.guardRoot), false);
   const ordinary = await f.prepare(); assert.equal(ordinary.codeEnabled, false); assert.equal(f.status.length, 1); assert.equal(f.counters().mainPatchCalls, 0);

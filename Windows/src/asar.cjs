@@ -26,36 +26,44 @@ function parseArchive(buffer) {
 }
 
 function patchNativeTitlebar(archive) {
-  const variants = [
-    { anchor: 'titleBarStyle:"hidden",titleBarOverlay:!1,trafficLightPosition:zHi()', positions: [
-      'B.setWindowButtonPosition(PHi(e,Do?Z1:NHi()))',
-      'e.setWindowButtonPosition(DHi(t,rI(e.webContents.zoomFactor)))'
-    ] },
-    { anchor: 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:I0t()', positions: [
-      'e.setWindowButtonPosition(A0t(t,WN(e.webContents.zoomFactor)))'
-    ] },
-    { anchor: 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:nha()', positions: [
-      'e.setWindowButtonPosition(Kma(t,zP(e.webContents.zoomFactor)))'
-    ] }
-  ];
+  const titlebar = /titleBarStyle:"hidden",titleBarOverlay:(?:!0|!1),trafficLightPosition:[A-Za-z_$][\w$]*\(\)/g;
+  function removeButtonPositions(source) {
+    const marker = /[A-Za-z_$][\w$]*\.setWindowButtonPosition\(/g;
+    let result = '', cursor = 0;
+    while (true) {
+      marker.lastIndex = cursor;
+      const match = marker.exec(source);
+      if (!match) return result + source.slice(cursor);
+      const start = match.index;
+      result += source.slice(cursor, start) + 'void 0';
+      const open = start + match[0].length - 1;
+      let depth = 0, quote = '', escaped = false, end = -1;
+      for (let index = open; index < source.length; index++) {
+        const char = source[index];
+        if (quote) {
+          if (escaped) escaped = false;
+          else if (char === '\\') escaped = true;
+          else if (char === quote) quote = '';
+          continue;
+        }
+        if (char === '"' || char === "'" || char === '`') { quote = char; continue; }
+        if (char === '(') depth++;
+        else if (char === ')' && --depth === 0) { end = index + 1; break; }
+      }
+      if (end < 0) throw Error('Неоднозначный заголовок главного окна Claude Code.');
+      cursor = end;
+    }
+  }
   const patches = [];
   function visit(files, parent) {
     for (const [name, item] of Object.entries(files || {})) {
       const filename = parent + '/' + name;
       if (item.files) { visit(item.files, filename); continue; }
       if (!name.endsWith('.js') || item.unpacked || item.link || item.size > 16 * 1024 * 1024) continue;
-      const source = archive.read(filename).toString(), matches = variants.filter(variant => source.includes(variant.anchor));
-      if (!matches.length) {
-        if (source.includes('titleBarStyle:"hidden",titleBarOverlay:') && source.includes(',trafficLightPosition:')) {
-          throw Error('Неподдерживаемый заголовок главного окна Claude Code.');
-        }
-        continue;
-      }
-      if (matches.length !== 1 || source.split(matches[0].anchor).length !== 2 || matches[0].positions.some(position => !source.includes(position)) || patches.length) {
-        throw Error('Неоднозначный заголовок главного окна Claude Code.');
-      }
-      let patched = source.replace(matches[0].anchor, 'titleBarStyle:"default",titleBarOverlay:!1');
-      for (const position of matches[0].positions) patched = patched.replaceAll(position, 'void 0');
+      const source = archive.read(filename).toString(), matches = [...source.matchAll(titlebar)];
+      if (!matches.length) continue;
+      if (matches.length !== 1 || patches.length) throw Error('Неоднозначный заголовок главного окна Claude Code.');
+      const patched = removeButtonPositions(source.replace(matches[0][0], 'titleBarStyle:"default",titleBarOverlay:!1'));
       patches.push({ name: filename, source: Buffer.from(patched) });
     }
   }
@@ -240,4 +248,4 @@ if (process.platform === 'win32') app.setAppUserModelId('local.proxyguard.claude
     .replace(profileAnchor, '  const durableReady = ready.then(() => guardProfileReady);\n  durableReady.catch(targetFailure);')
     .replace(navigationAnchor, 'wc[name] = (...args) => durableReady.then'));
 }
-module.exports = { parseArchive, addBootstrap, updatePEIntegrity, windowsBootstrap, hash };
+module.exports = { parseArchive, patchNativeTitlebar, addBootstrap, updatePEIntegrity, windowsBootstrap, hash };

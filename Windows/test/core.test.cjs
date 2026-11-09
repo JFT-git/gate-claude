@@ -211,7 +211,8 @@ test('main-window ASAR chunk uses native titlebar without changing other windows
   assert.ok(!text.includes(anchor)); assert.ok(!text.includes('setWindowButtonPosition'));
   assert.ok(text.includes(otherWindow));
   assert.equal(parsed.entry('.vite/build/index.chunk-fixture.js').integrity.hash, A.hash(parsed.read('.vite/build/index.chunk-fixture.js')));
-  assert.throws(() => A.addBootstrap(fixtureArchive('console.log("fixture");', anchor), Buffer.from('boot')), /Неоднозначный заголовок/);
+  const withoutCustomButtons = A.parseArchive(A.addBootstrap(fixtureArchive('console.log("fixture");', anchor), Buffer.from('boot')).archive).read('.vite/build/index.chunk-fixture.js').toString();
+  assert.match(withoutCustomButtons, /titleBarStyle:"default",titleBarOverlay:!1/);
 });
 test('Windows main-window ASAR variant disables overlay and custom button positioning', () => {
   const anchor = 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:I0t()';
@@ -222,8 +223,9 @@ test('Windows main-window ASAR variant disables overlay and custom button positi
   assert.match(text, /titleBarStyle:"default",titleBarOverlay:!1/);
   assert.ok(!text.includes(anchor)); assert.ok(!text.includes('setWindowButtonPosition'));
   assert.ok(text.includes(otherWindow));
-  const unknown = source.replace('trafficLightPosition:I0t()', 'trafficLightPosition:Other()');
-  assert.throws(() => A.addBootstrap(fixtureArchive('console.log("fixture");', unknown), Buffer.from('boot')), /Неподдерживаемый заголовок/);
+  const unknown = source.replace('trafficLightPosition:I0t()', 'trafficLightPosition:Other()').replace('A0t(t,WN(e.webContents.zoomFactor))', 'FutureFn(t,Other(e.webContents.zoomFactor))');
+  const future = A.parseArchive(A.addBootstrap(fixtureArchive('console.log("fixture");', unknown), Buffer.from('boot')).archive).read('.vite/build/index.chunk-fixture.js').toString();
+  assert.match(future, /titleBarStyle:"default",titleBarOverlay:!1/); assert.ok(!future.includes('setWindowButtonPosition'));
 });
 test('Store main-window ASAR variant keeps native buttons and disables custom positioning', () => {
   const anchor = 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:nha()';

@@ -25,7 +25,7 @@ const servicePath = argument('--service') ? path.resolve(argument('--service')) 
 const codeEnabled = argv.includes('--code');
 const codeHostPath = argument('--code-host') ? path.resolve(argument('--code-host')) : null;
 const codeToolsDir = argument('--code-tools-dir') ? path.resolve(argument('--code-tools-dir')) : null;
-const ipHosts = ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org'];
+const ipHosts = ['ipwho.is', 'ipinfo.io', 'ipapi.co', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org'];
 const persistenceMarker = crypto.randomBytes(24).toString('hex');
 const persistenceCookie = '__Host-guard_fixture_persist';
 const fixtureDeepLink = 'claude://claude.ai/magic-link#guard-fixture-id:synthetic-token';
@@ -154,7 +154,16 @@ fetch('/__guard_test__/stream').then(async r=>{const reader=r.body.getReader();w
 const frame = '<script>parent.postMessage({guardFixture:true,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,language:navigator.language,locale:Intl.DateTimeFormat().resolvedOptions().locale},"https://claude.ai")</script>';
 
 async function main() {
-  assert.equal(process.platform, 'win32'); await fs.mkdir(work, { recursive: true });
+  assert.equal(process.platform, 'win32');
+  if (process.env.GUARD_TLS_DEBUG === '1') {
+    const originalConnect = tls.connect;
+    tls.connect = (...args) => {
+      const result = originalConnect(...args);
+      result.on('error', error => console.error('TLS_FIXTURE_ERROR', error.code || '', error.message || error));
+      return result;
+    };
+  }
+  await fs.mkdir(work, { recursive: true });
   if (codeEnabled) instrumentAsset();
   const execution = JSON.parse(await powershell("[pscustomobject]@{elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);interactive=((Get-Process -Id $PID).SessionId -gt 0)}|ConvertTo-Json -Compress"));
   proof.executionContext = { elevated: execution.elevated === true, interactive: execution.interactive === true,
@@ -230,8 +239,11 @@ async function main() {
     // Test-scoped destination mapping, without changing hosts or shipping a route override.
     net.createConnection = function (options, ...args) {
       if (options && typeof options === 'object' && options.host && !['127.0.0.1', '::1'].includes(options.host)) {
-        if (['claude.ai', 'challenges.cloudflare.com', ...ipHosts].includes(options.host) && options.port === 443)
-          return originalConnection.call(this, { ...options, host: '127.0.0.1', port: tlsServer.address().port }, ...args);
+        if (['claude.ai', 'challenges.cloudflare.com', ...ipHosts].includes(options.host) && options.port === 443) {
+          const mapped = { ...options, host: '127.0.0.1', port: tlsServer.address().port };
+          if (mapped.lookup) mapped.lookup = (name, lookupOptions, callback) => callback(null, '127.0.0.1', 4);
+          return originalConnection.call(this, mapped, ...args);
+        }
         if (codeEnabled && options.host === 'downloads.claude.ai' && options.port === 443) return originalConnection.call(this, options, ...args);
         const socket = new net.Socket(); queueMicrotask(() => socket.destroy(Object.assign(Error('Fixture denies external destinations'), { code: 'ECONNREFUSED' }))); return socket;
       }
@@ -481,14 +493,22 @@ command=async m=>{
     await until(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, 'runtime terminated');
     const refusal = net.connect(port, '127.0.0.1'); const refused = await new Promise(resolve => { refusal.once('connect', () => resolve(false)); refusal.once('error', () => resolve(true)); }); refusal.destroy();
     assert.equal(refused, true); controller.stop(); await assert.rejects(controller.start(input));
+    if (process.env.GUARD_RESET_PROBE === '1') {
+      const snapshot = controller.resetIP();
+      proof.resetProbe = { stateAfterReset: snapshot.state, memoryAfterReset: snapshot.savedIP };
+      await controller.start(input);
+      await until(() => controller.state === 'running' || (controller.state === 'blocked' && Promise.reject(Error(controller.message))), 'reset allows a different external IP', 45000);
+      proof.resetProbe.allowedDifferentIP = true;
+      controller.stop();
+    }
     const closeMilliseconds = Date.now() - changedAt;
     assert.ok(closeMilliseconds >= 19000 && closeMilliseconds < 35000, 'Freeze timeout must be bounded and must not be immediate');
     proof.killSwitch = { milliseconds: closeMilliseconds, freezeObservedBeforeClose: true, processGone: true, streamClosed: true, relayRefusesNewConnections: refused, blockedUntilRestart: true };
     // Teardown is asynchronous: do not race a new broker against the old global
     // WFP mutex or accept abandoned persistent filters as successful cleanup.
     await until(() => firstFence.closed && firstFence.installed === false, 'old WFP broker acknowledged filter removal', 20000);
-    observations.fixtureCookieDiskStopped=await fixtureCookieDisk(firstProfile);
-    observed = '203.0.113.7';
+    observations.fixtureCookieDiskStopped=await fixtureCookieDisk(firstProfile).catch(error=>{if(error.code==='EBUSY')return {locked:true};throw error});
+    observed = process.env.GUARD_RESET_PROBE === '1' ? '203.0.113.8' : '203.0.113.7';
     controller = newGuardController(root, resources);
     controller.on('log', event => console.log('restart ' + event.kind + ': ' + event.message));
     assert.equal(controller.policy.pinned, null); assert.equal(controller.policy.blocked, false);
