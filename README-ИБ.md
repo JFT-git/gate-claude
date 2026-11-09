@@ -8,7 +8,7 @@
 
 Guard — независимое приложение для запуска собственной локальной копии установленного Claude Desktop, проверки выходного IP, управления локальным шлюзом и просмотра доступных веб-запросов. Не связано с Anthropic. Claude Desktop и учётная запись устанавливаются/создаются отдельно; vendor runtime не включён в дистрибутив Guard.
 
-Поддерживаются Windows 10/11 x64 и macOS 13+ universal arm64/x86_64. Linux и отдельная Windows ARM64-сборка не заявлены. Windows-режим Claude Code закреплён на Desktop 1.44121.2 и CLI 2.1.304; native Git HTTPS и PowerShell поддерживаются в предусмотренной изоляции, Git Bash и Git SSH — нет.
+Поддерживаются Windows 10/11 x64 и macOS 13+ universal arm64/x86_64. Linux и отдельная Windows ARM64-сборка не заявлены. Windows-режим Claude Code поддерживает Desktop 1.44121.2 и Store 4.23118.0; текущий закреплённый CLI — 2.1.317; native Git HTTPS и PowerShell поддерживаются в предусмотренной изоляции, Git Bash и Git SSH — нет.
 
 Guard изменяет ASAR **собственной копии** Claude и её профиль. Исходная подпись Anthropic не удостоверяет модифицированную копию. Язык и часовой пояс применяются к контекстам Claude; системные язык и часовой пояс ОС не меняются.
 
@@ -36,7 +36,7 @@ Windows portable ZIP распаковывается целиком: одного
 - Управление runtime: локальные named pipes Windows либо унаследованные pipe/stdio macOS; внешний TCP debug-порт не открывается.
 - HTTPS-проверки IP/страны: `ipwho.is`, `ipinfo.io`, `ipapi.co`, `api64.ipify.org`, `api.ipify.org`, `api6.ipify.org`. Запросы группы выполняются параллельно, принимаются согласованные ответы; один работающий сервис является явным fallback, противоречия блокируются.
 - Внешняя DNS-метрика: случайный 32-hex поддомен `edns.ip-api.com`, только публичные сведения о DNS-ответчике. Она не влияет на запуск и не заменяет защитные DNS/WebRTC-правила.
-- На macOS после установления pin hostname-запросы выполняются через `cloudflare-dns.com` и `dns.google` по HTTPS с привязкой к проверенному egress. DoH-провайдеры видят имена назначений; отказ обоих закрывает CONNECT без возврата к системному resolver.
+- На Windows и macOS после установления pin hostname-запросы выполняются через `cloudflare-dns.com` и `dns.google` по HTTPS с привязкой к проверенному egress. DoH-провайдеры видят имена назначений; отказ обоих закрывает CONNECT без возврата к системному resolver.
 - Windows дополнительно проверяет выход к `claude.ai` и `api.anthropic.com` через `/cdn-cgi/trace`.
 - При включении Code возможна загрузка закреплённого CLI с `downloads.claude.ai`; размер и SHA-256 проверяются. Git/PowerShell поставляются проверенными sidecar-комплектами.
 - Автообновление Guard загружает signed metadata и пакеты из стабильных GitHub Releases по HTTPS. Учётные данные Claude и пользовательские файлы при этом не отправляются.
@@ -48,7 +48,7 @@ Guard не устанавливает MITM-сертификаты и не отк
 
 ## 5. Настройки, секреты и журналы
 
-**Windows:** `%APPDATA%\Claude Proxy Guard\Guard` — настройки, `diagnostics.json` до 80 событий, Profile, runtime/cache, CodeAssets/CodeBin/CodeTools и CodeState. Постоянная рабочая папка: `CodeState\Workspace`; авторизация Code находится внутри CodeState.
+**Windows:** `%APPDATA%\Claude Proxy Guard\Guard` — настройки, `diagnostics.json` до 80 событий, Profile, runtime/cache, CodeAssets/CodeBin/CodeTools и CodeState. Постоянная рабочая папка: `CodeState\Workspace`; авторизация Code находится внутри CodeState. `Guard\logs` содержит ограниченные технические JSONL/LOG с маскированием при записи. Диагностический ZIP не включает Profile, CodeState, settings, ip-memory или трафик, но как и любые журналы требует просмотра перед передачей.
 
 **macOS:** `~/Library/Application Support/ClaudeProxyGuard` — Profile, Runtime и `Diagnostics/events.jsonl` до 80 событий. Настройки UserDefaults: домен `local.proxyguard.claude`.
 

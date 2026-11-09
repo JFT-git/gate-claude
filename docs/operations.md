@@ -24,7 +24,7 @@ Portable не означает «без следов» и не хранит пр
 
 Начальная проверка страны выполняется параллельно через ipwho.is, ipinfo.io и ipapi.co, повторная проверка IP — через ipify, ipinfo.io и ipapi.co. Два согласованных ответа завершают группу без ожидания остальных сервисов. Если отвечает только один сервис, используется явно обозначенный fallback; разные IP или страны закрывают запуск. Каждый запрос ограничен 4 секундами, последовательного ожидания по 12 секунд на сервис нет.
 
-«Диагностика сети» показывает подтвердившие сервисы, ASN/оператора, задержки `claude.ai` и `api.anthropic.com`, фактический профиль и действующие DNS/WebRTC/QUIC-ограничения. На macOS после закрепления IP hostname-запросы дополнительно защищаются DNS-over-HTTPS через Cloudflare/Google с привязкой к проверенному egress; при недоступности обоих DoH-серверов соединение закрывается без системного DNS fallback. Дополнительная метрика через случайный поддомен `edns.ip-api.com` выполняется в фоне после закрепления IP и сообщает DNS-ответчик. Она может быть недоступна без влияния на сессию, не является самостоятельным доказательством утечки и не меняет security decision. Сторонний «trust score» Guard не выдумывает.
+«Диагностика сети» показывает подтвердившие сервисы, ASN/оператора, задержки `claude.ai` и `api.anthropic.com`, фактический профиль и действующие DNS/WebRTC/QUIC-ограничения. На Windows и macOS после закрепления IP hostname-запросы дополнительно защищаются DNS-over-HTTPS через Cloudflare/Google с привязкой к проверенному egress; при недоступности обоих DoH-серверов соединение закрывается без системного DNS fallback. Дополнительная метрика через случайный поддомен `edns.ip-api.com` выполняется в фоне после закрепления IP и сообщает DNS-ответчик. Она может быть недоступна без влияния на сессию, не является самостоятельным доказательством утечки и не меняет security decision. Сторонний «trust score» Guard не выдумывает.
 
 ## Обновление
 
@@ -38,18 +38,18 @@ Profile, CodeState, Workspace, настройки, diagnostics и `ip-memory.jso
 
 ## Где находятся данные
 
-- Windows: `%APPDATA%\Claude Proxy Guard\Guard` — настройки, `diagnostics.json`, Profile, Cache/runtime и CodeState. Постоянная рабочая папка: `CodeState\Workspace`. Авторизация Claude/Code хранится в их собственных профилях; это чувствительные данные. Privileged binaries: `%ProgramData%\Claude Proxy Guard\Service`, изменение только SYSTEM/Administrators.
+- Windows: `%APPDATA%\Claude Proxy Guard\Guard` — настройки, `diagnostics.json`, Profile, Cache/runtime и CodeState. Постоянная рабочая папка: `CodeState\Workspace`. Технические журналы: `Guard\logs\events.jsonl` и `guard.log` с одним `.previous`-сегментом. Авторизация Claude/Code хранится в их собственных профилях; это чувствительные данные. Privileged binaries: `%ProgramData%\Claude Proxy Guard\Service`, изменение только SYSTEM/Administrators.
 - macOS: `~/Library/Application Support/ClaudeProxyGuard` — Profile, Runtime и `Diagnostics/events.jsonl` до 80 событий. Настройки UserDefaults: домен `local.proxyguard.claude`.
 - Пароль SOCKS5 не сохраняется настройками Guard. Хост, порт и логин могут сохраняться.
 - Трафик находится в памяти до явного экспорта.
 
 ## Разбор ошибки
 
-Откройте журнал из заголовка или баннера ошибки. Соберите версию/commit, Windows или macOS и архитектуру, действие, последний этап и фиксированный код ошибки. Не публикуйте Profile, Workspace, magic link, адреса, cookies, пароль и содержимое чата.
+Откройте журнал из заголовка или баннера ошибки. В Windows кнопка «Собрать логи» создаёт ZIP с обезличенными техническими событиями, включая native command ack/timeout, epoch/revision, relay/WFP и состояние службы; «Папка логов» открывает фактический каталог записи. Перед передачей распакуйте и просмотрите архив. Дополнительно соберите версию/commit, Windows или macOS и архитектуру, действие, последний этап и фиксированный код ошибки. Не публикуйте Profile, Workspace, magic link, адреса, cookies, пароль и содержимое чата.
 
 Если UAC не появился при первом install/update, проверьте «Журнал защиты» Windows и полноту пакета. Не отключайте Defender/Firewall и не меняйте права WindowsApps. `not_installed`, `stopped`, `update_required` и `error` означают, что session routing недоступен; production не откатывается на старый per-session helper. `resources\GuardService.exe --status` возвращает authoritative JSON. Start/stop доступны только узкими native requests; stop отклоняется при активных brokers.
 
-Code закреплён на Desktop 1.44121.2 / CLI 2.1.304. Ошибка после автоматического обновления Claude требует проверки совместимости; кнопка повторного запуска не отменяет проверку исходных хешей.
+Code поддерживает Desktop 1.44121.2 и Store 4.23118.0; текущий закреплённый CLI — 2.1.317. Ошибка после автоматического обновления Claude требует проверки совместимости; кнопка повторного запуска не отменяет проверку исходных хешей.
 
 ## Полное удаление
 

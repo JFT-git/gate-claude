@@ -44,14 +44,25 @@ class GuardController extends EventEmitter {
     });
     this.fenceOwnerWindow = options.ownerWindow;
     this.fenceServiceLaunch = options.serviceLaunch;
-    this.root = root; this.resources = resources; this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
+    this.root = root; this.resources = resources; this.diagnostics = options.diagnostics || { event() {} };
+    this.policy = new IPPolicy(); this.state = 'idle'; this.events = []; this.epoch = 0;
     this.processFrozen = false; this.processState = 'running'; this.freezeDeadline = null; this.freezeWanted = false; this.recheckingSince = null;
     this.hostCommands = new Map(); this.hostCommandID = 0;
     this.ipMemory = new IPMemory(root); this.savedIP = null; this.ipMemoryError = '';
     try { this.savedIP = this.ipMemory.load(); } catch (error) { this.ipMemoryError = error.message; }
     try { this.events = JSON.parse(fs.readFileSync(path.join(root, 'diagnostics.json'), 'utf8')).slice(-80); } catch {}
   }
-  status(message) { this.message = message; this.emit('state', this.snapshot()); }
+  status(message) {
+    this.message = message;
+    const transition = [this.epoch, this.state, this.processState].join(':');
+    if (this.diagnosticTransition !== transition) {
+      this.diagnosticTransition = transition;
+      this.diagnostics.event('state', { epoch: this.epoch, state: this.state, processState: this.processState,
+        processFrozen: this.processFrozen, hostLive: this.liveHost(), relayOpen: Boolean(this.relay && !this.relay.closed),
+        relayUnlocked: this.relay?.unlocked === true, message });
+    }
+    this.emit('state', this.snapshot());
+  }
   snapshot() {
     const secondsRemaining = this.processFrozen && this.freezeDeadline !== null ? Math.max(0, Math.ceil((this.freezeDeadline - performance.now()) / 1000)) : 0;
     const metrics = this.networkMetrics || emptyNetworkMetrics();
@@ -79,6 +90,7 @@ class GuardController extends EventEmitter {
       const file = path.join(this.root, 'diagnostics.json'), temp = file + '.tmp';
       fs.writeFileSync(temp, JSON.stringify(this.events, null, 2), { mode: 0o600 }); fs.renameSync(temp, file);
     } catch { /* A full/unavailable disk must not keep the runtime alive after a block. */ }
+    this.diagnostics.event('user', { kind, message: event.message });
     this.emit('log', event);
   }
   reportProbeFailure(source, error, elapsedMS) {
@@ -134,28 +146,47 @@ class GuardController extends EventEmitter {
     const key = message.freezeAck !== undefined ? 'freezeAck' : message.thawAck !== undefined ? 'thawAck' : null;
     if (!key) return false;
     const id = message[key], entry = this.hostCommands.get(id);
-    if (!entry || entry.command !== key.slice(0, -3)) return true;
+    if (!entry || entry.command !== key.slice(0, -3)) {
+      this.diagnostics.event('host_command_unmatched', { id, command: key.slice(0, -3), nativeOk: message.ok === true,
+        count: Number.isSafeInteger(message.count) ? message.count : null, error: typeof message.error === 'string' ? message.error.slice(0, 256) : '' });
+      return true;
+    }
     this.hostCommands.delete(id); clearTimeout(entry.timer);
     const reason = typeof message.error === 'string' && message.error.length <= 256 ? ': ' + message.error : '';
-    if (message.ok !== true || !Number.isSafeInteger(message.count) || message.count < 0 || message.count > 4096) entry.reject(Error('GuardHost rejected the process state change' + reason + '.'));
+    const valid = message.ok === true && Number.isSafeInteger(message.count) && message.count >= 0 && message.count <= 4096;
+    this.diagnostics.event('host_command_ack', { id, command: entry.command, epoch: entry.epoch, revision: entry.revision,
+      ok: valid, nativeOk: message.ok === true, count: Number.isSafeInteger(message.count) ? message.count : null,
+      error: reason.slice(2), elapsedMS: performance.now() - entry.started, inFlight: this.hostCommands.size });
+    if (!valid) entry.reject(Error('GuardHost rejected the process state change' + reason + '.'));
     else entry.resolve({ count: message.count });
     return true;
   }
   rejectHostCommands(host = null) {
     for (const [id, entry] of this.hostCommands) {
       if (host && entry.host !== host) continue;
-      clearTimeout(entry.timer); this.hostCommands.delete(id); entry.reject(Error('GuardHost command cancelled.'));
+      clearTimeout(entry.timer); this.hostCommands.delete(id);
+      this.diagnostics.event('host_command_cancelled', { id, command: entry.command, epoch: entry.epoch, revision: entry.revision,
+        elapsedMS: performance.now() - entry.started, inFlight: this.hostCommands.size });
+      entry.reject(Error('GuardHost command cancelled.'));
     }
   }
   hostCommand(command, host = this.host) {
     if (!this.liveHost(host)) return Promise.reject(Error('GuardHost is not running.'));
-    const id = ++this.hostCommandID;
+    const id = ++this.hostCommandID, started = performance.now(), epoch = this.epoch, revision = this.revalidationRevision || 0;
+    this.diagnostics.event('host_command_start', { id, command, epoch, revision, timeoutMS: HOST_COMMAND_TIMEOUT_MS, inFlight: this.hostCommands.size + 1 });
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.hostCommands.delete(id); reject(Error('GuardHost command timed out.')); }, HOST_COMMAND_TIMEOUT_MS);
-      this.hostCommands.set(id, { host, command, resolve, reject, timer });
+      const timer = setTimeout(() => {
+        this.hostCommands.delete(id);
+        this.diagnostics.event('host_command_timeout', { id, command, epoch, revision, elapsedMS: performance.now() - started, inFlight: this.hostCommands.size });
+        reject(Error('GuardHost command timed out.'));
+      }, HOST_COMMAND_TIMEOUT_MS);
+      this.hostCommands.set(id, { host, command, resolve, reject, timer, started, epoch, revision });
       host.stdin.write(command + ' ' + id + '\n', error => {
         if (!error || !this.hostCommands.has(id)) return;
-        clearTimeout(timer); this.hostCommands.delete(id); reject(error);
+        clearTimeout(timer); this.hostCommands.delete(id);
+        this.diagnostics.event('host_command_write_error', { id, command, epoch, revision, code: error.code || '',
+          elapsedMS: performance.now() - started, inFlight: this.hostCommands.size });
+        reject(error);
       });
     });
   }
@@ -226,7 +257,9 @@ class GuardController extends EventEmitter {
     try { this.relay.resume(); }
     catch { if (valid()) this.block('Не удалось возобновить защищённый шлюз. Сессия закрыта.'); return false; }
     if (!valid()) { this.relay?.pause(); return false; }
-    this.recheckingSince = null; this.clearProcessFreeze(); return true;
+    this.recheckingSince = null; this.clearProcessFreeze();
+    this.diagnostics.event('revalidation_resume', { epoch, revision, relayUnlocked: this.relay.unlocked === true });
+    return true;
   }
   closeFrozenSession(epoch, host) {
     if (this.epoch !== epoch || this.host !== host || !this.processFrozen || this.freezeClosing) return;
@@ -802,6 +835,7 @@ class GuardController extends EventEmitter {
     }
     finally { if (this.ipRequest === request) this.ipRequest = null; }
   }
+  routinePollDelay(elapsed) { return Math.max(FREEZE_RETRY_MS, this.settings.interval * 1000 - elapsed); }
   schedulePoll(epoch, delay) {
     clearTimeout(this.pollTimer);
     if (this.epoch !== epoch || this.policy.blocked || !this.relay || this.freezeClosing) return;
@@ -911,7 +945,11 @@ class GuardController extends EventEmitter {
       if (this.checkTask === task) this.checkTask = null;
       if (!active()) return;
       const changed = task.revision !== (this.revalidationRevision || 0), elapsed = performance.now() - task.started;
-      this.schedulePoll(epoch, this.processFrozen ? Math.max(0, FREEZE_RETRY_MS - elapsed) : changed ? FREEZE_RETRY_MS : Math.max(0, this.settings.interval * 1000 - elapsed));
+      if (rechecking || changed || this.state === 'rechecking') this.diagnostics.event('revalidation_poll', {
+        epoch, revision: task.revision, currentRevision: this.revalidationRevision || 0, changed, elapsedMS: elapsed,
+        state: this.state, processState: this.processState, recheckingMS: this.recheckingSince === null ? null : performance.now() - this.recheckingSince
+      });
+      this.schedulePoll(epoch, this.processFrozen ? Math.max(0, FREEZE_RETRY_MS - elapsed) : changed ? FREEZE_RETRY_MS : this.routinePollDelay(elapsed));
     });
     this.checkTask = task; return task.promise;
   }
@@ -952,6 +990,10 @@ class GuardController extends EventEmitter {
   }
   block(reason) {
     if (this.state === 'blocked') return;
+    this.diagnostics.event('block', { epoch: this.epoch, previousState: this.state, processState: this.processState,
+      processFrozen: this.processFrozen, runtimePID: this.runtimePID || null, hostLive: this.liveHost(),
+      relayOpen: Boolean(this.relay && !this.relay.closed), relayUnlocked: this.relay?.unlocked === true,
+      fenceInstalled: this.fence?.installed === true, reason });
     this.policy.block(); this.teardown(); this.state = 'blocked';
     this.log(reason, 'blocked'); this.status(reason);
   }

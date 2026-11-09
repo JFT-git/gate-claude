@@ -182,6 +182,10 @@
           <button id="logsTab" type="button" class="tab active" role="tab" aria-selected="true" aria-controls="logs" tabindex="0"><svg class="icon" aria-hidden="true"><use href="icons.svg#journal"/></svg>Журнал</button>
           <button id="trafficTab" type="button" class="tab" role="tab" aria-selected="false" aria-controls="traffic" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="icons.svg#traffic"/></svg>Трафик <span id="count">0</span></button>
         </div>
+        <div id="logActions" class="log-actions">
+          <button id="collectLogs" type="button" class="secondary small"><svg class="icon" aria-hidden="true"><use href="icons.svg#download"/></svg>Собрать логи</button>
+          <button id="logsFolder" type="button" class="secondary small"><svg class="icon" aria-hidden="true"><use href="icons.svg#folder"/></svg>Папка логов</button>
+        </div>
         <button id="export" type="button" class="secondary small" hidden disabled><svg class="icon" aria-hidden="true"><use href="icons.svg#download"/></svg>Экспорт JSON</button>
       </div>
       <div id="logs" class="logs" role="tabpanel" aria-labelledby="logsTab" tabindex="0">

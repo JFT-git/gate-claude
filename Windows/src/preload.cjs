@@ -16,5 +16,7 @@ contextBridge.exposeInMainWorld('guard', Object.freeze({
   updateCheck: () => ipcRenderer.invoke('guard:updateCheck'),
   updateInstall: () => ipcRenderer.invoke('guard:updateInstall', true),
   export: () => ipcRenderer.invoke('guard:export'),
+  diagnosticsOpen: () => ipcRenderer.invoke('guard:diagnosticsOpen'),
+  diagnosticsExport: () => ipcRenderer.invoke('guard:diagnosticsExport'),
   subscribe: callback => { const listener = (_event, value) => callback(value); ipcRenderer.on('guard:event', listener); return () => ipcRenderer.off('guard:event', listener); }
 }));

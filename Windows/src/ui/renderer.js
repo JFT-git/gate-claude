@@ -32,7 +32,7 @@ function refreshControls() {
   $('export').disabled = records.size === 0 || pending.has('export');
   $('restartConfirmYes').disabled = !c.restart;
   $('resetIP').disabled = !ready || !['idle','blocked'].includes(state.state) || state.windowsApprovalPending || pending.size > 0 || (!state.savedIP && !state.ipMemoryError);
-  for (const [id, key] of [['protocolSettings','protocolSettings'],['protocolCheck','protocolCheck'],['codeWorkspace','workspace'],['serviceRefresh','service']]) { $(id).disabled = !ready || pending.has(key); $(id).setAttribute('aria-busy', String(pending.has(key))); }
+  for (const [id, key] of [['protocolSettings','protocolSettings'],['protocolCheck','protocolCheck'],['codeWorkspace','workspace'],['serviceRefresh','service'],['collectLogs','diagnosticsExport'],['logsFolder','diagnosticsOpen']]) { $(id).disabled = !ready || pending.has(key); $(id).setAttribute('aria-busy', String(pending.has(key))); }
   for (const button of document.querySelectorAll('[data-service]')) button.disabled = pending.has('service') || VM.service(serviceSnapshot).busy;
   $('serviceActivity').hidden = !pending.has('service') && !VM.service(serviceSnapshot).busy;
   const updateBusy = ['checking','downloading','installing'].includes(updateSnapshot?.state);
@@ -172,7 +172,7 @@ function renderRecords() {
 }
 function record(value) { records.set(value.id,value); while(records.size>200) records.delete(records.keys().next().value); if(!renderTimer) renderTimer=setTimeout(renderRecords,120); }
 function tab(traffic, focus = false) {
-  $('traffic').hidden=!traffic; $('logs').hidden=traffic; $('export').hidden=!traffic;
+  $('traffic').hidden=!traffic; $('logs').hidden=traffic; $('export').hidden=!traffic; $('logActions').hidden=traffic;
   for (const id of ['trafficTab','logsTab']) { const selected=id===(traffic?'trafficTab':'logsTab'); $(id).classList.toggle('active',selected); $(id).setAttribute('aria-selected',String(selected)); $(id).tabIndex=selected?0:-1; }
   if(focus) $(traffic?'trafficTab':'logsTab').focus();
 }
@@ -224,6 +224,8 @@ $('protocolSettings').addEventListener('click',()=>void perform('protocolSetting
 $('protocolCheck').addEventListener('click',()=>void perform('protocolCheck','Проверка ссылок входа',async()=>{const value=await window.guard.protocolCheck();if(!value?.error)showProtocol(value);return value;},result=>result?.defaultConfirmed?'Guard выбран':'выбор Guard не подтверждён'));
 $('mode').addEventListener('change',()=>{if($('mode').value==='network')$('password').value='';refreshControls();});
 $('codeWorkspace').addEventListener('click',()=>void perform('workspace','Открытие рабочей папки',()=>window.guard.codeWorkspace(),'папка открыта'));
+$('collectLogs').addEventListener('click',()=>void perform('diagnosticsExport','Сбор диагностики',()=>window.guard.diagnosticsExport(),result=>result?.saved?'ZIP сохранён':'сохранение отменено'));
+$('logsFolder').addEventListener('click',()=>void perform('diagnosticsOpen','Папка логов',()=>window.guard.diagnosticsOpen(),'папка открыта'));
 $('export').addEventListener('click',()=>{if(records.size)void perform('export','Экспорт трафика',()=>window.guard.export(),result=>result?'файл сохранён':'сохранение отменено');});
 for(const id of ['openLogs','errorLogs'])$(id).addEventListener('click',()=>{tab(false);$('logs').focus();});
 $('dismissError').addEventListener('click',()=>{$('errorBanner').hidden=true;$('sessionActions').focus();});

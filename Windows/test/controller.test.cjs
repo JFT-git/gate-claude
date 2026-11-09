@@ -193,11 +193,19 @@ test('continuous rechecking is bounded even without a runtime host', async t => 
   controller.pauseForRevalidation('permanent failure');
   assert.equal(controller.state, 'blocked'); assert.equal(controller.policy.blocked, true); assert.equal(controller.recheckingSince, null);
 });
-test('native freeze rejection includes its sanitized operation', async t => {
-  const controller = await fixture(t), host = { killed: false, exitCode: null, signalCode: null, stdin: { destroyed: false, write() {} } };
+test('native freeze rejection includes its sanitized operation and a late ack stays unmatched', async t => {
+  const controller = await fixture(t), events = [], host = { killed: false, exitCode: null, signalCode: null, stdin: { destroyed: false, write() {} } };
+  controller.diagnostics = { event: (type, details) => events.push({ type, ...details }) };
   const pending = controller.hostCommand('freeze', host);
   controller.resolveHostCommand({ freezeAck: 1, ok: false, count: 0, error: 'InvalidOperationException:0:ThreadSnapshot' });
   await assert.rejects(pending, /ThreadSnapshot/);
+  controller.resolveHostCommand({ freezeAck: 1, ok: true, count: 1 });
+  assert.ok(events.some(event => event.type === 'host_command_ack' && event.error.includes('ThreadSnapshot') && event.epoch === controller.epoch));
+  assert.ok(events.some(event => event.type === 'host_command_unmatched' && event.id === 1));
+});
+test('long routine validation never schedules an immediate retry', async t => {
+  const controller = await fixture(t); controller.settings = { interval: 2 };
+  assert.equal(controller.routinePollDelay(2500), 1000); assert.equal(controller.routinePollDelay(100), 1900);
 });
 test('successful revalidation refreshes the local pin and stop resets it', async t => {
   const controller = await fixture(t); let calls = 0, resumed = 0;

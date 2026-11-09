@@ -3,6 +3,9 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const dgram = require('node:dgram');
+const fs = require('node:fs');
+const path = require('node:path');
+const tls = require('node:tls');
 const { once } = require('node:events');
 const { capturedEgressLocalAddresses, beginEgressCapture, setPinnedLocalAddresses, connectCurrentNetwork, NetworkRelay, connectTunnel } = require('../src/relay.cjs');
 function pin(t, value) { setPinnedLocalAddresses(value); t.after(() => setPinnedLocalAddresses(null)); }
@@ -53,6 +56,43 @@ test('DNS timeout closes CONNECT without system lookup fallback', { timeout: 750
   const dns = require('node:dns'), original = dns.lookup; let fallbacks = 0; const stacks = [];
   dns.lookup = () => { fallbacks++; stacks.push(new Error('Unexpected system DNS').stack); throw Error('Unexpected system DNS'); }; t.after(() => { dns.lookup = original; });
   await assert.rejects(connectTunnel(relay.port, 'timeout.invalid', 443)); assert.equal(fallbacks, 0, stacks.join('\n'));
+});
+
+async function dohFixture(t, status) {
+  const directory = path.join(__dirname, 'helpers/native-code-asset-tls'), cert = fs.readFileSync(path.join(directory, 'cert.txt')), key = fs.readFileSync(path.join(directory, 'key.txt'));
+  const defaults = tls.getCACertificates(); tls.setDefaultCACertificates([...defaults, cert]); t.after(() => tls.setDefaultCACertificates(defaults));
+  const requests = [], peers = new Set();
+  const server = tls.createServer({ cert, key }, socket => {
+    peers.add(socket); socket.on('error', () => {}); socket.on('close', () => peers.delete(socket));
+    let head = ''; socket.on('data', chunk => {
+      head += chunk.toString('latin1'); if (!head.includes('\r\n\r\n')) return;
+      requests.push(head); const body = JSON.stringify({ Status: status, Answer: status === 0 ? [{ type: 1, data: '127.0.0.1' }] : [] });
+      socket.end('HTTP/1.1 200 OK\r\nContent-Type: application/dns-json\r\nContent-Length: ' + Buffer.byteLength(body) + '\r\nConnection: close\r\n\r\n' + body);
+    });
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => { for (const peer of peers) peer.destroy(); server.close(); });
+  return { port: server.address().port, requests };
+}
+test('DoH resolves through the pinned route without system DNS or UDP fallback', async t => {
+  const destination = await receiver(t), fixture = await dohFixture(t, 0), dns = require('node:dns'), originalLookup = dns.lookup, originalDgram = dgram.createSocket;
+  let fallbacks = 0;
+  dns.lookup = () => { fallbacks++; throw Error('Unexpected system DNS'); }; dgram.createSocket = () => { fallbacks++; throw Error('Unexpected UDP DNS'); };
+  t.after(() => { dns.lookup = originalLookup; dgram.createSocket = originalDgram; });
+  pin(t, { v4: '127.0.0.1', dohServers: [{ host: '127.0.0.1', port: fixture.port, servername: 'downloads.claude.ai', path: '/dns-query' }] });
+  const socket = await connectCurrentNetwork('doh.invalid', destination, undefined, 4); t.after(() => socket.destroy());
+  assert.equal(socket.remoteAddress, '127.0.0.1'); assert.equal(fallbacks, 0);
+  assert.match(fixture.requests[0], /^GET \/dns-query\?name=doh\.invalid&type=A /);
+  assert.match(fixture.requests[0], /Host: downloads\.claude\.ai/i);
+});
+test('failed DoH closes CONNECT without system DNS or UDP fallback', async t => {
+  const fixture = await dohFixture(t, 3), dns = require('node:dns'), originalLookup = dns.lookup, originalDgram = dgram.createSocket;
+  let fallbacks = 0;
+  dns.lookup = () => { fallbacks++; throw Error('Unexpected system DNS'); }; dgram.createSocket = () => { fallbacks++; throw Error('Unexpected UDP DNS'); };
+  t.after(() => { dns.lookup = originalLookup; dgram.createSocket = originalDgram; });
+  pin(t, { v4: '127.0.0.1', dohServers: [{ host: '127.0.0.1', port: fixture.port, servername: 'downloads.claude.ai', path: '/dns-query' }] });
+  await assert.rejects(connectCurrentNetwork('doh-failure.invalid', 443, undefined, 4), error => error.targetRefused);
+  assert.equal(fallbacks, 0);
 });
 
 test('loopback control connections do not become egress pins', async t => {

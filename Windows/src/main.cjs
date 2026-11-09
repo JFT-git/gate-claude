@@ -15,12 +15,14 @@ const { ServiceIntegration } = require('./service-integration.cjs');
 const { NativeServiceBackend } = require('./service-backend.cjs');
 const { resetIPWithConfirmation } = require('./ip-reset.cjs');
 const { WindowsUpdater } = require('./updater.cjs');
+const os = require('node:os');
+const { DiagnosticStore, sessionSnapshot } = require('./diagnostics.cjs');
 
 app.setName('Claude Proxy Guard');
 app.setAppUserModelId?.('local.proxyguard.gate-claude');
 if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
-  let window, controller, updater, protocolState, earlyLinkRefused = false, resettingIP = false;
+  let window, controller, updater, protocolState, earlyLinkRefused = false, resettingIP = false, exportingDiagnostics = false;
   const receiveDeepLink = argv => {
     const link = takeDeepLinkFromArgv(argv);
     if (!link.hadLink) return;
@@ -30,6 +32,7 @@ else {
   receiveDeepLink(process.argv);
   const traffic = new Map();
   const root = path.join(app.getPath('userData'), 'Guard');
+  const diagnostics = new DiagnosticStore(root);
   const resources = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '..', 'resources');
   const send = (type, data) => { if (window && !window.isDestroyed()) window.webContents.send('guard:event', { type, data }); };
   const safeError = error => diagnostic(error?.message || 'Не удалось выполнить действие.');
@@ -43,10 +46,11 @@ else {
   function handle(name, callback) {
     ipcMain.handle('guard:' + name, async (event, ...args) => {
       if (event.sender !== window?.webContents || event.senderFrame !== window.webContents.mainFrame) throw Error('Недопустимый источник команды.');
-      try { return await callback(...args); } catch (error) { return { error: safeError(error) }; }
+      try { return await callback(...args); } catch (error) { diagnostics.error('ipc:' + name, error); return { error: safeError(error) }; }
     });
   }
   app.whenReady().then(async () => {
+    diagnostics.event('app_ready', { version: app.getVersion(), platform: process.platform, arch: process.arch, os: os.release() });
     const ownerWindow = () => {
       if (!window || window.isDestroyed()) throw Error('Окно Guard недоступно для системного запроса Windows.');
       window.show(); window.focus();
@@ -55,7 +59,7 @@ else {
     const serviceBackend = new NativeServiceBackend({ helperPath: path.join(resources, 'GuardService.exe'), ownerWindow });
     const serviceIntegration = new ServiceIntegration(serviceBackend);
     controller = new GuardController(root, resources, {
-      ownerWindow,
+      ownerWindow, diagnostics,
       serviceLaunch: request => serviceIntegration.launch(request)
     });
     const updateMenu = createUpdateMenu({
@@ -178,6 +182,32 @@ else {
       if (!result.canceled && result.filePath) { fs.writeFileSync(result.filePath, JSON.stringify([...traffic.values()], null, 2), { mode: 0o600 }); return true; }
       return false;
     });
+    handle('diagnosticsOpen', async () => {
+      diagnostics.event('logs_folder_opened');
+      const message = await shell.openPath(diagnostics.ensure());
+      if (message) throw Error('Не удалось открыть папку журналов.');
+      return { opened: true };
+    });
+    handle('diagnosticsExport', async () => {
+      if (exportingDiagnostics) throw Error('Сбор диагностики уже выполняется.');
+      exportingDiagnostics = true;
+      try {
+        diagnostics.event('logs_export_requested');
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const result = await dialog.showSaveDialog(window, { title: 'Собрать диагностические логи', defaultPath: 'guard-logs-' + stamp + '.zip', filters: [{ name: 'ZIP', extensions: ['zip'] }] });
+        if (result.canceled || !result.filePath) return { saved: false };
+        const bundle = await diagnostics.bundle({
+          manifest: { schema: 1, createdAt: new Date().toISOString(), appVersion: app.getVersion(), platform: process.platform,
+            arch: process.arch, osRelease: os.release(), electron: process.versions.electron, chrome: process.versions.chrome, node: process.versions.node },
+          session: sessionSnapshot(controller), service: await serviceIntegration.status()
+        });
+        const temporary = result.filePath + '.tmp';
+        try { await fs.promises.writeFile(temporary, bundle.bytes, { mode: 0o600 }); await fs.promises.rename(temporary, result.filePath); }
+        finally { await fs.promises.unlink(temporary).catch(() => {}); }
+        diagnostics.event('logs_export_completed', { bytes: bundle.bytes.length, files: bundle.files.length });
+        return { saved: true };
+      } finally { exportingDiagnostics = false; }
+    });
     window = new BrowserWindow({ width: 1240, height: 900, minWidth: 640, minHeight: 600, backgroundColor: nativeTheme.shouldUseDarkColors ? '#101813' : '#f4f7f5', title: 'Claude Proxy Guard',
       autoHideMenuBar: false, menuBarVisible: true, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false, webSecurity: true } });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -224,13 +254,13 @@ else {
       app.exit(ok ? 0 : 1);
     }
   }).catch(error => {
-    dialog.showErrorBox('Claude Proxy Guard', safeError(error)); app.exit(1);
+    diagnostics.error('startup', error); diagnostics.flushSync(); dialog.showErrorBox('Claude Proxy Guard', safeError(error)); app.exit(1);
   });
   app.on('second-instance', (_event, argv) => { receiveDeepLink(argv); if (window) { if (window.isMinimized()) window.restore(); window.show(); window.focus(); } });
-  app.on('before-quit', () => { updater?.dispose(); controller?.stop(); });
+  app.on('before-quit', () => { diagnostics.event('app_quit'); updater?.dispose(); controller?.stop(); diagnostics.flushSync(); });
   app.on('window-all-closed', () => app.quit());
   const powerBlock = () => { if (controller && !['idle', 'blocked'].includes(controller.state)) controller.revalidate('Сон или пробуждение компьютера. Проверяем прежний IP.'); };
   app.whenReady().then(() => { powerMonitor.on('suspend', powerBlock); powerMonitor.on('resume', powerBlock); });
-  process.on('uncaughtException', () => { controller?.block('Внутренняя ошибка Guard. Сессия закрыта.'); app.exit(1); });
-  process.on('unhandledRejection', () => { controller?.block('Внутренняя ошибка Guard. Сессия закрыта.'); app.exit(1); });
+  process.on('uncaughtException', error => { diagnostics.error('uncaughtException', error); controller?.block('Внутренняя ошибка Guard. Сессия закрыта.'); diagnostics.flushSync(); app.exit(1); });
+  process.on('unhandledRejection', error => { diagnostics.error('unhandledRejection', error); controller?.block('Внутренняя ошибка Guard. Сессия закрыта.'); diagnostics.flushSync(); app.exit(1); });
 }

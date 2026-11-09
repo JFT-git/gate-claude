@@ -1,6 +1,8 @@
 'use strict';
 const net = require('node:net');
 const dns = require('node:dns');
+const https = require('node:https');
+const tls = require('node:tls');
 const { EventEmitter, once } = require('node:events');
 const { randomBytes, timingSafeEqual } = require('node:crypto');
 const securityError = message => Object.assign(Error(message), { guardSecurity: true });
@@ -216,7 +218,7 @@ function beginEgressCapture() { capturedLocalAddresses = {}; captureGeneration++
 function setPinnedLocalAddresses(pin) {
   if (pin !== null && (!pin || [4, 6].some(f => pin['v' + f] != null &&
       (net.isIP(pin['v' + f]) !== f || mappedIPv4(pin['v' + f]))))) throw familyRefusal();
-  pinnedLocalAddresses = pin === null ? null : { ...pin, dnsServers: pin.dnsServers?.slice() };
+  pinnedLocalAddresses = pin === null ? null : { ...pin, dnsServers: pin.dnsServers?.slice(), dohServers: pin.dohServers?.map(provider => ({ ...provider })) };
 }
 function localRefusal() { return Object.assign(Error('Локальный адрес закреплённого выхода недоступен. Соединение закрыто.'), { targetRefused: true }); }
 function dnsName(packet, start) {
@@ -261,10 +263,79 @@ function dnsAnswer(packet, id, host, family) {
   }
   throw Error('DNS не вернул адрес нужного семейства.');
 }
+const DEFAULT_DOH_PROVIDERS = Object.freeze([
+  Object.freeze({ host: '1.1.1.1', servername: 'cloudflare-dns.com', path: '/dns-query' }),
+  Object.freeze({ host: '1.0.0.1', servername: 'cloudflare-dns.com', path: '/dns-query' }),
+  Object.freeze({ host: '8.8.8.8', servername: 'dns.google', path: '/resolve' }),
+  Object.freeze({ host: '2606:4700:4700::1111', servername: 'cloudflare-dns.com', path: '/dns-query' }),
+  Object.freeze({ host: '2001:4860:4860::8888', servername: 'dns.google', path: '/resolve' })
+]);
+function dohAnswer(value, family) {
+  const type = family === 4 ? 1 : 28;
+  if (!value || value.Status !== 0 || !Array.isArray(value.Answer)) throw Error('DoH не вернул адрес.');
+  for (const answer of value.Answer) {
+    if (answer?.type !== type || typeof answer.data !== 'string' || net.isIP(answer.data) !== family || mappedIPv4(answer.data)) continue;
+    return family === 6 ? answer.data.toLowerCase() : answer.data;
+  }
+  throw Error('DoH не вернул адрес нужного семейства.');
+}
+function dohRequest(provider, host, family) {
+  let raw, secure, request, response, agent;
+  try { agent = new https.Agent({ keepAlive: false, maxSockets: 1, maxCachedSessions: 0 }); }
+  catch { return Promise.reject(Error('DoH недоступен.')); }
+  const port = provider.port || 443;
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const finish = (error, value) => {
+      if (finished) return; finished = true; clearTimeout(timer);
+      for (const stream of [response, request, secure, raw, agent]) { try { stream?.destroy?.(); } catch {} }
+      error ? reject(error) : resolve(value);
+    };
+    const timer = setTimeout(() => finish(Error('Тайм-аут DoH.')), 3000);
+    agent.createConnection = (_options, callback) => {
+      let completed = false;
+      const complete = (error, stream) => { if (!completed) { completed = true; try { callback(error, stream); } catch { finish(error); } } };
+      connectCurrentNetwork(provider.host, port, socket => { raw = socket; if (finished) socket.destroy(); }, family, false).then(socket => {
+        raw = socket; if (finished) { socket.destroy(); return; }
+        try {
+          secure = tls.connect({ socket, servername: provider.servername, rejectUnauthorized: true, minVersion: 'TLSv1.2' });
+          secure.once('secureConnect', () => complete(null, secure));
+          secure.once('error', error => { complete(error); finish(error); });
+        } catch (error) { complete(error); finish(error); }
+      }).catch(error => { complete(error); finish(error); });
+      return undefined;
+    };
+    try {
+      request = https.request({ host: provider.host, port, path: provider.path + '?name=' + encodeURIComponent(host) + '&type=' + (family === 4 ? 'A' : 'AAAA'),
+        method: 'GET', agent, maxHeaderSize: 8192, headers: { Host: provider.servername, Accept: 'application/dns-json, application/json',
+          'Accept-Encoding': 'identity', 'Cache-Control': 'no-store', Connection: 'close', 'User-Agent': 'gate-claude/doh' } }, incoming => {
+        response = incoming;
+        if (finished) { incoming.destroy(); return; }
+        if (incoming.statusCode !== 200 || !/^application\/(?:dns-)?json(?:\s*;.*)?$/i.test(incoming.headers['content-type'] || '') ||
+            (incoming.headers['content-encoding'] && incoming.headers['content-encoding'] !== 'identity')) { finish(Error('Неверный ответ DoH.')); return; }
+        if (Number(incoming.headers['content-length'] || 0) > 32768) { finish(Error('Ответ DoH слишком большой.')); return; }
+        let size = 0; const chunks = [];
+        incoming.on('data', chunk => { size += chunk.length; if (size > 32768) finish(Error('Ответ DoH слишком большой.')); else chunks.push(chunk); });
+        incoming.once('end', () => { try { finish(null, dohAnswer(JSON.parse(Buffer.concat(chunks, size).toString('utf8')), family)); } catch (error) { finish(error); } });
+        incoming.once('aborted', () => finish(Error('Ответ DoH оборван.')));
+        incoming.once('error', error => finish(error));
+        incoming.once('close', () => { if (!incoming.complete) finish(Error('Ответ DoH не завершён.')); });
+      });
+      request.once('error', finish); request.end();
+    } catch (error) { finish(error); }
+  });
+}
+function dohLookup(host, family, providers) {
+  const candidates = providers.filter(provider => provider && net.isIP(provider.host) === family && !mappedIPv4(provider.host) &&
+    typeof provider.servername === 'string' && /^[a-z0-9.-]+$/i.test(provider.servername) && typeof provider.path === 'string' && provider.path.startsWith('/'));
+  if (!candidates.length) return Promise.reject(localRefusal());
+  return Promise.any(candidates.map(provider => dohRequest(provider, host, family))).catch(() => { throw localRefusal(); });
+}
 async function boundLookup(host, family, pin) {
   const labels = host.replace(/\.$/, '').split('.');
   if (!labels.length || labels.some(x => !x.length || x.length > 63 || !/^[a-z0-9_-]+$/i.test(x)) || host.length > 254) throw Error('Неверное имя DNS.');
-  const servers = pin.dnsServers || dns.getServers(); let failure = localRefusal();
+  if (!pin.dnsServers?.length) return dohLookup(host, family, pin.dohServers || DEFAULT_DOH_PROVIDERS);
+  const servers = pin.dnsServers; let failure = localRefusal();
   for (let attempt = 0; attempt < 2; attempt++) for (const server of servers) {
     try {
       const match = /^\[([^\]]+)\](?::(\d+))?$/.exec(server) || /^(\d+\.\d+\.\d+\.\d+)(?::(\d+))?$/.exec(server);
