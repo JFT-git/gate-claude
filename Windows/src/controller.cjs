@@ -25,6 +25,7 @@ const DESTINATIONS = Object.freeze(['claude.ai', 'api.anthropic.com']);
 const FREEZE_LIMIT_MS = 20000;
 const FREEZE_RETRY_MS = 1000;
 const FREEZE_CLOSE_MS = 5000;
+const HOST_COMMAND_TIMEOUT_MS = 5000;
 function emptyNetworkMetrics() {
   return { sources: [], organization: '', asn: '', destinations: {}, dns: { state: 'idle' }, dnsProtection: '', webRTC: 'disable_non_proxied_udp', quic: 'disabled' };
 }
@@ -135,7 +136,8 @@ class GuardController extends EventEmitter {
     const id = message[key], entry = this.hostCommands.get(id);
     if (!entry || entry.command !== key.slice(0, -3)) return true;
     this.hostCommands.delete(id); clearTimeout(entry.timer);
-    if (message.ok !== true || !Number.isSafeInteger(message.count) || message.count < 0 || message.count > 4096) entry.reject(Error('GuardHost rejected the process state change.'));
+    const reason = typeof message.error === 'string' && message.error.length <= 256 ? ': ' + message.error : '';
+    if (message.ok !== true || !Number.isSafeInteger(message.count) || message.count < 0 || message.count > 4096) entry.reject(Error('GuardHost rejected the process state change' + reason + '.'));
     else entry.resolve({ count: message.count });
     return true;
   }
@@ -149,7 +151,7 @@ class GuardController extends EventEmitter {
     if (!this.liveHost(host)) return Promise.reject(Error('GuardHost is not running.'));
     const id = ++this.hostCommandID;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.hostCommands.delete(id); reject(Error('GuardHost command timed out.')); }, 1500);
+      const timer = setTimeout(() => { this.hostCommands.delete(id); reject(Error('GuardHost command timed out.')); }, HOST_COMMAND_TIMEOUT_MS);
       this.hostCommands.set(id, { host, command, resolve, reject, timer });
       host.stdin.write(command + ' ' + id + '\n', error => {
         if (!error || !this.hostCommands.has(id)) return;

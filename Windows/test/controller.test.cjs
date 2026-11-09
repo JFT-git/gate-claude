@@ -193,6 +193,12 @@ test('continuous rechecking is bounded even without a runtime host', async t => 
   controller.pauseForRevalidation('permanent failure');
   assert.equal(controller.state, 'blocked'); assert.equal(controller.policy.blocked, true); assert.equal(controller.recheckingSince, null);
 });
+test('native freeze rejection includes its sanitized operation', async t => {
+  const controller = await fixture(t), host = { killed: false, exitCode: null, signalCode: null, stdin: { destroyed: false, write() {} } };
+  const pending = controller.hostCommand('freeze', host);
+  controller.resolveHostCommand({ freezeAck: 1, ok: false, count: 0, error: 'InvalidOperationException:0:ThreadSnapshot' });
+  await assert.rejects(pending, /ThreadSnapshot/);
+});
 test('successful revalidation refreshes the local pin and stop resets it', async t => {
   const controller = await fixture(t); let calls = 0, resumed = 0;
   controller.settings = { mode: 'network', interval: 30 }; controller.state = 'rechecking'; controller.route = '';

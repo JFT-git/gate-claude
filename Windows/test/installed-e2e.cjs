@@ -427,10 +427,20 @@ command=async m=>{
     assert.ok(pid > 0); assert.equal(pid, beforeMagicPID); assert.equal(controller.state, 'running');
     proof.magicLinkDelivery = { syntheticCallbackDelivered: true, vendorListenerPresent: true, observerCount: deepLink.count,
       sameRuntimePID: true, privateProfileArgument: true, workingDirectoryCorrect: true, vendorNavigatedFixture: true };
+    if (process.env.GUARD_REVALIDATION_SERIES === '1') {
+      for (let cycle = 1; cycle <= 3; cycle++) {
+        failNextCurrentIP = true; void controller.revalidate();
+        await until(() => observations.http500 === cycle && controller.processState === 'frozen', 'repeated freeze ' + cycle, 10000);
+        holdCurrentIP = false; for (const respond of heldIPResponses.splice(0)) respond();
+        await until(() => controller.state === 'running', 'repeated thaw ' + cycle, 15000);
+        assert.equal(controller.runtimePID, pid); assert.equal(controller.processFrozen, false); process.kill(pid, 0);
+      }
+    }
     const statesBefore = states.length;
     failNextCurrentIP = true;
     if (codeEnabled) void controller.revalidate();
-    await until(() => observations.http500 === 1 && controller.processState === 'frozen', 'HTTP 500 freezes the verified runtime', 10000);
+    const expectedHTTP500 = process.env.GUARD_REVALIDATION_SERIES === '1' ? 4 : 1;
+    await until(() => observations.http500 === expectedHTTP500 && controller.processState === 'frozen', 'HTTP 500 freezes the verified runtime', 10000);
     assert.equal(controller.relay.unlocked, false); assert.equal(controller.policy.blocked, false);
     assert.equal(controller.runtimePID, pid); process.kill(pid, 0);
     await until(() => activeStreams.size === 0, 'SSE closed while frozen');
@@ -563,8 +573,9 @@ command=async m=>{
       sameSyntheticIPProvider: true, counts: { ...observations.destinationChecks }, capturedProxy: 'fixed test-only direct route' };
     proof.profileDiagnostics={electronVersion:flush.electronVersion,sameRuntimeExecutable:observations.sameRuntimeExecutable,
       keysBefore:observations.ownKeyPresenceBefore,keysAfterSettling:observations.ownKeyPresenceAfterSettling,keysAfterRestart:observations.ownKeyPresenceAfter,
-      beforeKillDBLocked:observations.fixtureCookieDiskBefore.locked===true,persistedFixtureRowsBeforeReload:observations.fixtureCookieDiskStopped.rows.length,
-      encryptedFixtureScheme:observations.fixtureCookieDiskStopped.rows[0]?.scheme,diagnosticSettleBeforeIPChange:argv.includes('--settle-key')};
+      beforeKillDBLocked:observations.fixtureCookieDiskBefore.locked===true,stoppedDBLocked:observations.fixtureCookieDiskStopped.locked===true,
+      persistedFixtureRowsBeforeReload:observations.fixtureCookieDiskStopped.rows?.length??null,
+      encryptedFixtureScheme:observations.fixtureCookieDiskStopped.rows?.[0]?.scheme,diagnosticSettleBeforeIPChange:argv.includes('--settle-key')};
     if (servicePath) proof.serviceRouting.launchRequests = observations.serviceLaunches;
     if (codeEnabled) proof.codeFenceSession.closeCleanup = true;
     proof.result = 'PASS'; await fs.writeFile(path.join(work, 'proof.json'), JSON.stringify(proof, null, 2));
