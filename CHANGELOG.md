@@ -1,5 +1,11 @@
 # Изменения
 
+## Windows 0.9.2 / macOS 0.6.2 — 2026-11-09
+
+- Windows: добавлена поддержка Claude Desktop из Microsoft Store `4.23118.0` с новым titlebar и отдельным профилем SDK/main/sessions/scratch. Прежняя версия `1.44121.2` и её pins сохранены.
+- Claude Code `2.1.317` выбирается по версии Desktop: официальный win32-x64 asset имеет SHA-256 `a33aa5518497dda9dca73d465d77da3fb56de5373350ff734ec20e88464efa17`, распакованный executable — `26b01ec22df2c17ac7f5703aa547d36706e8d58412136ced0344a8ced4d86038`. Прежний Claude Code `2.1.304` остаётся поддерживаемым.
+- Проверки подписи, хешей, pinned IP, kill switch и запуск через защищённый broker сохранены. Поддержка Store-версии не заменяет её неизвестные файлы на прежние и не отключает fail-closed поведение.
+
 ## Windows 0.9.1 / macOS 0.6.2 — 2026-11-09
 
 - macOS: исправлен запуск защищённой сессии на fake-IP VPN. Контрольные HTTPS-запросы IP, Claude и внешней DNS-метрики переведены с macOS `curl` на нативный `URLSession`; сохранены proxy-токен, HTTPS, тайм-аут 4 секунды, запрет redirect и лимит ответа. Kill switch, DoH, pinned IP и fail-closed поведение не изменены.

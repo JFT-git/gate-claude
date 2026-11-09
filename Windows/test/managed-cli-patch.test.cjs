@@ -245,3 +245,27 @@ test('actual pinned manager prepares a fresh Profile from CodeBin without filesy
   const old = original.source.toString(), vmStart = old.indexOf('async prepareForVM('), vmEnd = old.indexOf('async prefetchForVM(', vmStart);
   assert.ok(changed.includes(old.slice(vmStart, vmEnd)));
 });
+
+function v4Bytes(source, size) { return Buffer.concat([Buffer.from(source), Buffer.alloc(size - Buffer.byteLength(source), 32)]); }
+test('Store SDK adapter preserves the new spawn and managed settings shapes', () => {
+  const source = 'class Transport{spawnLocalProcess(e){let{command:t,args:n,cwd:r,env:i,signal:a}=e,o=(0,g.spawn)(t,n,{cwd:r,stdio:["pipe","pipe","pipe"],signal:a,env:i,windowsHide:!0});}configure(){this.options.managedSettings&&j.push(...Mp("--managed-settings",this.options.managedSettings));}}exports.query=og';
+  const changed = transformerWithDigestFixture(P.V4_SDK_SHA256).patchManagedCliSDK(v4Bytes(source, P.V4_SDK_BYTES)).toString();
+  new vm.Script(changed);
+  assert.ok(changed.includes('o=__gateCli.spawnManaged(e);'));
+  assert.ok(changed.includes('j.push(...Mp("--managed-settings",__gateCli.mergeManagedSettings(this.options.managedSettings)));'));
+});
+test('Store manager resolver pins only Claude Code 2.1.317 and its complete checksum', () => {
+  const source = 'class CodeManager{async getHostPreseedInPlacePath(){if(!ti()||this.skipPreseedThisProcess)return null;let e=this.getHostTarget();return zvi(e.platform,e.binaryName)}}';
+  const changed = transformerWithDigestFixture(P.V4_MAIN_SHA256).patchManagedCliMain(v4Bytes(source, P.V4_MAIN_BYTES)).toString();
+  new vm.Script(changed);
+  assert.ok(changed.includes('this.targetVersion!=="2.1.317"'));
+  assert.ok(changed.includes('a33aa5518497dda9dca73d465d77da3fb56de5373350ff734ec20e88464efa17'));
+  assert.ok(changed.includes('__gateCli.resolveManagedCliPath(this.getBinaryPathForTarget(e,this.targetVersion))'));
+});
+test('Store local sessions receive the Guard adapter before API wrappers', () => {
+  const source = 'function createLocalSessionsApi(y){return Mn(y,{async start(e){}})}';
+  const changed = transformerWithDigestFixture('d8b5f3dd24bd8f11cc461462b7225c26f544a4a2ff9b57857712173c671ded05').patchManagedCliSessions(v4Bytes(source, P.V4_SESSIONS_BYTES)).toString();
+  const calls = [], context = { require: () => ({ configureLocalSessions: value => { calls.push(value); return value; } }), Mn: (value, api) => ({ value, api }), y: {} };
+  vm.runInNewContext(changed + ';globalThis.api=createLocalSessionsApi({marker: true});', context);
+  assert.equal(context.api.value.marker, true); assert.equal(calls.length, 1); assert.equal(calls[0].marker, true);
+});

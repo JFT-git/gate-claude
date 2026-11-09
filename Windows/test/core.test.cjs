@@ -225,3 +225,11 @@ test('Windows main-window ASAR variant disables overlay and custom button positi
   const unknown = source.replace('trafficLightPosition:I0t()', 'trafficLightPosition:Other()');
   assert.throws(() => A.addBootstrap(fixtureArchive('console.log("fixture");', unknown), Buffer.from('boot')), /Неподдерживаемый заголовок/);
 });
+test('Store main-window ASAR variant keeps native buttons and disables custom positioning', () => {
+  const anchor = 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:nha()';
+  const source = anchor + ';e.setWindowButtonPosition(Kma(t,zP(e.webContents.zoomFactor)));';
+  const result = A.addBootstrap(fixtureArchive('console.log("fixture");', source), Buffer.from('/* own boot */'));
+  const parsed = A.parseArchive(result.archive), text = parsed.read('.vite/build/index.chunk-fixture.js').toString();
+  assert.match(text, /titleBarStyle:"default",titleBarOverlay:!1/);
+  assert.ok(!text.includes(anchor)); assert.ok(!text.includes('setWindowButtonPosition'));
+});

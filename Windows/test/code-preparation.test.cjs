@@ -6,7 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
-const { prepareCodeFiles, SOURCE_POLICY, MAX_CLI_BYTES, validatePE } = require('../src/code-preparation.cjs');
+const { prepareCodeFiles, SOURCE_POLICY, SOURCE_POLICY_V4, MAX_CLI_BYTES, validatePE } = require('../src/code-preparation.cjs');
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const SID = 'S-1-15-2-1-2-3-4-5-6-7';
 function pe() { const bytes = Buffer.alloc(1024); bytes.writeUInt16LE(0x5a4d); bytes.writeUInt32LE(128, 0x3c); bytes.writeUInt32LE(0x4550, 128); bytes.writeUInt16LE(0x8664, 132); bytes.writeUInt16LE(1, 134); bytes.writeUInt16LE(0x20b, 152); return bytes; }
@@ -26,6 +26,14 @@ async function fixture(t) {
 
 test('production source policy pins signed Desktop, original SDK/main, compressed size and complete checksum', () => {
   assert.ok(Object.isFrozen(SOURCE_POLICY)); assert.equal(SOURCE_POLICY.desktopVersion, '1.44121.2'); assert.equal(SOURCE_POLICY.codeVersion, '2.1.304'); assert.equal(SOURCE_POLICY.compressedSize, 104965652); assert.equal(SOURCE_POLICY.compressedSHA256, 'aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81'); assert.equal(SOURCE_POLICY.sdkSHA256, require('../src/managed-cli-patch.cjs').SDK_SHA256); assert.equal(SOURCE_POLICY.mainSHA256, 'dfe50aee8e72e608a3cc7b73b8f4e528bc486d403470d49e2dc353d9163a83be');
+});
+test('Store source policy selects its own SDK, CLI and executable pins', async t => {
+  assert.equal(SOURCE_POLICY_V4.desktopVersion, '4.23118.0'); assert.equal(SOURCE_POLICY_V4.codeVersion, '2.1.317');
+  assert.equal(SOURCE_POLICY_V4.compressedSize, 122895826); assert.equal(SOURCE_POLICY_V4.compressedSHA256, 'a33aa5518497dda9dca73d465d77da3fb56de5373350ff734ec20e88464efa17');
+  assert.equal(SOURCE_POLICY_V4.executableSize, 338187936); assert.equal(SOURCE_POLICY_V4.executableSHA256, '26b01ec22df2c17ac7f5703aa547d36706e8d58412136ced0344a8ced4d86038');
+  const f = await fixture(t); f.runtime.version = SOURCE_POLICY_V4.desktopVersion; f.deps.sourcePolicy = undefined;
+  f.deps.inspectSource = async (bytes, checkedPolicy) => { f.counts.inspect++; assert.equal(checkedPolicy, SOURCE_POLICY_V4); };
+  await assert.rejects(f.prepare(), /Не удалось безопасно/); assert.equal(f.counts.inspect, 1); assert.equal(f.counts.decompress, 0);
 });
 test('prepares one hash-addressed native CLI, persistent workspace and exact vendor request mapping', async t => {
   const f = await fixture(t), code = await f.prepare(), executableSHA = sha(pe());

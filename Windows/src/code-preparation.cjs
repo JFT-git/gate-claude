@@ -8,13 +8,18 @@ const runFile = promisify(require('node:child_process').execFile);
 const decompressZstd = typeof zlib.zstdDecompress === 'function' ? promisify(zlib.zstdDecompress) : undefined;
 const { sha256: hash } = require('./async-bytes.cjs');
 const { parseArchive } = require('./asar.cjs');
-const { findManagedCliSDK, SDK_SHA256 } = require('./managed-cli-patch.cjs');
+const { findManagedCliSDK, SDK_SHA256, V4_SDK_SHA256, V4_MAIN_FILE, V4_MAIN_SHA256 } = require('./managed-cli-patch.cjs');
 const { createPreparationProgress } = require('./preparation-progress.cjs');
 const MAX_CLI_BYTES = 512 * 1024 * 1024;
 const SOURCE_POLICY = Object.freeze({ desktopVersion: '1.44121.2', codeVersion: '2.1.304', platform: 'win32-x64',
   compressedSize: 104965652, compressedSHA256: 'aed62990b91e94efb35482fd7068cc616c6c2414084c6aa32148ca2a359e4e81',
   executableSize: 293227168, executableSHA256: '019e5174d5d954585edb1a946fe280e44a973050b4897034adf0e16306f85fdd',
   sdkSHA256: SDK_SHA256, mainFile: '.vite/build/index.chunk-BHbE7U4N.js', mainSHA256: 'dfe50aee8e72e608a3cc7b73b8f4e528bc486d403470d49e2dc353d9163a83be' });
+const SOURCE_POLICY_V4 = Object.freeze({ desktopVersion: '4.23118.0', codeVersion: '2.1.317', platform: 'win32-x64',
+  compressedSize: 122895826, compressedSHA256: 'a33aa5518497dda9dca73d465d77da3fb56de5373350ff734ec20e88464efa17',
+  executableSize: 338187936, executableSHA256: '26b01ec22df2c17ac7f5703aa547d36706e8d58412136ced0344a8ced4d86038',
+  sdkSHA256: V4_SDK_SHA256, mainFile: V4_MAIN_FILE, mainSHA256: V4_MAIN_SHA256 });
+const SOURCE_POLICIES = Object.freeze([SOURCE_POLICY, SOURCE_POLICY_V4]);
 const fail = () => Error('Не удалось безопасно подготовить Claude Code. Исходная версия или файлы не подтверждены.');
 function validatePE(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length < 256 || bytes.length > MAX_CLI_BYTES || bytes.readUInt16LE(0) !== 0x5a4d) throw fail();
@@ -33,7 +38,7 @@ function samePath(a, b) { return process.platform === 'win32' ? path.resolve(a).
 async function prepareCodeFiles(runtime, sourcePath, guardRoot, resources, testdeps = {}, assets, options = {}) {
   const fs = testdeps.fs || rawFS, run = testdeps.runFile || runFile, decompress = testdeps.decompress || decompressZstd;
   // Dependency injection is for owned unit fixtures; production supplies no overrides.
-  const policy = testdeps.sourcePolicy || SOURCE_POLICY, inspect = testdeps.inspectSource || inspectSource;
+  const policy = testdeps.sourcePolicy || SOURCE_POLICIES.find(candidate => candidate.desktopVersion === runtime?.version) || SOURCE_POLICY, inspect = testdeps.inspectSource || inspectSource;
   const randomBytes = testdeps.randomBytes || crypto.randomBytes;
   const progress = createPreparationProgress(options);
   let createdProfile = false, containerName, hostPath, staging;
@@ -138,4 +143,4 @@ async function prepareCodeFiles(runtime, sourcePath, guardRoot, resources, testd
     throw fail();
   }
 }
-module.exports = { prepareCodeFiles, SOURCE_POLICY, MAX_CLI_BYTES, validatePE };
+module.exports = { prepareCodeFiles, SOURCE_POLICY, SOURCE_POLICY_V4, SOURCE_POLICIES, MAX_CLI_BYTES, validatePE };

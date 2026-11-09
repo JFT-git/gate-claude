@@ -33,6 +33,9 @@ function patchNativeTitlebar(archive) {
     ] },
     { anchor: 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:I0t()', positions: [
       'e.setWindowButtonPosition(A0t(t,WN(e.webContents.zoomFactor)))'
+    ] },
+    { anchor: 'titleBarStyle:"hidden",titleBarOverlay:!0,trafficLightPosition:nha()', positions: [
+      'e.setWindowButtonPosition(Kma(t,zP(e.webContents.zoomFactor)))'
     ] }
   ];
   const patches = [];

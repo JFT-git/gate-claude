@@ -125,3 +125,10 @@ test('atomic publication never replaces a concurrent cache leaf', async t => {
   const root = await directory(t), f = await fixture(t, sendBody), h = load({ filesystem: { promises: { ...fs.promises, link: async (source, destination) => { await fs.promises.writeFile(destination, 'concurrent-owner', { flag: 'wx' }); return fs.promises.link(source, destination); } } } });
   await assert.rejects(h.api.ensureNativeCodeAsset(root, f.port, { active: () => true }), denied); assert.equal(fs.readFileSync(path.join(root, 'CodeAssets', sha256(body), 'win32-x64.zst'), 'utf8'), 'concurrent-owner'); assert.deepEqual(contents(root), [sha256(body)]);
 });
+test('asset selection follows the verified Desktop version', () => {
+  const asset = production.assetForVersion('4.23118.0');
+  assert.equal(asset.pathname, '/claude-code-releases/2.1.317/win32-x64/claude.exe.zst');
+  assert.equal(asset.bytes, 122895826); assert.equal(asset.sha256, 'a33aa5518497dda9dca73d465d77da3fb56de5373350ff734ec20e88464efa17');
+  assert.deepEqual(production.assetForVersion(), production.ASSET);
+  assert.throws(() => production.assetForVersion('0.0.0'), denied);
+});

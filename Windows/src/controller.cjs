@@ -341,7 +341,7 @@ class GuardController extends EventEmitter {
             const relay = this.relay, revision = this.revalidationRevision || 0, abort = new AbortController(); this.codeAssetAbort = abort;
             try {
               asset = await ensureNativeCodeAsset(this.root, port, { signal: abort.signal,
-                active: () => active() && !!this.policy.pinned && this.relay === relay && relay.unlocked === true && !relay.closed && this.state !== 'rechecking' });
+                active: () => active() && !!this.policy.pinned && this.relay === relay && relay.unlocked === true && !relay.closed && this.state !== 'rechecking' }, this.runtime?.version);
               break;
             } catch (error) {
               if (!active()) return;
