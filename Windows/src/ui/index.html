@@ -114,6 +114,19 @@
     </section>
   </div>
 
+  <section class="panel metrics-panel" aria-labelledby="metricsHeading">
+    <div class="card-heading panel-heading"><svg class="icon" aria-hidden="true"><use href="icons.svg#traffic"/></svg><h2 id="metricsHeading">Диагностика сети</h2></div>
+    <dl class="metrics-grid">
+      <div><dt>IP-сервисы</dt><dd id="metricProviders">Проверка ещё не выполнялась</dd></div>
+      <div><dt>ASN / оператор</dt><dd id="metricNetwork">Появится после проверки IP</dd></div>
+      <div><dt>Задержка Claude</dt><dd id="metricDestinations">Маршруты ещё не проверены</dd></div>
+      <div><dt>DNS</dt><dd id="metricDNS">Защита зависит от выбранного маршрута</dd></div>
+      <div><dt>WebRTC / QUIC</dt><dd id="metricUDP">Ограничения применяются при запуске Claude</dd></div>
+      <div><dt>Профиль устройства</dt><dd id="metricProfile">Будет подтверждён после запуска Claude</dd></div>
+    </dl>
+    <p class="hint metrics-note">Внешняя DNS-метрика сторонняя и не участвует в решении о запуске. DNS и WebRTC защищаются правилами Guard, а не оценкой стороннего сайта.</p>
+  </section>
+
   <div class="columns">
     <section class="panel connection" aria-labelledby="connectionHeading">
       <div class="card-heading panel-heading"><svg class="icon" aria-hidden="true"><use href="icons.svg#settings"/></svg><h2 id="connectionHeading">Подключение</h2></div>
@@ -182,7 +195,7 @@
     </section>
   </div>
   <footer><svg class="icon" aria-hidden="true"><use href="icons.svg#shield-check"/></svg><span>Guard использует собственную копию и отдельный профиль Claude. Закрытие Guard завершает его копию Claude. Оригинальные файлы Claude, язык и часовой пояс Windows не меняются.</span></footer>
-  <details class="limits"><summary>Границы защиты и привилегий</summary><p>Windows устанавливает WFP-ограничения для проверенных EXE частной копии и запускает runtime через Job Object. Это ограничение Chat по путям EXE. Claude Code использует отдельные AppContainer и CodeGate; эти режимы не являются полной изоляцией компьютера или системных служб. Текущий NetworkFence — брокер сессии, не постоянная служба.</p><p>Проверки ipwho.is, ipify и служебных адресов claude.ai / api.anthropic.com получают внешний IP без данных чата. Проверка периодическая: между изменением удалённого IP и его обнаружением есть интервал. После подтверждённого запуска временный сбой или другой IP немедленно закрывает потоки и приостанавливает процессы на непродлеваемые 20 секунд. Полная проверка прежнего IP возобновляет их; иначе Claude корректно закрывается, а потоки не восстанавливаются. До подтверждённого запуска, при RU и сбоях защиты сессия блокируется сразу.</p><p>Неизвестные секреты могут остаться в данных трафика. Guard не устанавливает сертификаты MITM и не отключает TLS-проверку. Для локальной копии изменяется ASAR; подпись Anthropic не удостоверяет эту копию. Приложение независимо от Anthropic.</p></details>
+  <details class="limits"><summary>Границы защиты и привилегий</summary><p>Windows устанавливает WFP-ограничения для проверенных EXE частной копии и запускает runtime через Job Object. Это ограничение Chat по путям EXE. Claude Code использует отдельные AppContainer и CodeGate; эти режимы не являются полной изоляцией компьютера или системных служб. При установленной постоянной службе NetworkFence запускается через неё без повторного UAC.</p><p>Проверки ipwho.is, ipinfo.io, ipapi.co, ipify и служебных адресов claude.ai / api.anthropic.com получают внешний IP без данных чата. Сторонняя метрика на случайном поддомене edns.ip-api.com возвращает только данные DNS-ответчика и не участвует в решении о запуске. Проверка периодическая: между изменением удалённого IP и его обнаружением есть интервал. После подтверждённого запуска временный сбой или другой IP немедленно закрывает потоки и приостанавливает процессы на непродлеваемые 20 секунд. Полная проверка прежнего IP возобновляет их; иначе Claude корректно закрывается, а потоки не восстанавливаются. До подтверждённого запуска, при RU и сбоях защиты сессия блокируется сразу.</p><p>Неизвестные секреты могут остаться в данных трафика. Guard не устанавливает сертификаты MITM и не отключает TLS-проверку. Для локальной копии изменяется ASAR; подпись Anthropic не удостоверяет эту копию. Приложение независимо от Anthropic.</p></details>
 </main>
 <script src="view-model.js"></script>
 <script src="renderer.js"></script>

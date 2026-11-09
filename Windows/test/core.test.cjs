@@ -84,6 +84,10 @@ test('CONNECT SOCKS5: precheck gate, auth, remote DNS, stream reset and kill', a
   await assert.rejects(connectTunnel(relay.port, 'example.test')); assert.equal(socks.targets.length, 0);
   await assert.rejects(connectTunnel(relay.port, 'ipwho.is'));
   const pre = await connectTunnel(relay.port, 'ipwho.is', 443, relay.checkToken); pre.destroy();
+  for (const host of ['ipinfo.io', 'ipapi.co', '0123456789abcdef0123456789abcdef.edns.ip-api.com']) {
+    const probe = await connectTunnel(relay.port, host, 443, relay.checkToken); probe.destroy();
+  }
+  await assert.rejects(connectTunnel(relay.port, '0123456789abcdef0123456789abcdef.edns.ip-api.com.evil.test', 443, relay.checkToken));
   relay.unlock();
   await assert.rejects(connectTunnel(relay.port, 'refused.test')); assert.equal(failures.length, 0);
   const socket = await connectTunnel(relay.port, 'example.test'); socket.resume(); socket.write('echo');

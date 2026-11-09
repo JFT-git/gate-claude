@@ -1,6 +1,7 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, powerMonitor, shell, nativeTheme } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, powerMonitor, shell, nativeTheme, Menu } = require('electron');
 const fs = require('node:fs');
+const { createUpdateMenu } = require('./update-menu.cjs');
 const path = require('node:path');
 const { GuardController } = require('./controller.cjs');
 const { NetworkFence } = require('./fence.cjs');
@@ -57,12 +58,36 @@ else {
       ownerWindow,
       serviceLaunch: request => serviceIntegration.launch(request)
     });
+    const updateMenu = createUpdateMenu({
+      Menu,
+      onCheck: () => updater?.check(),
+      onInstall: async () => {
+        try {
+          if (updater?.snapshot().state !== 'downloaded') return;
+          window.show(); window.focus();
+          const choice = await dialog.showMessageBox(window, {
+            type: 'warning', title: 'Установить обновление?', message: 'Guard остановит Claude, установит обновление и перезапустится.',
+            detail: 'Profile, CodeState, Workspace, settings.json и ip-memory.json сохраняются. Пароль прокси нужно будет ввести снова.',
+            buttons: ['Отмена', 'Остановить, установить и перезапустить'], defaultId: 0, cancelId: 0, noLink: true
+          });
+          if (choice.response === 1) await updater.install(true);
+        } catch {
+          dialog.showErrorBox('Обновления Guard', 'Не удалось запустить установку. Guard продолжит работу; повторите действие из меню «Обновления».');
+        }
+      },
+      onOpenReleases: async url => {
+        try { await shell.openExternal(url); }
+        catch { dialog.showErrorBox('Обновления Guard', 'Не удалось открыть страницу выпусков. Проверка обновлений доступна в этом меню.'); }
+      }
+    });
+    Menu.setApplicationMenu(updateMenu.menu);
     if (!process.argv.includes('--smoke-test')) {
       const autoUpdater = require('electron-updater').autoUpdater;
       autoUpdater.setFeedURL({ provider: 'github', owner: 'JFT-git', repo: 'gate-claude', channel: 'latest' });
       updater = new WindowsUpdater({ autoUpdater, currentVersion: app.getVersion(), platform: process.platform, isPackaged: app.isPackaged,
         configurationPresent: fs.existsSync(path.join(resources, 'app-update.yml')), portable: Boolean(process.env.PORTABLE_EXECUTABLE_FILE), quiesce: () => controller.quiesce() });
-      updater.on('state', value => send('update', value));
+      updater.on('state', value => { updateMenu.update(value); send('update', value); });
+      updateMenu.update(updater.snapshot());
     }
     const checkProtocol = async () => {
       protocolState = await ensureGuardProtocolRegistration(app, { smokeTest: process.argv.includes('--smoke-test') });
@@ -154,7 +179,7 @@ else {
       return false;
     });
     window = new BrowserWindow({ width: 1240, height: 900, minWidth: 640, minHeight: 600, backgroundColor: nativeTheme.shouldUseDarkColors ? '#101813' : '#f4f7f5', title: 'Claude Proxy Guard',
-      autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false, webSecurity: true } });
+      autoHideMenuBar: false, menuBarVisible: true, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false, webSecurity: true } });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('will-navigate', event => event.preventDefault());
     window.webContents.session.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));

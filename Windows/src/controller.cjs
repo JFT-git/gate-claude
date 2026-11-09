@@ -7,7 +7,7 @@ const net = require('node:net');
 const { IPPolicy, canonicalIP, networkFingerprint, validateSettings } = require('./policy.cjs');
 const { IPMemory, MISMATCH } = require('./ip-memory.cjs');
 const { SOCKSRelay, NetworkRelay, setPinnedLocalAddresses, capturedEgressLocalAddresses, beginEgressCapture } = require('./relay.cjs');
-const { initialIP, currentIP, queryDestinationIP, NetworkCheckError } = require('./ip-check.cjs');
+const { initialIP, currentIP, queryDestinationIP, NetworkCheckError, dnsProbe } = require('./ip-check.cjs');
 const { readSystemProxy } = require('./system-proxy.cjs');
 const { prepareRuntime } = require('./runtime.cjs');
 const { Channel } = require('./channel.cjs');
@@ -25,12 +25,16 @@ const DESTINATIONS = Object.freeze(['claude.ai', 'api.anthropic.com']);
 const FREEZE_LIMIT_MS = 20000;
 const FREEZE_RETRY_MS = 1000;
 const FREEZE_CLOSE_MS = 5000;
+function emptyNetworkMetrics() {
+  return { sources: [], organization: '', asn: '', destinations: {}, dns: { state: 'idle' }, dnsProtection: '', webRTC: 'disable_non_proxied_udp', quic: 'disabled' };
+}
 
 class GuardController extends EventEmitter {
   constructor(root, resources, options = {}) {
     super(); this.codeCleanups = new WeakMap(); this.codeStatePreparations = new WeakMap();
     this.pendingOperations = new Set(); this.startTask = null; this.shutdownFailed = false;
     this.destinationPolicies = new Map(); this.destinationRequests = new Map(); this.probeFailures = new Map();
+    this.networkMetrics = emptyNetworkMetrics(); this.dnsProbe = options.dnsProbe || dnsProbe; this.dnsMetricsTask = null;
     this.deepLinks = new DeepLinkInbox({
       active: () => !this.policy?.blocked && !!this.policy?.pinned && ['starting', 'running', 'rechecking'].includes(this.state) && !!this.host && this.host.exitCode == null && !this.host.killed && !!this.channel && !this.channel.closed,
       ready: () => this.deepLinkReady === true && this.state !== 'rechecking' && !!this.channel?.socket,
@@ -49,10 +53,12 @@ class GuardController extends EventEmitter {
   status(message) { this.message = message; this.emit('state', this.snapshot()); }
   snapshot() {
     const secondsRemaining = this.processFrozen && this.freezeDeadline !== null ? Math.max(0, Math.ceil((this.freezeDeadline - performance.now()) / 1000)) : 0;
+    const metrics = this.networkMetrics || emptyNetworkMetrics();
     return { state: this.state, message: this.message || 'Готов к проверке', blocked: this.policy.blocked, profile: this.verified || null,
       country: this.country || '', exitIP: this.policy.pinned || '', savedIP: this.savedIP, ipMemoryError: this.ipMemoryError,
       processFrozen: this.processFrozen, processState: this.processFrozen ? this.processState : 'running', secondsRemaining,
-      windowsApprovalPending: NetworkFence.approvalPending };
+      windowsApprovalPending: NetworkFence.approvalPending,
+      metrics: { ...metrics, sources: [...(metrics.sources || [])], destinations: { ...(metrics.destinations || {}) }, dns: { ...(metrics.dns || { state: 'idle' }) } } };
   }
   canResetIP() { return ['idle', 'blocked'].includes(this.state) && !NetworkFence.approvalPending && !this.fencePending && !this.codePreparationPending; }
   resetIP() {
@@ -258,6 +264,7 @@ class GuardController extends EventEmitter {
     this.policy.assertAvailable();
     if (this.state !== 'idle') throw Error('Guard уже работает.');
     const settings = validateSettings(input); this.settings = settings;
+    this.networkMetrics = emptyNetworkMetrics(); this.networkMetrics.dnsProtection = settings.mode === 'socks5' ? 'remote_socks5' : 'pinned_egress'; this.dnsMetricsTask = null;
     this.deepLinks.clear(); this.deepLinkReady = false; this.probeFailures.clear(); this.preparationStage = null;
     const epoch = ++this.epoch, active = () => this.epoch === epoch && !this.policy.blocked && this.state !== 'idle';
     let code = null; this.codeFenceRequested = false; this.runtimePID = null;
@@ -296,6 +303,9 @@ class GuardController extends EventEmitter {
       const pinExit = async () => {
         const revision = this.revalidationRevision || 0, interfaces = networkFingerprint();
         const initial = await this.requestIP(epoch, initialIP, port, this.relay.checkToken); if (!active()) return false;
+        this.networkMetrics.sources = Array.isArray(initial.providers) ? initial.providers.filter(host => ['ipwho.is', 'ipinfo.io', 'ipapi.co'].includes(host)).slice(0, 3) : [];
+        this.networkMetrics.organization = typeof initial.organization === 'string' ? initial.organization.slice(0, 160) : '';
+        this.networkMetrics.asn = typeof initial.asn === 'string' && /^AS\d{1,10}$/.test(initial.asn) ? initial.asn : '';
         const pin = this.policy.pin(initial); this.country = pin.country;
         this.ipMemory.check(pin.ip);
         if (settings.mode === 'network') this.relay.pinIPFamily(net.isIP(pin.ip));
@@ -315,6 +325,7 @@ class GuardController extends EventEmitter {
         this.savedIP = this.ipMemory.commit(pin.ip);
         this.log('Исходный IP закреплён: [IP скрыт] · ' + pin.country);
         this.schedulePoll(epoch, settings.interval * 1000);
+        void this.refreshDNSMetrics(epoch, port, this.relay.checkToken);
         return true;
       };
       if (settings.codeEnabled === true) {
@@ -684,6 +695,7 @@ class GuardController extends EventEmitter {
   async queryDestinations(epoch, port, token, pin = false) {
     const active = () => this.epoch === epoch && !this.policy.blocked && !!this.relay;
     const results = await Promise.allSettled(DESTINATIONS.map(async hostname => {
+      const started = performance.now();
       try {
         const result = await this.requestDestinationIP(epoch, hostname, port, token);
         if (!active()) return false;
@@ -703,15 +715,39 @@ class GuardController extends EventEmitter {
           if (pinned.pinned !== ip) return this.hostedIPMismatch('Внешний IP маршрута Claude изменился.');
           pinned.check(ip);
         }
+        this.networkMetrics.destinations[hostname] = { state: 'ok', latencyMs: Math.max(0, Math.min(600000, Math.round(performance.now() - started))) };
         return true;
       } catch {
-        if (active()) this.pauseForRevalidation('Не удалось подтвердить маршрут Claude. Повторяем проверку.', false);
+        if (active()) {
+          this.networkMetrics.destinations[hostname] = { state: 'error', latencyMs: Math.max(0, Math.min(600000, Math.round(performance.now() - started))) };
+          this.pauseForRevalidation('Не удалось подтвердить маршрут Claude. Повторяем проверку.', false);
+        }
         throw Error('Не удалось подтвердить маршрут Claude.');
       }
     }));
     if (!active()) return false;
     if (results.some(result => result.status !== 'fulfilled' || !result.value)) throw Error('Не удалось подтвердить маршрут Claude.');
     return true;
+  }
+  refreshDNSMetrics(epoch, port, token) {
+    if (this.dnsMetricsTask) return this.dnsMetricsTask;
+    this.networkMetrics.dns = { state: 'checking' };
+    const task = (async () => {
+      try {
+        if (typeof this.dnsProbe !== 'function') throw Error('DNS metric unavailable');
+        const value = await this.dnsProbe(port, token);
+        if (this.epoch !== epoch || this.policy.blocked) return;
+        if (!net.isIP(value?.ip) || typeof value.geo !== 'string' || !value.geo.length || value.geo.length > 160 || /[\x00-\x1f\x7f]/.test(value.geo)) throw Error('Invalid DNS metric');
+        this.networkMetrics.dns = { state: 'ready', ip: value.ip, organization: value.geo };
+      } catch {
+        if (this.epoch === epoch && !this.policy.blocked) this.networkMetrics.dns = { state: 'unavailable' };
+      }
+    })();
+    this.dnsMetricsTask = task;
+    return task.finally(() => {
+      if (this.dnsMetricsTask === task) this.dnsMetricsTask = null;
+      if (this.epoch === epoch) this.emit('state', this.snapshot());
+    });
   }
   async checkCurrentIP(epoch, port, token) {
     const active = () => this.epoch === epoch && !this.policy.blocked && !!this.relay;
@@ -876,7 +912,10 @@ class GuardController extends EventEmitter {
     this.codeAssetAbort?.abort(); this.codeAssetAbort = null;
     this.cancelCodeState?.();
     this.deepLinkReady = false; this.deepLinks.clear();
-    this.epoch++; clearInterval(this.networkTimer); clearInterval(this.heartbeatTimer); clearTimeout(this.pollTimer);
+    this.epoch++;
+    if (this.networkMetrics?.dns?.state === 'checking') this.networkMetrics.dns = { state: 'idle' };
+    this.dnsMetricsTask = null;
+    clearInterval(this.networkTimer); clearInterval(this.heartbeatTimer); clearTimeout(this.pollTimer);
     this.clearProcessFreeze(); this.rejectHostCommands(); this.freezeTask = null;
     this.inspector?.stop(); this.channel?.close(); this.relay?.close();
     // EOF makes GuardHost close its job. Force-terminating the helper also closes its job handle.

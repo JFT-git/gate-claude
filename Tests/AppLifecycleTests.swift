@@ -129,11 +129,14 @@ final class AppLifecycleProbe: NSObject {
             return
         }
         let open = menu.item(withTitle: "Открыть Claude Proxy Guard")
-        let updates = menu.item(withTitle: "Проверить обновления…")
+        let updateRoot = menu.item(withTitle: "Обновления")
+        let updates = updateRoot?.submenu?.item(withTitle: "Проверить обновления…")
         let quit = menu.item(withTitle: "Выход")
         let session = menu.items.first { $0.title.hasPrefix("Сессия:") }
         expect(open?.action == #selector(AppDelegate.showWindow), "open menu action opens main window")
         expect(updates?.action == #selector(AppDelegate.checkUpdates), "updates menu uses existing update action")
+        expect(updateRoot?.submenu?.items.count == 2 && updateRoot?.submenu?.item(at: 1)?.isEnabled == false,
+               "updates submenu exposes status without closing the app")
         expect(quit?.action == #selector(NSApplication.terminate(_:)), "quit menu uses NSApplication termination")
         expect(session?.isEnabled == false, "session state is informational")
 
@@ -150,9 +153,14 @@ final class AppLifecycleProbe: NSObject {
         if let open, let action = open.action {
             expect(application.sendAction(action, to: open.target, from: open), "tray open action is dispatchable")
         }
+        if let updates, let action = updates.action {
+            expect(application.sendAction(action, to: updates.target, from: updates), "updates menu action is dispatchable")
+        }
         pump()
-        expect(application.activationPolicy() == .regular && delegate.window?.isVisible == true,
-               "tray opens visible window with regular activation")
+        expect(application.activationPolicy() == .accessory && delegate.window?.isVisible == true,
+               "updates menu presents panel without leaving status-bar mode")
+        expect(application.activationPolicy() == .accessory && delegate.window?.isVisible == true,
+               "tray opens visible window without leaving accessory mode")
         if let contentView = delegate.window?.contentView { snapshot(contentView, name: "macos-lifecycle-window") }
 
         delegate.window?.close()
@@ -167,14 +175,14 @@ final class AppLifecycleProbe: NSObject {
 
         expect(delegate.applicationShouldHandleReopen(application, hasVisibleWindows: false), "reopen is handled")
         pump()
-        expect(delegate.window?.isVisible == true && application.activationPolicy() == .regular,
+        expect(delegate.window?.isVisible == true && application.activationPolicy() == .accessory,
                "reopen restores main window")
         delegate.applicationDidHide(Notification(name: NSApplication.didHideNotification))
         pump()
         expect(application.activationPolicy() == .accessory, "hide notification returns to accessory")
         _ = delegate.applicationShouldHandleReopen(application, hasVisibleWindows: false)
         pump()
-        expect(delegate.window?.isVisible == true && application.activationPolicy() == .regular,
+        expect(delegate.window?.isVisible == true && application.activationPolicy() == .accessory,
                "reopen after hide restores window and activation")
         delegate.window?.close()
         pump()
@@ -182,7 +190,7 @@ final class AppLifecycleProbe: NSObject {
         let url = URL(string: "claude://claude.ai/magic-link#lifecycle:proof")!
         delegate.application(application, open: [url])
         pump()
-        expect(delegate.window?.isVisible == true && application.activationPolicy() == .regular,
+        expect(delegate.window?.isVisible == true && application.activationPolicy() == .accessory,
                "deep link opens main window")
         delegate.window?.close()
         pump()

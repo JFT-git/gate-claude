@@ -146,9 +146,48 @@ test('invalid arguments are classified before requests while existing messages s
   assert.equal(f.agents.length, 0); assert.equal(f.requests.length, 0);
 });
 
-test('geolocation keeps its existing twelve-second deadline', async () => {
+test('geolocation starts all providers in parallel and keeps a four-second deadline', async () => {
   const f = fixture({ holdConnect: true }), pending = f.api.initialIP(12345, 'b'.repeat(64));
   const rejected = assert.rejects(pending, error => error instanceof f.api.NetworkCheckError && error.code === 'TIMEOUT' && error.service === 'ipwho.is' && error.phase === 'connect');
-  await turn(); await f.advance(11999); assert.equal(f.requests[0].destroyed, undefined);
+  await turn(); assert.equal(f.requests.length, 3);
+  await f.advance(3999); for (const request of f.requests) assert.equal(request.destroyed, undefined);
   await f.advance(1); await rejected; f.closed();
+});
+
+const { queryConsensus, normalizeGeo, parseDNSProbe } = require('../src/ip-check.cjs');
+const providers = ['ipwho.is', 'ipinfo.io', 'ipapi.co'].map(hostname => ({ hostname, path: '/json' }));
+const identity = value => value.ip + '|' + value.country_code;
+test('matching providers finish together and normalize public ASN and organization metadata', async () => {
+  let active = 0, maximum = 0;
+  const request = async (_port, hostname) => {
+    active++; maximum = Math.max(maximum, active);
+    await turn(); active--;
+    if (hostname === 'ipwho.is') throw Error('one provider is unavailable');
+    if (hostname === 'ipinfo.io') return { ip: '203.0.113.7', country: 'NL', org: 'AS41436 Example Hosting' };
+    return { ip: '203.0.113.7', country_code: 'NL', asn: 'AS41436', org: 'Example Hosting' };
+  };
+  const result = await queryConsensus(providers, 1, '', normalizeGeo, identity, request);
+  assert.equal(maximum, 3);
+  assert.equal(result.ip, '203.0.113.7');
+  assert.equal(result.asn, 'AS41436');
+  assert.equal(result.organization, 'Example Hosting');
+  assert.deepEqual(result.providers, ['ipinfo.io', 'ipapi.co']);
+});
+
+test('conflicting public routes fail closed, while a single healthy provider is an explicit fallback', async () => {
+  const addresses = { 'ipwho.is': '203.0.113.1', 'ipinfo.io': '203.0.113.2', 'ipapi.co': '203.0.113.3' };
+  await assert.rejects(queryConsensus(providers, 1, '', normalizeGeo, identity, async (_port, hostname) => ({ ip: addresses[hostname], country: 'NL' })), error => error.code === 'BODY');
+  const result = await queryConsensus(providers, 1, '', normalizeGeo, identity, async (_port, hostname) => {
+    if (hostname !== 'ipinfo.io') throw Error('offline');
+    return { ip: '203.0.113.7', country: 'NL' };
+  });
+  assert.deepEqual(result.providers, ['ipinfo.io']);
+});
+
+test('provider-specific metadata and external DNS responses are bounded and validated', () => {
+  const who = normalizeGeo({ hostname: 'ipwho.is' }, { success: true, ip: '203.0.113.7', country_code: 'NL', connection: { asn: 41436, org: 'Example Org' } });
+  assert.equal(who.asn, 'AS41436'); assert.equal(who.organization, 'Example Org');
+  assert.throws(() => normalizeGeo({ hostname: 'ipwho.is' }, { success: false, ip: '203.0.113.7', country_code: 'NL' }));
+  assert.deepEqual(parseDNSProbe({ dns: { ip: '203.0.113.9', geo: 'Germany - Google LLC' } }), { ip: '203.0.113.9', geo: 'Germany - Google LLC' });
+  assert.throws(() => parseDNSProbe({ dns: { ip: secret, geo: secret } }), error => error.code === 'BODY' && error.service === 'edns.ip-api.com' && !error.message.includes(secret));
 });

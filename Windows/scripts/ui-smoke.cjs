@@ -69,6 +69,15 @@ app.whenReady().then(async()=>{
  await check('pending Windows approval prevents repeat restart',async()=>{assert.equal((await buttons()).restart.disabled,true);assert.equal(await js(`document.getElementById('approvalHint').hidden`),false);});
  await emit({type:'state',data:{...state('running'),profile:{timezone:'Europe/Amsterdam',language:'en-US',locale:'en-US'}}});
  await check('authoritative profile and running controls display',async()=>{assert.match(await js(`document.getElementById('profile').textContent`),/Amsterdam.*en-US/);assert.equal((await buttons()).stop.disabled,false);assert.equal(await js(`document.getElementById('stateIcon').getAttribute('href')`),'icons.svg#shield-check');});
+ await emit({type:'state',data:{...state('running'),profile:{timezone:'Europe/Amsterdam',language:'en-US',locale:'en-US'},metrics:{sources:['ipwho.is','ipinfo.io'],asn:'AS41436',organization:'Example Hosting',destinations:{'claude.ai':{state:'ok',latencyMs:64},'api.anthropic.com':{state:'ok',latencyMs:348}},dns:{state:'ready',ip:'203.0.113.9',organization:'Germany - Google LLC'},dnsProtection:'pinned_egress',webRTC:'disable_non_proxied_udp',quic:'disabled'}}});
+ await check('network metrics expose providers, ASN, latency, DNS, UDP and actual profile',async()=>{
+   assert.match(await js(`document.getElementById('metricProviders').textContent`),/ipwho\.is.*ipinfo\.io.*согласованный/);
+   assert.match(await js(`document.getElementById('metricNetwork').textContent`),/AS41436.*Example Hosting/);
+   assert.match(await js(`document.getElementById('metricDestinations').textContent`),/claude\.ai: 64 мс.*api\.anthropic\.com: 348 мс/);
+   assert.match(await js(`document.getElementById('metricDNS').textContent`),/203\.0\.113\.9.*Google LLC.*проверенному выходу/);
+   assert.match(await js(`document.getElementById('metricUDP').textContent`),/disable_non_proxied_udp.*disabled/);
+   assert.match(await js(`document.getElementById('metricProfile').textContent`),/Amsterdam.*en-US/);
+ });
  await check('freeze, thaw and close states expose process status and fixed countdown',async()=>{
    for(const processState of ['freezing','frozen','thawing','closing']){
      await emit({type:'state',data:{...state('rechecking'),country:'Нидерланды',exitIP:'203.0.113.7',processFrozen:true,processState,secondsRemaining:processState==='frozen'?19:20}});

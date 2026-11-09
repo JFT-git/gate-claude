@@ -31,6 +31,7 @@ final class GuardUpdateController: NSObject, SPUUpdaterDelegate {
     func checkForUpdates() {
         guard !model.restarting, !installConfirmed else { return }
         model.updateError = nil
+        NSApp.activate(ignoringOtherApps: true)
         controller.checkForUpdates(nil)
     }
 
@@ -108,6 +109,7 @@ final class GuardUpdateController: NSObject, SPUUpdaterDelegate {
     }
 
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        NSApp.activate(ignoringOtherApps: true)
         model.updateError = nil
         model.updateStatus = "Найдено обновление \(item.displayVersionString); загрузка в фоне."
     }
@@ -121,6 +123,7 @@ final class GuardUpdateController: NSObject, SPUUpdaterDelegate {
     }
 
     func updater(_ updater: SPUUpdater, didDownloadUpdate item: SUAppcastItem) {
+        NSApp.activate(ignoringOtherApps: true)
         model.updateStatus = "Обновление загружено. Установка только после подтверждения и остановки Claude."
     }
 
@@ -132,6 +135,7 @@ final class GuardUpdateController: NSObject, SPUUpdaterDelegate {
     }
 
     func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem, immediateInstallationBlock immediateInstallHandler: @escaping () -> Void) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
         pendingInstallation = immediateInstallHandler
         model.updateStatus = "Обновление готово. Подтвердите остановку Claude, установку и перезапуск Guard."
         #if GUARD_UPDATE_TEST

@@ -390,7 +390,7 @@ class SOCKSRelay extends EventEmitter {
         const credentials = request.fields.filter(field => field.name === 'proxy-authorization');
         const token = credentials.length === 1 && /^Bearer ([a-f0-9]{64})$/i.exec(credentials[0].value);
         const control = request.kind === 'connect' && token && timingSafeEqual(Buffer.from(token[1]), Buffer.from(this.checkToken)) &&
-          port === 443 && ['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org', 'claude.ai', 'api.anthropic.com'].includes(host);
+          port === 443 && (['ipwho.is', 'api64.ipify.org', 'api.ipify.org', 'api6.ipify.org', 'ipinfo.io', 'ipapi.co', 'claude.ai', 'api.anthropic.com'].includes(host) || /^[a-f0-9]{32}\.edns\.ip-api\.com$/.test(host));
         if (control) this.controlSockets.add(client);
         const allowed = () => !this.closed && !client.destroyed && (this.unlocked || control);
         if (!allowed()) {

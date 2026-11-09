@@ -79,6 +79,7 @@ import Darwin
         model.username = ""; model.password = ""; model.interval = 2; model.watchPublicIP = true
         model.timezone = "Europe/Amsterdam"; model.language = "en-US"; model.captureBodies = true
         model.e2eInitialCheck = { _ in IPReport(ip: "203.0.113.7", countryCode: "NL", country: "Нидерланды", date: Date()) }
+        model.e2eDNSCheck = { _ in DNSMetric(ip: "203.0.113.9", organization: "Fixture DNS") }
         model.e2ePublicCheck = { _ in
             if failNextCheck { failNextCheck = false; throw GuardError.message("controlled transient installed-runtime failure") }
             return observedIP

@@ -82,6 +82,45 @@ import Network
                               ("duplicate key", trace + "ip=203.0.113.7\n"), ("non ASCII", trace + "x=я\n"), ("invalid line", trace + "invalid\n")] {
             rejected("trace rejects \(label)") { _ = try IPChecker.parseDestinationTrace(Data(body.utf8), hostname: "claude.ai", family: 4) }
         }
+        do {
+            let report = try await IPChecker.check(relayPort: nil, token: "", fetcher: { provider in
+                if provider.name == "ipwho.is" { throw GuardError.message("fixture offline") }
+                return json("NL", "203.0.113.7")
+            })
+            expect(report.sources.count == 2 && report.ip == "203.0.113.7", "two matching providers complete the check without waiting for a failed service")
+            let fallback = try await IPChecker.check(relayPort: nil, token: "", fetcher: { provider in
+                if provider.name != "ipinfo.io" { throw GuardError.message("fixture offline") }
+                return Data("{\"ip\":\"203.0.113.7\",\"country\":\"NL\",\"org\":\"AS41436 Example Hosting\"}".utf8)
+            })
+            expect(fallback.sources == ["ipinfo.io"] && fallback.asn == "AS41436" && fallback.organization == "Example Hosting", "single healthy provider is an explicit fallback with normalized metadata")
+            let current = try await IPChecker.publicIP(relayPort: nil, token: "", pinnedIP: "203.0.113.7", fetcher: { _ in
+                Data("{\"ip\":\"203.0.113.7\"}".utf8)
+            })
+            expect(current == "203.0.113.7", "public IP checks agree across providers")
+        } catch { expect(false, "multi-provider checks") }
+        do {
+            _ = try await IPChecker.check(relayPort: nil, token: "", fetcher: { provider in
+                let ip = provider.name == "ipwho.is" ? "203.0.113.1" : provider.name == "ipinfo.io" ? "203.0.113.2" : "203.0.113.3"
+                return json("NL", ip)
+            })
+            expect(false, "conflicting providers fail closed")
+        } catch { expect(true, "conflicting providers fail closed") }
+        do {
+            let dns = try IPChecker.parseDNSMetric(Data("{\"dns\":{\"geo\":\"Germany - Google LLC\",\"ip\":\"203.0.113.9\"}}".utf8))
+            expect(dns.ip == "203.0.113.9" && dns.organization == "Germany - Google LLC", "external DNS metric is parsed")
+        } catch { expect(false, "external DNS metric is parsed") }
+        rejected("invalid external DNS metric is rejected") { _ = try IPChecker.parseDNSMetric(Data("{\"dns\":{\"ip\":\"invalid\",\"geo\":\"\"}}".utf8)) }
+        let dohV4 = Data("{\"Status\":0,\"Question\":[{\"name\":\"claude.ai.\"}],\"Answer\":[{\"type\":1,\"data\":\"203.0.113.7\"},{\"type\":28,\"data\":\"2001:db8::7\"}]}".utf8)
+        let dohV6 = Data("{\"Status\":0,\"Question\":[{\"name\":\"claude.ai.\"}],\"Answer\":[{\"type\":28,\"data\":\"2001:db8::7\"}]}".utf8)
+        do {
+            let v4 = try DNSResolver.parse(dohV4, host: "claude.ai", family: AF_INET)
+            let v6 = try DNSResolver.parse(dohV6, host: "claude.ai", family: AF_INET6)
+            expect(v4 == ["203.0.113.7"] && v6 == ["2001:db8::7"], "DoH parser accepts only the requested address family")
+        } catch { expect(false, "DoH parser accepts only the requested address family") }
+        rejected("DoH rejects a response for another hostname") { _ = try DNSResolver.parse(dohV4, host: "example.com", family: AF_INET) }
+        rejected("DoH rejects missing requested family") { _ = try DNSResolver.parse(dohV6, host: "claude.ai", family: AF_INET) }
+        rejected("DoH rejects an invalid IP") { _ = try DNSResolver.parse(Data("{\"Status\":0,\"Question\":[{\"name\":\"claude.ai\"}],\"Answer\":[{\"type\":1,\"data\":\"invalid\"}]}".utf8), host: "claude.ai", family: AF_INET) }
+        rejected("DoH rejects NXDOMAIN without answers") { _ = try DNSResolver.parse(Data("{\"Status\":3,\"Question\":[{\"name\":\"claude.ai\"}]}".utf8), host: "claude.ai", family: AF_INET) }
         guard CommandLine.arguments.count > 1, let upstreamPort = UInt16(CommandLine.arguments[1]) else { exit(2) }
         do {
             // A direct HTTP fixture, separate from run.py's authenticated SOCKS server.
@@ -114,6 +153,7 @@ import Network
             let direct = SOCKSRelay(currentNetwork: true)
             let directPort = try await direct.start()
             direct.setPinnedFamily(.v4)
+            direct.setPinnedLocalAddresses(.init(v4: "127.0.0.1", v6: nil))
             expect(direct.unlock(), "current-network bridge unlocks with pinned IPv4")
             let directV4 = await request(directPort, host: "127.0.0.1", destinationPort: fixturePort)
             expect(directV4.0 == 0 && directV4.1 == "ok", "pinned IPv4 permits literal 127.0.0.1")
@@ -130,6 +170,12 @@ import Network
             expect(denied.0 != 0, "arbitrary destination blocked before verification")
             let probe = await request(port, host: "ipwho.is", token: relay.checkToken)
             expect(probe.0 == 0 && probe.1 == "ok:ipwho.is", "probe uses authenticated SOCKS and remote hostname")
+            for host in ["ipinfo.io", "ipapi.co", "0123456789abcdef0123456789abcdef.edns.ip-api.com"] {
+                let provider = await request(port, host: host, token: relay.checkToken)
+                expect(provider.0 == 0, "new control provider is allowed before unlock: \(host)")
+            }
+            let lookalike = await request(port, host: "0123456789abcdef0123456789abcdef.edns.ip-api.com.evil.test", token: relay.checkToken)
+            expect(lookalike.0 != 0, "lookalike EDNS host is rejected before unlock")
             expect(relay.unlock(), "verified bridge unlocks")
             let allowed = await request(port, host: "destination.test")
             expect(allowed.0 == 0 && allowed.1 == "ok:destination.test", "HTTPS CONNECT bytes forwarded after unlock")

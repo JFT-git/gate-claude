@@ -50,6 +50,8 @@ final class GuardModel: ObservableObject {
     @Published var phase = "Ожидание проверки"
     @Published var detail = "Выберите маршрут и проверьте внешний IP перед запуском."
     @Published var report: IPReport?
+    @Published var networkMetrics = GuardNetworkMetrics()
+    private var dnsMetricsTask: Task<Void, Never>?
     @Published var busy = false
     @Published var monitoring = false
     @Published var allowed = false
@@ -139,6 +141,7 @@ final class GuardModel: ObservableObject {
     var e2eDestinationCheck: ((String) async throws -> (ip: String, countryCode: String))?
     var e2eInitialCheck: ((UInt16?) async throws -> IPReport)?
     var e2ePublicCheck: ((UInt16?) async throws -> String)?
+    var e2eDNSCheck: ((UInt16?) async throws -> DNSMetric)?
     var e2eRuntimeRoot: URL?
     var e2eBootstrapURL: URL?
     var e2eHelperURL: URL?
@@ -297,6 +300,9 @@ final class GuardModel: ObservableObject {
         saveSettings()
         if monitoring { verifyPinnedIP(andLaunch: launch); return }
         report = nil; traffic.removeAll(); lastVerifiedProfile = nil; profileStatus = "Профиль страницы ещё не проверен"
+        dnsMetricsTask?.cancel(); dnsMetricsTask = nil
+        networkMetrics = GuardNetworkMetrics()
+        networkMetrics.dnsProtection = useProxy ? "DNS-имена разрешает SOCKS5-сервер; локальный resolver Claude не используется." : "После закрепления IP hostname-запросы идут через Cloudflare/Google DoH с привязкой к тому же egress; системный resolver и непроксированный WebRTC UDP не используются, QUIC отключён."
         let token = UUID(); operation = token
         allowed = false; busy = true; phase = "Проверяем исходный IP…"
         detail = "Проверяем подключение по постоянно закреплённому IP. Другой адрес не разрешён."
@@ -365,6 +371,9 @@ final class GuardModel: ObservableObject {
                 let result = try await initialIPCheck(relayPort)
                 guard operation == token else { return }
                 report = result
+                networkMetrics.sources = result.sources
+                networkMetrics.organization = result.organization
+                networkMetrics.asn = result.asn
                 try policy.establish(result)
                 do { try ipMemory.check(result.ip) }
                 catch { policy.latch(error.localizedDescription); throw error }
@@ -633,6 +642,7 @@ final class GuardModel: ObservableObject {
     private func verifyDestinations(operation expected: UUID) async throws {
         guard let relay, let relayPort else { throw GuardError.message("Локальный шлюз закрыт.") }
         for host in IPChecker.destinationHosts {
+            let started = Date()
             let result: (ip: String, countryCode: String)
             #if GUARD_E2E
             // Existing recovery fixtures replace the entire external route check.
@@ -649,6 +659,36 @@ final class GuardModel: ObservableObject {
             guard operation == expected, !Task.isCancelled else { throw CancellationError() }
             try policy.verifyDestination(hostname: host, ip: result.ip, countryCode: result.countryCode,
                                          recoverableMismatch: claudeRunning && lastVerifiedProfile != nil && runtimeIdentity != nil)
+            networkMetrics.destinationLatency[host] = max(0, min(600_000, Int(Date().timeIntervalSince(started) * 1000)))
+        }
+        if networkMetrics.dns == nil && networkMetrics.dnsState == "Внешняя DNS-метрика ещё не выполнялась" { refreshDNSMetrics(operation: expected) }
+    }
+
+    private func refreshDNSMetrics(operation expected: UUID) {
+        dnsMetricsTask?.cancel()
+        networkMetrics.dnsState = "Проверяем внешний DNS-ответчик…"
+        let port = relayPort, token = relay?.checkToken ?? ""
+        dnsMetricsTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.operation == expected { self.dnsMetricsTask = nil } }
+            do {
+                let metric: DNSMetric
+                #if GUARD_E2E
+                guard let check = self.e2eDNSCheck else {
+                    self.networkMetrics.dnsState = "Внешняя DNS-метрика отключена в тестовом контуре"
+                    return
+                }
+                metric = try await check(port)
+                #else
+                metric = try await IPChecker.dnsProbe(relayPort: port, token: token)
+                #endif
+                guard !Task.isCancelled, self.operation == expected else { return }
+                self.networkMetrics.dns = metric
+                self.networkMetrics.dnsState = "Внешняя DNS-метрика получена"
+            } catch {
+                guard !Task.isCancelled, self.operation == expected else { return }
+                self.networkMetrics.dnsState = "Метрика недоступна; защитные DNS-правила не изменены"
+            }
         }
     }
 
@@ -983,6 +1023,7 @@ final class GuardModel: ObservableObject {
         if latch { policy.latch(reason) }
         requiresRestart = policy.requiresRestart
         operation = UUID()
+        dnsMetricsTask?.cancel(); dnsMetricsTask = nil
         revalidationTask?.cancel(); revalidationTask = nil
         launchPending = false; launchAfterValidation = false
         relay?.stop(); relay = nil; relayPort = nil; systemProxy = nil
@@ -1321,10 +1362,27 @@ struct GuardView: View {
                                 Text("Каждые 2 с").tag(2); Text("Каждые 5 с").tag(5); Text("Каждые 10 с").tag(10); Text("Каждые 30 с").tag(30)
                             }.labelsHidden().frame(width: 150)
                         }
-                        Text("Публичный IP проверяется через ipify постоянно: без периодического контроля смена выхода может остаться незамеченной.").font(.system(size: 12))
+                        Text("Внешний IP проверяется параллельно через ipify, ipinfo.io и ipapi.co; согласованные ответы не ждут остальные сервисы.").font(.system(size: 12))
                         Text("Изменение сети или ошибка проверки приостанавливает шлюз. Прежний подтверждённый IP возобновляет сессию. Другой IP закрывает её; перезапуск Guard сохраняет закрепление.")
                             .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     }.disabled(model.monitoring || model.busy || model.requiresRestart)
+                }
+                Surface {
+                    VStack(alignment: .leading, spacing: 11) {
+                        Text("Диагностика сети").font(.system(size: 15, weight: .semibold))
+                        LabeledContent("IP-сервисы", value: model.networkMetrics.sources.isEmpty ? "Проверка ещё не выполнялась" : model.networkMetrics.sources.joined(separator: " · "))
+                        LabeledContent("ASN / оператор", value: [model.networkMetrics.asn, model.networkMetrics.organization].filter { !$0.isEmpty }.joined(separator: " · "))
+                        ForEach(IPChecker.destinationHosts, id: \.self) { host in
+                            LabeledContent(host, value: model.networkMetrics.destinationLatency[host].map { "\($0) мс" } ?? "Ещё не проверено")
+                        }
+                        LabeledContent("DNS-ответчик", value: model.networkMetrics.dns.map { "\($0.ip) · \($0.organization)" } ?? model.networkMetrics.dnsState)
+                        Text(model.networkMetrics.dnsProtection).font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
+                        LabeledContent("WebRTC", value: "Без прокси UDP запрещён")
+                        LabeledContent("QUIC", value: "Отключён")
+                        LabeledContent("Профиль", value: "\(model.lastVerifiedProfile?.timezone ?? model.timezone) · \(model.lastVerifiedProfile?.language ?? model.language)")
+                        Text("Внешняя DNS-метрика сторонняя и не участвует в решении о запуске. DNS и WebRTC защищаются правилами Guard, а не оценкой стороннего сайта.")
+                            .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
+                    }.font(.system(size: 12))
                 }
                 Surface {
                     VStack(alignment: .leading, spacing: 12) {
@@ -1407,7 +1465,7 @@ struct GuardView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Label(model.networkBarrier && model.barrierActive ? "Системный kill switch активен" : "Упрощённая защита — системный барьер не активен", systemImage: model.networkBarrier && model.barrierActive ? "checkmark.shield" : "info.circle")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(model.networkBarrier && model.barrierActive ? GuardPalette.accent : GuardPalette.warning)
-                    Text("Начальная страна: ipwho.is; повторный IP: ipify. Подтверждённый новый IP завершает сессию. Временная ошибка закрывает потоки и замораживает Claude максимум на 20 секунд; полная проверка прежнего IP возобновляет работу, а новые потоки открываются заново. Публичный IP нельзя проверить локально за NAT. Активный барьер ограничивает весь процесс Claude локальным шлюзом; без него native, MCP и Cowork могут обходить прокси; CDP видит только доступные веб-контексты.")
+                    Text("Начальная страна: ipwho.is, ipinfo.io и ipapi.co; повторный IP: ipify, ipinfo.io и ipapi.co. Согласованные ответы не ждут остальные сервисы, противоречия блокируются. Подтверждённый новый IP завершает сессию. Временная ошибка закрывает потоки и замораживает Claude максимум на 20 секунд; полная проверка прежнего IP возобновляет работу, а новые потоки открываются заново. Публичный IP нельзя проверить локально за NAT. Активный барьер ограничивает весь процесс Claude локальным шлюзом; без него native, MCP и Cowork могут обходить прокси; CDP видит только доступные веб-контексты.")
                         .font(.system(size: 11)).foregroundStyle(GuardPalette.secondary).fixedSize(horizontal: false, vertical: true)
                     DisclosureGroup("Журнал проверок", isExpanded: $model.showLog) {
                         VStack(alignment: .leading, spacing: 6) {
@@ -1507,8 +1565,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         stop.target = self; menu.addItem(stop); stopMenuItem = stop
         let restart = NSMenuItem(title: "Перезапустить Guard", action: #selector(restartGuard), keyEquivalent: "")
         restart.target = self; menu.addItem(restart); restartMenuItem = restart
+        let updateRoot = NSMenuItem(title: "Обновления", action: nil, keyEquivalent: "")
+        let updateMenu = NSMenu(title: "Обновления")
+        updateRoot.submenu = updateMenu
         let updates = NSMenuItem(title: "Проверить обновления…", action: #selector(checkUpdates), keyEquivalent: "")
-        updates.target = self; menu.addItem(updates); updatesMenuItem = updates
+        updates.target = self; updateMenu.addItem(updates); updatesMenuItem = updates
+        let updateStatus = NSMenuItem(title: model.updateStatus, action: nil, keyEquivalent: "")
+        updateStatus.isEnabled = false; updateMenu.addItem(updateStatus)
+        menu.addItem(updateRoot)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Выход", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApplication.shared; menu.addItem(quit)
@@ -1569,6 +1633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         stopMenuItem?.isEnabled = (model.monitoring || model.busy || model.claudeRunning) && !model.restarting
         restartMenuItem?.isEnabled = !model.restarting
         updatesMenuItem?.isEnabled = !model.restarting && model.checkForUpdates != nil
+        updatesMenuItem?.menu?.item(at: 1)?.title = model.updateStatus
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -1587,14 +1652,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc func showWindow() {
         let window = makeMainWindow()
-        NSApp.setActivationPolicy(.regular)
+        NSApp.setActivationPolicy(.accessory)
         NSApp.unhide(nil)
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
     @objc func stopGuard() { model.stop(); refreshStatusMenu() }
-    @objc func checkUpdates() { updateController?.checkForUpdates() }
+    @objc func checkUpdates() { showWindow(); updateController?.checkForUpdates() }
     @objc func restartGuard() {
         guard !model.restarting else { return }
         if model.monitoring || model.claudeRunning || model.busy {

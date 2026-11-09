@@ -58,6 +58,15 @@ function showState(value) {
   $('savedIP').textContent = value.ipMemoryError || (value.savedIP ? 'Разрешён только IP: ' + value.savedIP : 'Адрес ещё не сохранён. Он будет закреплён после успешной проверки подключения.');
   if (value.profile) { $('profile').textContent = value.profile.timezone + ' · ' + value.profile.language; $('locale').textContent = 'Intl locale: ' + value.profile.locale; }
   else { $('profile').textContent = value.state === 'blocked' ? 'Соединение закрыто' : 'Ожидаем запуск Claude'; $('locale').textContent = 'Проверяются Intl, navigator и Accept-Language'; }
+  const metrics = value.metrics || {}, sources = Array.isArray(metrics.sources) ? metrics.sources : [];
+  $('metricProviders').textContent = sources.length ? sources.join(' · ') + (sources.length === 1 ? ' · fallback одного сервиса' : ' · согласованный ответ') : 'Проверка ещё не выполнялась';
+  $('metricNetwork').textContent = [metrics.asn, metrics.organization].filter(Boolean).join(' · ') || 'ASN и оператор появятся после проверки IP';
+  const destinations = Object.entries(metrics.destinations || {});
+  $('metricDestinations').textContent = destinations.length ? destinations.map(([host, value]) => host + ': ' + (value.state === 'ok' ? value.latencyMs + ' мс' : 'ошибка проверки')).join(' · ') : 'Маршруты ещё не проверены';
+  const dns = metrics.dns || {}, dnsProtection = metrics.dnsProtection === 'remote_socks5' ? 'Имена разрешает SOCKS5' : metrics.dnsProtection === 'pinned_egress' ? 'DNS привязан к проверенному выходу' : 'DNS-защита зависит от маршрута';
+  $('metricDNS').textContent = (dns.state === 'ready' ? dns.ip + ' · ' + dns.organization + ' · ' : dns.state === 'checking' ? 'Внешняя DNS-метрика… · ' : dns.state === 'unavailable' ? 'Метрика недоступна · ' : '') + dnsProtection;
+  $('metricUDP').textContent = 'WebRTC: ' + (metrics.webRTC || 'disable_non_proxied_udp') + ' · QUIC: ' + (metrics.quic || 'disabled');
+  $('metricProfile').textContent = value.profile ? value.profile.timezone + ' · ' + value.profile.language + ' · ' + value.profile.locale : 'Будет подтверждён после запуска Claude';
   if (value.state === 'running' && previous.state !== 'running') { $('errorBanner').hidden = true; lastOperation('Проверка сессии', 'профиль подтверждён'); }
   if (value.state === 'blocked' && previous.state !== 'blocked' && !pending.has('stop')) failure(value.message || 'Сессия закрыта. Откройте журнал и перезапустите Guard для новой проверки.');
   refreshControls();

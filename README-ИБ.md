@@ -34,7 +34,9 @@ Windows portable ZIP распаковывается целиком: одного
 
 - Локальный HTTP CONNECT-шлюз: случайный TCP-порт на **127.0.0.1**. Фиксированного публичного порта управления нет.
 - Управление runtime: локальные named pipes Windows либо унаследованные pipe/stdio macOS; внешний TCP debug-порт не открывается.
-- HTTPS-проверки IP/страны: `ipwho.is`, `api64.ipify.org`, `api.ipify.org`, `api6.ipify.org`.
+- HTTPS-проверки IP/страны: `ipwho.is`, `ipinfo.io`, `ipapi.co`, `api64.ipify.org`, `api.ipify.org`, `api6.ipify.org`. Запросы группы выполняются параллельно, принимаются согласованные ответы; один работающий сервис является явным fallback, противоречия блокируются.
+- Внешняя DNS-метрика: случайный 32-hex поддомен `edns.ip-api.com`, только публичные сведения о DNS-ответчике. Она не влияет на запуск и не заменяет защитные DNS/WebRTC-правила.
+- На macOS после установления pin hostname-запросы выполняются через `cloudflare-dns.com` и `dns.google` по HTTPS с привязкой к проверенному egress. DoH-провайдеры видят имена назначений; отказ обоих закрывает CONNECT без возврата к системному resolver.
 - Windows дополнительно проверяет выход к `claude.ai` и `api.anthropic.com` через `/cdn-cgi/trace`.
 - При включении Code возможна загрузка закреплённого CLI с `downloads.claude.ai`; размер и SHA-256 проверяются. Git/PowerShell поставляются проверенными sidecar-комплектами.
 - Автообновление Guard загружает signed metadata и пакеты из стабильных GitHub Releases по HTTPS. Учётные данные Claude и пользовательские файлы при этом не отправляются.

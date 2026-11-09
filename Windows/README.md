@@ -1,12 +1,16 @@
-# Claude Proxy Guard для Windows · 0.9.0
+# Claude Proxy Guard для Windows · 0.9.1
 
 Независимое приложение для Windows 10/11 x64. Требует отдельно установленного Claude Desktop. Для Claude Code поддерживается закреплённый Desktop 1.44121.2 и CLI 2.1.304. ARM64, Git Bash и Git SSH не заявлены.
 
-Запустите `ClaudeProxyGuard-Windows-0.9.0-x64-Setup.exe` для установки текущему пользователю или полностью распакуйте portable ZIP и запустите `Claude Proxy Guard.exe`. Нужна вся папка с Electron, native-помощниками и CodeTools. Установщик размещает эти же файлы в `%LOCALAPPDATA%\Programs\Claude Proxy Guard`.
+Запустите `ClaudeProxyGuard-Windows-0.9.1-x64-Setup.exe` для установки текущему пользователю или полностью распакуйте portable ZIP и запустите `Claude Proxy Guard.exe`. Нужна вся папка с Electron, native-помощниками и CodeTools. Установщик размещает эти же файлы в `%LOCALAPPDATA%\Programs\Claude Proxy Guard`.
 
 В 0.9.0 добавлена постоянная служба с одним UAC на установку и обновлён нативный интерфейс. Обычные сессии и обновления с неизменными service binaries не требуют повторного повышения.
 
 Выберите сеть/VPN или SOCKS5 и нажмите «Запустить». При первой установке `ClaudeProxyGuard` Windows один раз запросит повышение для защищённой службы; обычные последующие сессии с совместимой running service не требуют UAC. Дождитесь фактической проверки Claude. Guard ищет Claude в установленных пакетах WindowsApps; менять ACL WindowsApps не нужно. Code использует постоянную `Guard\CodeState\Workspace`, если проект не выбран. Рабочие файлы сохраняются после выхода.
+
+Проверка внешнего IP идёт параллельно через ipwho.is, ipinfo.io и ipapi.co, повторная — через ipify, ipinfo.io и ipapi.co. Два согласованных ответа завершают её без ожидания остальных сервисов; один доступный сервис является явным fallback, противоречия блокируются. Карточка «Диагностика сети» показывает подтвердившие сервисы, ASN/оператора, задержки Claude, внешнюю DNS-метрику, фактические ограничения WebRTC/QUIC и профиль. Сторонняя метрика не определяет разрешение запуска.
+
+В меню **«Обновления»** доступны фоновая проверка, статус, установка после подтверждения и страница выпусков. Для проверки закрывать Guard не требуется; установка по-прежнему завершает Claude и перезапускает Guard после явного подтверждения.
 
 NSIS вызывает `GuardService.exe --request-install` после копирования файлов и прерывает установку при неподтверждённом результате, включая exit 2. Изменение service/NetworkFence binary требует нового privileged update; удаление службы требует отдельного elevated request. Служба запускает только pinned NetworkFence из `%ProgramData%\Claude Proxy Guard\Service`, не Claude и не произвольные команды. Portable использует ту же первую установку службы и не отменяет UAC. Архитектура службы и ограничения описаны в [service integration](../docs/service-integration.md); standard-user install и Chat/Code проверены на Windows 11.
 

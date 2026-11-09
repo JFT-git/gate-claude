@@ -29,6 +29,7 @@ cat > "$LIFECYCLE_APP/Contents/Info.plist" <<EOF
 <key>CFBundleName</key><string>Guard Lifecycle Tests</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 EOF

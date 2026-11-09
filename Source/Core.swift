@@ -43,12 +43,16 @@ struct IPReport: Equatable {
     let countryCode: String
     let country: String
     let date: Date
+    var organization = ""
+    var asn = ""
+    var sources: [String] = []
 
-    static func parse(_ data: Data) throws -> IPReport {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              json["success"] as? Bool == true,
+    static func parse(_ data: Data, provider: String = "ipwho.is") throws -> IPReport {
+        guard ["ipwho.is", "ipinfo.io", "ipapi.co"].contains(provider),
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              json["success"] == nil || json["success"] as? Bool == true,
               let ip = json["ip"] as? String,
-              let code = json["country_code"] as? String else {
+              let code = (json["country_code"] ?? json["country"]) as? String else {
             throw GuardError.message("Сервис проверки не вернул достоверный IP и страну. Доступ закрыт.")
         }
         var v4 = in_addr(); var v6 = in6_addr()
@@ -56,14 +60,38 @@ struct IPReport: Equatable {
               code.count == 2, code.unicodeScalars.allSatisfy({ (65...90).contains($0.value) }) else {
             throw GuardError.message("Некорректный ответ сервиса проверки. Доступ закрыт.")
         }
-        // Unknown and special geographic assignments must never unlock launch.
         let isoCodes = Set(Locale.Region.isoRegions.map(\.identifier).filter { $0.count == 2 })
         guard isoCodes.contains(code), !["ZZ", "XX", "EU", "UN"].contains(code) else {
             throw GuardError.message("Страна IP не определена. Доступ закрыт.")
         }
+        func text(_ value: Any?) -> String {
+            guard let value = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty, value.count <= 160,
+                  value.unicodeScalars.allSatisfy({ $0.value > 31 && $0.value != 127 }) else { return "" }
+            return value
+        }
+        var organization = "", asn = ""
+        if provider == "ipwho.is" {
+            let connection = json["connection"] as? [String: Any]
+            if let number = connection?["asn"] as? Int, number > 0, number <= 4_294_967_295 { asn = "AS\(number)" }
+            organization = text(connection?["org"] ?? connection?["isp"])
+        } else if provider == "ipinfo.io" {
+            let value = text(json["org"])
+            if let split = value.firstIndex(of: " "), value.hasPrefix("AS") {
+                let candidate = String(value[..<split])
+                if candidate.dropFirst(2).allSatisfy(\.isNumber), UInt32(candidate.dropFirst(2)) != nil {
+                    asn = candidate; organization = String(value[value.index(after: split)...])
+                }
+            }
+            if asn.isEmpty { organization = value }
+        } else {
+            let candidate = text(json["asn"])
+            if candidate.hasPrefix("AS"), let number = UInt32(candidate.dropFirst(2)), number > 0 { asn = candidate }
+            organization = text(json["org"])
+        }
         return IPReport(ip: ip, countryCode: code,
                         country: Locale(identifier: "ru_RU").localizedString(forRegionCode: code) ?? code,
-                        date: Date())
+                        date: Date(), organization: organization, asn: asn, sources: [provider])
     }
 
     func requireForeign() throws {
@@ -71,25 +99,98 @@ struct IPReport: Equatable {
     }
 }
 
+struct DNSMetric: Equatable { let ip: String; let organization: String }
+struct GuardNetworkMetrics: Equatable {
+    var sources: [String] = []
+    var organization = ""
+    var asn = ""
+    var destinationLatency: [String: Int] = [:]
+    var dns: DNSMetric?
+    var dnsState = "Внешняя DNS-метрика ещё не выполнялась"
+    var dnsProtection = "DNS-защита зависит от выбранного маршрута"
+    var webRTC = "disable_non_proxied_udp"
+    var quic = "disabled"
+}
+struct IPService: Equatable { let name: String; let url: String }
+private struct IPProviderResult<T> { let provider: String; let value: T? }
+
 enum IPChecker {
-    // curl is bundled with macOS. -q must be the first argument: ignore ~/.curlrc.
-    // Clear proxy environment variables so the only route is the explicitly selected one.
-    static func check(relayPort: UInt16?, token: String) async throws -> IPReport {
-        try IPReport.parse(await fetch(url: "https://ipwho.is/?fields=success,ip,country_code", relayPort: relayPort, token: token, timeout: 12))
+    static let geoProviders = [
+        IPService(name: "ipwho.is", url: "https://ipwho.is/?fields=success,ip,country_code,connection"),
+        IPService(name: "ipinfo.io", url: "https://ipinfo.io/json"),
+        IPService(name: "ipapi.co", url: "https://ipapi.co/json/")
+    ]
+    static func check(relayPort: UInt16?, token: String, fetcher: ((IPService) async throws -> Data)? = nil) async throws -> IPReport {
+        let load: (IPService) async throws -> Data
+        if let fetcher { load = fetcher }
+        else { load = { try await fetch(url: $0.url, relayPort: relayPort, token: token, timeout: 4) } }
+        let result = try await resolve(providers: geoProviders, fetcher: load,
+            parser: { try IPReport.parse($1, provider: $0.name) }, identity: { $0.ip + "|" + $0.countryCode })
+        var report = result.value; report.sources = result.sources
+        return report
     }
 
     static func publicIPURL(for pinnedIP: String?) -> String {
-        // A dual-stack probe may alternate between the same network's IPv4 and IPv6.
-        // Keep the family selected during the country check for every later probe.
         let host = pinnedIP.map { $0.contains(":") ? "api6.ipify.org" : "api.ipify.org" } ?? "api64.ipify.org"
         return "https://\(host)?format=json"
     }
+    static func publicProviders(for pinnedIP: String?) -> [IPService] {
+        [IPService(name: "ipify", url: publicIPURL(for: pinnedIP)),
+         IPService(name: "ipinfo.io", url: "https://ipinfo.io/json"),
+         IPService(name: "ipapi.co", url: "https://ipapi.co/json/")]
+    }
+    static func publicIP(relayPort: UInt16?, token: String, pinnedIP: String? = nil, fetcher: ((IPService) async throws -> Data)? = nil) async throws -> String {
+        let load: (IPService) async throws -> Data
+        if let fetcher { load = fetcher }
+        else { load = { try await fetch(url: $0.url, relayPort: relayPort, token: token, timeout: 4) } }
+        return try await resolve(providers: publicProviders(for: pinnedIP), fetcher: load,
+            parser: { _, data in
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let ip = json["ip"] as? String else { throw GuardError.message("Не удалось определить внешний IP.") }
+                return try IPIdentity.canonical(ip)
+            }, identity: { $0 }).value
+    }
 
-    static func publicIP(relayPort: UInt16?, token: String, pinnedIP: String? = nil) async throws -> String {
-        let data = try await fetch(url: publicIPURL(for: pinnedIP), relayPort: relayPort, token: token, timeout: 4)
+    static func resolve<T>(providers: [IPService], fetcher: @escaping (IPService) async throws -> Data,
+                           parser: @escaping (IPService, Data) throws -> T, identity: (T) -> String) async throws -> (value: T, sources: [String]) {
+        try await withThrowingTaskGroup(of: IPProviderResult<T>.self, returning: (value: T, sources: [String]).self) { group in
+            for provider in providers {
+                group.addTask {
+                    do { return IPProviderResult(provider: provider.name, value: try parser(provider, await fetcher(provider))) }
+                    catch { return IPProviderResult(provider: provider.name, value: nil) }
+                }
+            }
+            var values: [IPProviderResult<T>] = []
+            for try await result in group {
+                guard let value = result.value else { continue }
+                values.append(result)
+                let matching = values.filter { identity($0.value!) == identity(value) }
+                if matching.count >= 2 {
+                    guard matching.count == values.count else { throw GuardError.message("Сервисы вернули разные внешние IP. Доступ закрыт.") }
+                    group.cancelAll()
+                    return (matching[0].value!, matching.map(\.provider))
+                }
+            }
+            guard let first = values.first, Set(values.map { identity($0.value!) }).count == 1 else {
+                throw GuardError.message(values.isEmpty ? "Ни один сервис проверки IP не ответил достоверно. Доступ закрыт." : "Сервисы вернули разные внешние IP. Доступ закрыт.")
+            }
+            return (first.value!, values.map(\.provider))
+        }
+    }
+
+    static func parseDNSMetric(_ data: Data) throws -> DNSMetric {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let ip = json["ip"] as? String else { throw GuardError.message("Не удалось определить внешний IP.") }
-        return try IPIdentity.canonical(ip)
+              let dns = json["dns"] as? [String: Any], let ip = dns["ip"] as? String,
+              let organization = (dns["geo"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !organization.isEmpty, organization.count <= 160,
+              organization.unicodeScalars.allSatisfy({ $0.value > 31 && $0.value != 127 }) else {
+            throw GuardError.message("Внешняя DNS-метрика вернула некорректный ответ.")
+        }
+        return DNSMetric(ip: try IPIdentity.canonical(ip), organization: organization)
+    }
+    static func dnsProbe(relayPort: UInt16?, token: String) async throws -> DNSMetric {
+        let prefix = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return try parseDNSMetric(await fetch(url: "https://\(prefix).edns.ip-api.com/json", relayPort: relayPort, token: token, timeout: 4, limit: 4096))
     }
 
     static let destinationHosts = ["claude.ai", "api.anthropic.com"]
@@ -156,6 +257,90 @@ enum IPChecker {
                     }
                     continuation.resume(returning: data)
                 } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+}
+
+enum DNSResolver {
+    private struct Provider {
+        let host: String
+        let path: String
+        let v4: String
+        let v6: String
+    }
+    private static let providers = [
+        Provider(host: "cloudflare-dns.com", path: "/dns-query", v4: "1.1.1.1", v6: "2606:4700:4700::1111"),
+        Provider(host: "dns.google", path: "/resolve", v4: "8.8.8.8", v6: "2001:4860:4860::8888")
+    ]
+
+    static func parse(_ data: Data, host: String, family: Int32) throws -> [String] {
+        guard data.count <= 65536, family == AF_INET || family == AF_INET6,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = json["Status"] as? Int, [0, 3].contains(status),
+              let questions = json["Question"] as? [[String: Any]], questions.count == 1,
+              let question = questions[0]["name"] as? String,
+              question.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) == host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")),
+              let answers = json["Answer"] as? [[String: Any]], answers.count <= 64 else {
+            throw GuardError.message("DNS-over-HTTPS не подтвердил адрес назначения.")
+        }
+        let expectedType = family == AF_INET ? 1 : 28
+        var result: [String] = []
+        for answer in answers {
+            guard let type = answer["type"] as? Int, type == expectedType,
+                  let value = answer["data"] as? String else { continue }
+            let ip = try IPIdentity.canonical(value)
+            if ip.lowercased().hasPrefix("::ffff:") { throw GuardError.message("DNS-over-HTTPS вернул запрещённый mapped-адрес.") }
+            if !result.contains(ip) { result.append(ip) }
+        }
+        guard !result.isEmpty else { throw GuardError.message("DNS-over-HTTPS не вернул адрес нужного семейства.") }
+        return result
+    }
+
+    static func resolve(host: String, family: Int32, local: String, queue: DispatchQueue, completion: @escaping ([String]?) -> Void) {
+        var v4 = in_addr(), v6 = in6_addr()
+        let validLocal = family == AF_INET ? inet_pton(AF_INET, local, &v4) == 1 : inet_pton(AF_INET6, local, &v6) == 1
+        guard validLocal, host.utf8.count <= 253, !host.isEmpty,
+              host.allSatisfy({ $0.isASCII && !$0.isWhitespace && $0 != "@" && $0 != "/" && $0 != "&" && $0 != "%" }) else {
+            queue.async { completion(nil) }; return
+        }
+        let lock = NSLock()
+        var remaining = providers.count, finished = false
+        for provider in providers {
+            let server = family == AF_INET ? provider.v4 : provider.v6
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    var components = URLComponents()
+                    components.scheme = "https"; components.host = provider.host; components.path = provider.path
+                    components.queryItems = [URLQueryItem(name: "name", value: host), URLQueryItem(name: "type", value: family == AF_INET ? "A" : "AAAA")]
+                    guard let url = components.url?.absoluteString else { throw GuardError.message("Неверный DNS-запрос.") }
+                    let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                    process.arguments = ["-q", "--silent", "--show-error", "--fail", "--connect-timeout", "2", "--max-time", "3",
+                                         "--max-filesize", "65536", "--proto", "=https", "--max-redirs", "0",
+                                         "--proxy", "", "--noproxy", "*", "--interface", local,
+                                         "--connect-to", "\(provider.host):443:\(server.contains(":") ? "[\(server)]" : server):443",
+                                         "--header", "Accept: application/dns-json", url]
+                    process.environment = ProcessInfo.processInfo.environment.filter {
+                        !["http_proxy", "https_proxy", "all_proxy", "no_proxy"].contains($0.key.lowercased())
+                    }
+                    let output = Pipe(); process.standardOutput = output; process.standardError = FileHandle.nullDevice
+                    try process.run()
+                    let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+                    guard process.terminationStatus == 0, let addresses = try? parse(data, host: host, family: family), !addresses.isEmpty else {
+                        throw GuardError.message("DNS-over-HTTPS недоступен.")
+                    }
+                    lock.lock()
+                    let accepted = !finished
+                    if accepted { finished = true }
+                    lock.unlock()
+                    if accepted { queue.async { completion(addresses) } }
+                } catch {
+                    lock.lock(); remaining -= 1
+                    let exhausted = remaining == 0 && !finished
+                    if exhausted { finished = true }
+                    lock.unlock()
+                    if exhausted { queue.async { completion(nil) } }
+                }
             }
         }
     }
@@ -439,7 +624,9 @@ private final class RelayTunnel {
                     self.reject(); return
                 }
                 let host = String(authority[..<split]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-                self.isControl = validToken && port == 443 && (["ipwho.is", "api.ipify.org", "api6.ipify.org", "api64.ipify.org"] + IPChecker.destinationHosts).contains(host.lowercased())
+                let normalizedHost = host.lowercased()
+                let dnsMetricHost = normalizedHost.range(of: "^[a-f0-9]{32}\\.edns\\.ip-api\\.com$", options: .regularExpression) != nil
+                self.isControl = validToken && port == 443 && ((["ipwho.is", "api.ipify.org", "api6.ipify.org", "api64.ipify.org", "ipinfo.io", "ipapi.co"] + IPChecker.destinationHosts).contains(normalizedHost) || dnsMetricHost)
                 guard !host.isEmpty, host.utf8.count <= 255,
                       !host.contains(where: { $0.isWhitespace }), !host.contains("@"),
                       self.isAllowed?(host, port, self.isControl) == true else {
@@ -483,6 +670,15 @@ private final class RelayTunnel {
                 guard family == AF_INET else { close(); return }
             } else if inet_pton(AF_INET6, destination, &v6) == 1 {
                 guard family == AF_INET6, !Self.isMappedIPv4(destination) else { close(); return }
+            } else if let pin = pinnedLocal {
+                guard let local = family == AF_INET ? pin.v4 : pin.v6 else { close(); return }
+                DNSResolver.resolve(host: destination, family: family, local: local, queue: queue) { [weak self] addresses in
+                    guard let self, !self.closed, let resolved = addresses?.first, !Self.isMappedIPv4(resolved) else {
+                        self?.close(); return
+                    }
+                    self.openCurrentNetwork(host: resolved)
+                }
+                return
             } else {
                 var hints = addrinfo()
                 hints.ai_family = family
@@ -503,11 +699,13 @@ private final class RelayTunnel {
                 guard !Self.isMappedIPv4(host) else { close(); return }
             }
         }
+        if pinnedFamily == nil && pinnedLocal != nil { close(); return }
+        openCurrentNetwork(host: host)
+    }
+
+    private func openCurrentNetwork(host: String) {
         let parameters = NWParameters.tcp
         if let pin = pinnedLocal {
-            // Kill switch: bind the upstream socket to the pinned address of the
-            // approved egress interface. If that interface or VPN is gone, the bind
-            // fails and no packet can leave through a fallback route.
             var v4check = in_addr()
             let isV4 = inet_pton(AF_INET, host, &v4check) == 1
             var parsedV4 = in_addr(); var parsedV6 = in6_addr()
@@ -522,10 +720,6 @@ private final class RelayTunnel {
             guard let self, !self.closed else { return }
             switch state {
             case .ready:
-                // Learn the proven egress address of this connection: it becomes the
-                // kill-switch pin, so the pin always reflects the real route taken.
-                // Only authenticated control tunnels may teach the pin — application
-                // dials never influence which address gets pinned.
                 if self.settings == nil, self.isControl, let local = connection.currentPath?.localEndpoint,
                    case .hostPort(let localHost, _) = local {
                     switch localHost {
@@ -545,7 +739,6 @@ private final class RelayTunnel {
                     }
                 }
                 self.connected()
-            // A single destination failing is not evidence of a changed exit IP.
             case .failed, .waiting: self.close()
             default: break
             }

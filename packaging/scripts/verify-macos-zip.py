@@ -123,6 +123,10 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
         seen.add(rel)
 if seen != set(regular) | set(links):
     raise SystemExit("Missing expected bundle files or symlinks")
+import plistlib
+metadata = plistlib.loads(regular["Info.plist"].read_bytes())
+if metadata.get("LSUIElement") is not True:
+    raise SystemExit("macOS release must remain an accessory/status-bar application")
 
 with tempfile.TemporaryDirectory(prefix="guard-macos-zip-") as temporary:
     subprocess.run(["/usr/bin/ditto", "-x", "-k", str(pathlib.Path(sys.argv[1]).resolve()), temporary], check=True)

@@ -125,8 +125,12 @@ async function smoke(routeFailure) {
     }
     async loadFile() {}
   }
+  const Menu = {
+    buildFromTemplate: template => ({ items: template.map(item => ({ ...item, submenu: Array.isArray(item.submenu) ? { items: item.submenu } : item.submenu })) }),
+    setApplicationMenu() {}
+  };
   const mocks = {
-    electron: { app, BrowserWindow: Window, ipcMain: { handle() {} }, dialog: { showErrorBox() {} }, powerMonitor: { on() {} }, nativeTheme: { shouldUseDarkColors: true } },
+    electron: { app, BrowserWindow: Window, ipcMain: { handle() {} }, dialog: { showErrorBox() {} }, powerMonitor: { on() {} }, nativeTheme: { shouldUseDarkColors: true }, Menu },
     'node:fs': { writeFileSync: (_file, value) => { receipt = JSON.parse(value); } },
     './controller.cjs': { GuardController: Controller }, './discovery.cjs': {}, './runtime.cjs': {}, './policy.cjs': {},
     './sanitize.cjs': { diagnostic: value => value }, './deep-link.cjs': { takeDeepLinkFromArgv: () => ({ hadLink: false }) },
